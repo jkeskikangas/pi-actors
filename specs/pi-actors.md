@@ -8,7 +8,7 @@ A pi agent must be able to start other pi agents, fresh or as a fork of its own 
 
 ## Users and scenarios
 
-Primary workflow: a coordinator works through a backlog. For each item it starts an agent, which designs the feature, forks frontend and backend agents on different models, starts a fresh-context reviewer, and escalates decisions to the human only when needed.
+Example workflow: a coordinator agent delegates parts of a task to child agents. A child might fork frontend and backend implementers on different models, or start a fresh-context reviewer, and escalate decisions to the human only when needed. The primitives must not assume any one workflow shape.
 
 ## Use cases
 
@@ -32,7 +32,7 @@ Primary workflow: a coordinator works through a backlog. For each item it starts
 | INV-2  | [CHANGED] Every termination of an agent incarnation produces exactly one DOWN notice to its parent, with a reason from: `normal`, `error`, `killed`, `timeout`, `lost`.                                                                                                                              |
 | INV-3  | [CHANGED] Effectively-once: while the receiver lives, every accepted message is delivered at least once, and the receiving agent consumes each message ID at most once. Retries by the sending extension never create a new message. A message the *model* deliberately sends twice is two messages. |
 | INV-4  | [CHANGED] FIFO per sender incarnation.                                                                                                                                                                                                                                                               |
-| INV-5  | [CHANGED] Limits are enforced at spawn time by the broker, and a child's limits are never looser than its parent's. The limits are: depth, live children per agent, live agents per tree, and a spawn budget per subtree of each root child.                                                         |
+| INV-5  | [CHANGED] Two limits, enforced at spawn time by the broker: max nesting depth and total spawn count. A subtree may tighten them but never loosen them.                                                                                                                                               |
 | INV-6  | A send or call to an unknown or terminated agent fails immediately. A pending call fails when its target goes DOWN or its deadline passes.                                                                                                                                                           |
 | INV-7  | A pi reload of any agent loses no mail, no identity, no children and no pending calls.                                                                                                                                                                                                               |
 | INV-8  | [CHANGED] Every payload is bounded: message, result, and mailbox depth and bytes. Mailbox overflow fails the send explicitly. Truncation is explicit, never silent.                                                                                                                                  |
