@@ -425,7 +425,7 @@ A reload loses the unaccepted frames held in memory. A tool interrupted by the r
 
 ## Confirmed defaults
 
-User-confirmed: G = 60 s; only two limits, max depth (2) and spawn count (40 per tree), both configurable. Proposed, pending confirmation: root G = 300 s, so a slow root reload or a closed terminal doesn't kill the tree.
+User-confirmed 2026-10-05: G = 60 s for children and 300 s for the root; only two limits, max depth (2) and spawn count (40 per tree), both configurable; mailbox safety caps of 200 messages / 2 MiB of ordinary mail per agent, with a 400-slot reserve for DOWN notices and replies.
 
 ## Revision log
 
