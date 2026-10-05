@@ -217,9 +217,11 @@ module pi_actors {
       avail.length() > 0,
       val m = avail.head()
       val seen = s.persisted.get(id).contains(m.uid)
+      // Also skip a message this client is still delivering (fetched before a broker restart).
+      val inFlight = s.fetched.get(id).select(x => x.uid == m.uid).length() > 0
       s' = { ...s,
         leases: s.leases.setBy(id, x => x.union(Set(m.uid))),
-        fetched: if (seen) s.fetched else s.fetched.setBy(id, l => l.append(m)),
+        fetched: if (seen or inFlight) s.fetched else s.fetched.setBy(id, l => l.append(m)),
         pendingAck: if (seen) s.pendingAck.setBy(id, x => x.union(Set(m.uid))) else s.pendingAck,
         redeliveries: if (seen) s.redeliveries + 1 else s.redeliveries,
       },
@@ -416,4 +418,13 @@ module pi_actors {
       .then(clientAccepted("r")).then(reload("r")).then(hello("r")).then(send("r", "a"))
       .then(brokerAccept("r")).then(clientAccepted("r"))
       .then(all { assert(s.mailbox.get("a").length() == 2 and all_invariants), s' = s })
+
+  // Found by the Tree property test: a delivery in flight across a broker restart.
+  run inFlightAcrossBrokerRestartTest =
+    init.then(spawn("r", "a")).then(hello("a")).then(send("r", "a")).then(brokerAccept("r"))
+      .then(clientAccepted("r")).then(fetch("a")).then(brokerCrash).then(brokerRestart)
+      .then(hello("a")).then(fetch("a"))
+      .then(all { assert(s.fetched.get("a").length() == 1 and all_invariants), s' = s })
+      .then(persist("a"))
+      .then(all { assert(all_invariants), s' = s })
 }
