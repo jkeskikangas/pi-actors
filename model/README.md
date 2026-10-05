@@ -9,6 +9,10 @@ Run it with `npm run model`. That command:
 - checks that every reachability witness is reached;
 - checks that every bug in `mutants.py` is caught.
 
+## Push delivery (design v4)
+
+The model's `fetch` / `persist` / `ack` actions describe the client's mailroom, not a model-facing tool: the client fetches (leases) messages when notified, injects them as one stamped entry (`persist` is that entry being saved), and acks at `turn_end`. So v4's push delivery is covered as is.
+
 ## Covered
 
 Lifecycle and DOWN notices, links, depth and spawn limits, sender sequence numbers with retransmit, leased fetch with client dedupe and deferred ack, reloads, process crashes, and broker crash with effect-free replay plus `recover()`.

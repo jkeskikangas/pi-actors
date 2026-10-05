@@ -422,6 +422,13 @@ Delivery: idle agent → `sendMessage(..., {triggerTurn: true})`; busy agent →
    - `fork-model`: `--fork` with another `--model` works; the new session's cwd is the process cwd → UC-2 holds; resume passes `--model` again.
 1. **Tree property tests** mirror the model's invariants (D15).
 
+## Implementation verification (v0.1.0, 2026-10-05)
+
+- `npm test` (37): reducer scenarios and properties (3,000 random executions × 150 steps against the model's invariants), push delivery, conformance, and model-free broker integration (real broker and Keepers with fake agents, including a broker SIGKILL mid-run).
+- `npm run test:live` (3, real pi 1.0.3, scripted provider): a spawn → report → follow-up → report → stop round trip; a fork that sees the parent's conversation on another model; a herdr pane child (inside herdr only). Also run against the packed tarball installed in `node_modules`.
+- `npm run model`: 6 scenarios, random simulation, 5 witnesses, 6 mutants (all caught).
+- Bugs found during implementation and fixed: `recover` was not logged (second restart); in-flight double consumption across a broker restart; `welcome` delivering before the client was stored; built-in pi options rejecting `--name=value`; herdr's `process-info` syntax and agent-name rules; a pane child's hello arriving before its pane was recorded.
+
 ## Conformance rules (machine-checkable; `test/conformance.test.ts`)
 
 - `src/protocol.ts` and `src/tree.ts` import nothing except each other.

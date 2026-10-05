@@ -16,6 +16,7 @@ export interface Identity {
 }
 
 export interface FetchFilter {
+	all?: boolean;
 	kind?: MessageKind;
 	from?: string;
 	tag?: string;

@@ -91,7 +91,7 @@ export type Event =
 	| { type: "answer"; now: number; from: string; seq: number; ref: string; body: string }
 	| { type: "exit"; now: number; from: string; seq: number; result: string; truncated: boolean; error?: boolean }
 	| { type: "kill"; now: number; from: string; seq: number; target: string }
-	| { type: "fetch"; id: string; fetchId: string; kind?: MessageKind; from?: string; tag?: string; ref?: string }
+	| { type: "fetch"; id: string; fetchId: string; kind?: MessageKind; from?: string; tag?: string; ref?: string; all?: boolean }
 	| { type: "ack"; id: string; msgId: string }
 	| { type: "release"; id: string; msgId: string }
 	| { type: "procStart"; id: string; inc: number; pid: number }
@@ -420,7 +420,7 @@ function send(st: TreeState, sender: Agent, ev: Extract<Event, { type: "send" }>
 		sender.reserve += 1;
 		st.calls[msgId] = { caller: sender.id, target: ev.to, deadline: ev.now + (ev.timeoutS ?? 600) * 1000 };
 	}
-	enqueue(st, { id: msgId, from: sender.id, to: ev.to, kind: ev.kind, body: ev.body, tag: ev.tag, ref: ev.kind === "call" ? msgId : undefined, urgent: ev.urgent });
+	enqueue(st, { id: msgId, from: sender.id, to: ev.to, kind: ev.kind, body: ev.body, tag: ev.tag, ref: ev.kind === "call" ? msgId : ev.ref, urgent: ev.urgent });
 	if (!toHuman) fx.push({ type: "notify", id: ev.to, urgent: !!ev.urgent });
 	else fx.push({ type: "notify", id: ROOT, urgent: true });
 	return { ok: true, type: "accepted", msgId };
@@ -452,6 +452,7 @@ function answer(st: TreeState, sender: Agent, ev: Extract<Event, { type: "answer
 }
 
 function matches(m: Message, f: Extract<Event, { type: "fetch" }>): boolean {
+	if (f.all) return true; // push delivery takes everything, replies included
 	if (f.ref !== undefined) return m.ref === f.ref && m.kind === "reply";
 	if (f.kind !== undefined ? m.kind !== f.kind : m.kind === "reply") return false;
 	if (f.from !== undefined && m.from !== f.from) return false;

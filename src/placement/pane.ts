@@ -32,20 +32,30 @@ export async function herdrAvailable(rootPaneId: string | undefined): Promise<bo
 	}
 }
 
+/** herdr agent names are global across herdr: prefix with the tree id. */
+// herdr requires: lowercase letter first, then [a-z0-9_-], at most 32 characters.
+export const paneAgentName = (treeId: string, id: string) =>
+	`a${treeId.slice(-6)}-${id}`.toLowerCase().replace(/[^a-z0-9_-]/g, "-").slice(0, 32);
+
 /** Split a pane next to the root's and start pi in it with the given pi arguments. */
 export async function startPane(rootPaneId: string, name: string, cwd: string, piArgs: string[]): Promise<PaneHandle> {
 	const split = (await herdr(["pane", "split", rootPaneId, "--direction", "right", "--cwd", cwd, "--no-focus"])) as { pane?: { pane_id?: string } };
 	const paneId = split?.pane?.pane_id;
 	if (!paneId) throw new Error("herdr pane split returned no pane id");
-	await herdr(["agent", "start", name, "--kind", "pi", "--pane", paneId, "--timeout", "120000", "--", ...piArgs], 130_000);
+	try {
+		await herdr(["agent", "start", name, "--kind", "pi", "--pane", paneId, "--timeout", "120000", "--", ...piArgs], 130_000);
+	} catch (err) {
+		await closePane(paneId);
+		throw err;
+	}
 	return { paneId };
 }
 
 /** The pane's foreground process group: the identity check for pane children (D11). */
 export async function paneForegroundGroup(paneId: string): Promise<number | undefined> {
 	try {
-		const info = (await herdr(["pane", "process-info", paneId], 5000)) as { foreground_process_group_id?: number };
-		return info?.foreground_process_group_id;
+		const info = (await herdr(["pane", "process-info", "--pane", paneId], 5000)) as { process_info?: { foreground_process_group_id?: number } };
+		return info?.process_info?.foreground_process_group_id;
 	} catch {
 		return undefined;
 	}

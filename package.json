@@ -1,21 +1,56 @@
 {
   "name": "pi-actors",
-  "version": "0.0.1",
-  "private": true,
-  "description": "OTP-inspired subagents for pi: spawn, fork, send, call, receive, links and supervision over one broker per agent tree.",
-  "type": "module",
+  "version": "0.1.0",
+  "description": "Subagents for pi, built like Erlang processes: spawn fresh or forked children on any model, message them, and get their reports pushed back. Survives reloads and crashes.",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-extension",
+    "subagents",
+    "agents",
+    "orchestration",
+    "fork",
+    "herdr"
+  ],
   "license": "MIT",
   "author": "Jarno Keskikangas",
-  "engines": { "node": ">=22.18" },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jkeskikangas/pi-actors.git"
+  },
+  "homepage": "https://github.com/jkeskikangas/pi-actors#readme",
+  "bugs": {
+    "url": "https://github.com/jkeskikangas/pi-actors/issues"
+  },
+  "type": "module",
+  "engines": {
+    "node": ">=22.18"
+  },
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
   "scripts": {
-    "test": "node --test test/*.test.ts",
+    "test": "node --test test/tree.scenarios.test.ts test/tree.property.test.ts test/mailroom.test.ts test/conformance.test.ts test/broker.test.ts",
+    "test:live": "node --test test/live.test.ts",
     "typecheck": "tsc --noEmit -p .",
     "model": "quint typecheck model/pi_actors.qnt && sh model/check.sh"
   },
-  "peerDependencies": { "@earendil-works/pi-coding-agent": "*", "typebox": "*" },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
   "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^1.0.3",
     "@informalsystems/quint": "^0.33.0",
     "@types/node": "^26.6.4",
+    "typebox": "^1.3.35",
     "typescript": "^7.0.2"
   }
 }

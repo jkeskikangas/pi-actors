@@ -4,7 +4,7 @@
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type Server, type Socket } from "node:net";
 import { join } from "node:path";
-import { closePane, herdrAvailable, listPanes, paneForegroundGroup, startPane } from "../placement/pane.ts";
+import { closePane, herdrAvailable, listPanes, paneAgentName, paneForegroundGroup, startPane } from "../placement/pane.ts";
 import { signalGroup, startHeadless } from "../placement/headless.ts";
 import { decode, encode, PROTO, TIMING } from "../protocol.ts";
 import { acquireLock, type Config, ensureDir, releaseLock } from "../runtime.ts";
@@ -75,7 +75,7 @@ export async function startBroker(dir: string, sock: string, config: Config): Pr
 				ctx.gen = a.conn;
 				ctx.inc = a.inc;
 				agentConn.set(e.to, ctx);
-				send(ctx, { t: "welcome", lastSeq: e.lastSeq, mailbox: e.mailbox, id: e.to, inc: a.inc, treeId: st.treeId });
+				send(ctx, { t: "welcome", lastSeq: e.lastSeq, mailbox: e.mailbox, id: e.to, inc: a.inc, parent: a.parent, treeId: st.treeId });
 				break;
 			}
 			case "reject":
@@ -144,8 +144,9 @@ export async function startBroker(dir: string, sock: string, config: Config): Pr
 		];
 		if (resumeSession) args.push("--session", resumeSession);
 		else if (spec.context === "fork" && parentSession) args.push("--fork", parentSession);
-		if (spec.model) args.push(`--model=${spec.model}`);
-		if (spec.thinking) args.push(`--thinking=${spec.thinking}`);
+		// Built-in pi options take the value as a separate argument; only extension flags accept --name=value.
+		if (spec.model) args.push("--model", spec.model);
+		if (spec.thinking) args.push("--thinking", spec.thinking);
 		args.push(...(config.childArgs ?? []));
 		return args;
 	};
@@ -156,8 +157,13 @@ export async function startBroker(dir: string, sock: string, config: Config): Pr
 		try {
 			if (spec.placement === "pane") {
 				if (!(await herdrAvailable(config.rootPaneId))) throw new Error("herdr_unavailable");
-				const h = await startPane(config.rootPaneId!, id, cwd, piArgs);
+				const h = await startPane(config.rootPaneId!, paneAgentName(config.treeId, id), cwd, piArgs);
 				panes.set(id, h.paneId);
+				const held = pendingHello.get(id);
+				if (held) {
+					pendingHello.delete(id);
+					await helloEvent(held.conn, held.frame);
+				}
 				return;
 			}
 			const argv = config.childCommand ? [...config.childCommand, ...piArgs] : [...config.piCommand, "--mode", "rpc", ...piArgs];
@@ -198,6 +204,12 @@ export async function startBroker(dir: string, sock: string, config: Config): Pr
 			return;
 		}
 		c.role = "agent";
+		// A pane child can say hello before `herdr agent start` returns its pane: hold it until then.
+		const a0 = st.agents[f.id];
+		if (a0?.spec?.placement === "pane" && a0.status === "starting" && !panes.has(f.id)) {
+			pendingHello.set(f.id, { conn: c, frame: f });
+			return;
+		}
 		const fx = run({
 			type: "hello", now: Date.now(), id: f.id, inc: f.inc, pid: f.pid, sessionId: f.sessionId, sessionFile: f.sessionFile,
 			ownsPid: await ownsPid(f), recordedPidAlive: f.id === ROOT ? pidAlive(st.agents[ROOT]?.pid) : undefined,
@@ -251,7 +263,7 @@ export async function startBroker(dir: string, sock: string, config: Config): Pr
 				return;
 			}
 			case "fetch":
-				run({ type: "fetch", id: f.human ? HUMAN : id, fetchId: String(f.fetchId), kind: f.kind as never, from: f.from as string | undefined, tag: f.tag as string | undefined, ref: f.ref as string | undefined }, c);
+				run({ type: "fetch", id: f.human ? HUMAN : id, fetchId: String(f.fetchId), all: !!f.all, kind: f.kind as never, from: f.from as string | undefined, tag: f.tag as string | undefined, ref: f.ref as string | undefined }, c);
 				return;
 			case "ack":
 				run({ type: "ack", id: f.human ? HUMAN : id, msgId: String(f.msgId) });
