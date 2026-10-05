@@ -26,17 +26,18 @@ Primary workflow: a coordinator works through a backlog. For each item it starts
 
 ## Invariants
 
-| ID    | Invariant                                                                                                                                                     |
-| ----- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| INV-1 | No orphans: an agent whose parent link is lost terminates within grace period G (default 60 s).                                                               |
-| INV-2 | Every child termination produces exactly one DOWN notice to its parent, with a reason from: `normal`, `error`, `killed`, `timeout`, `lost`.                   |
-| INV-3 | Effectively-once: while the receiver lives, every accepted message is delivered at least once, and the receiving agent consumes each message ID at most once. |
-| INV-4 | FIFO per (sender, receiver) pair.                                                                                                                             |
-| INV-5 | Limits (depth, spawn budget, concurrent children) are enforced at spawn time by the broker, and a child's limits are never looser than its parent's.          |
-| INV-6 | A send or call to an unknown or terminated agent fails immediately. A pending call fails when its target goes DOWN or its deadline passes.                    |
-| INV-7 | A pi reload of any agent loses no mail, no identity, no children and no pending calls.                                                                        |
-| INV-8 | Every payload is bounded (message, result, mailbox). Truncation is explicit, never silent.                                                                    |
-| INV-9 | Messaging semantics are identical regardless of where an agent runs (headless or terminal pane).                                                              |
+| ID     | Invariant                                                                                                                                                                                                                                                                                            |
+| ------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| INV-1  | [CHANGED] No orphans: once the loss of an agent's parent link is detected, the agent terminates within G + 15 s (G default 60 s; 300 s for the root agent, so a slow root reload does not kill the tree).                                                                                            |
+| INV-2  | [CHANGED] Every termination of an agent incarnation produces exactly one DOWN notice to its parent, with a reason from: `normal`, `error`, `killed`, `timeout`, `lost`.                                                                                                                              |
+| INV-3  | [CHANGED] Effectively-once: while the receiver lives, every accepted message is delivered at least once, and the receiving agent consumes each message ID at most once. Retries by the sending extension never create a new message. A message the *model* deliberately sends twice is two messages. |
+| INV-4  | [CHANGED] FIFO per sender incarnation.                                                                                                                                                                                                                                                               |
+| INV-5  | [CHANGED] Limits are enforced at spawn time by the broker, and a child's limits are never looser than its parent's. The limits are: depth, live children per agent, live agents per tree, and a spawn budget per subtree of each root child.                                                         |
+| INV-6  | A send or call to an unknown or terminated agent fails immediately. A pending call fails when its target goes DOWN or its deadline passes.                                                                                                                                                           |
+| INV-7  | A pi reload of any agent loses no mail, no identity, no children and no pending calls.                                                                                                                                                                                                               |
+| INV-8  | [CHANGED] Every payload is bounded: message, result, and mailbox depth and bytes. Mailbox overflow fails the send explicitly. Truncation is explicit, never silent.                                                                                                                                  |
+| INV-10 | [NEW] At most one process acts as a given agent incarnation at a time. An inherited environment or a stale connection cannot take over an identity.                                                                                                                                                  |
+| INV-9  | Messaging semantics are identical regardless of where an agent runs (headless or terminal pane).                                                                                                                                                                                                     |
 
 ## Non-functional requirements
 
