@@ -152,3 +152,25 @@ export function releaseLock(dir: string): void {
 		// already gone
 	}
 }
+
+/** Child environment: everything except herdr's pane identity (operator N2) and our own vars. */
+export function childEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+	const out: NodeJS.ProcessEnv = {};
+	for (const [k, v] of Object.entries(env)) if (!k.startsWith("HERDR_") && !k.startsWith("PI_ACTORS_")) out[k] = v;
+	// Test isolation hooks are kept.
+	if (env.PI_ACTORS_HOME) out.PI_ACTORS_HOME = env.PI_ACTORS_HOME;
+	if (env.PI_ACTORS_SOCKET_DIR) out.PI_ACTORS_SOCKET_DIR = env.PI_ACTORS_SOCKET_DIR;
+	return out;
+}
+
+export interface KeeperSpec {
+	id: string;
+	inc: number;
+	socket: string;
+	/** Child command: [executable, ...args]. */
+	argv: string[];
+	cwd: string;
+	logDir: string;
+	/** How long the Keeper keeps a finished child's exit report while the broker is unreachable. */
+	graceMs: number;
+}
