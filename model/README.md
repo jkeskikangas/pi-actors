@@ -15,7 +15,7 @@ The model's `fetch` / `persist` / `ack` actions describe the client's mailroom, 
 
 ## Covered
 
-Lifecycle and DOWN notices, links, depth and spawn limits, sender sequence numbers with retransmit, leased fetch with client dedupe and deferred ack, reloads, process crashes, and broker crash with effect-free replay plus `recover()`.
+Lifecycle and DOWN notices, links, depth and spawn limits, sender sequence numbers with retransmit, leased fetch with client dedupe and deferred ack, pi dropping an injected message and the reclaim that redelivers it, reloads, process crashes, and broker crash with effect-free replay plus `recover()`.
 
 ## Not covered (yet)
 

@@ -21,7 +21,7 @@ Running agents in the background goes wrong in predictable ways: messages get lo
 
 | Tool | What it does |
 |---|---|
-| `spawn{task, name?, model?, thinking?, fork?, cwd?, pane?, timeout_minutes?, resume?}` | Starts a child and returns its id immediately. `fork: true` gives the child a copy of this conversation. `model` can be any provider's model, and `cwd` can point to, say, a git worktree. `pane: true` runs the child in a visible [herdr](https://herdr.dev) pane. |
+| `spawn{task, name?, model?, thinking?, fork?, cwd?, pane?, timeout_minutes?, resume?}` | Starts a child and returns its id immediately. `fork: true` gives the child a copy of this conversation. `model` can be any provider's model, and `cwd` can point to, say, a git worktree. `pane: true` runs the child in a visible pane when pi runs inside [herdr](https://herdr.dev) or tmux. |
 | `send{to, text, reply_to?, choices?, multi?, urgent?}` | Sends a message to a child (by id), to `"parent"`, or to `"human"`. It never blocks. `reply_to` answers a message. For a question to the human, `choices` offers options and `multi` allows picking several. |
 | `stop{id}` | Stops a child, together with its own children. |
 
@@ -43,16 +43,20 @@ While agents are working or waiting on you, a line under the editor says so: `pi
   - "Type something…" lets you answer in your own words.
   - `t` shows the agent's recent work, and `d` declines, telling the agent to use its own judgment.
   - Your answer goes back to exactly that agent and question.
-- **Agents come next**, showing each one's status, model and placement. Enter shows an agent's recent transcript: its task, the tools it ran and what it said. For an agent in a herdr pane, `f` jumps to its pane.
+- **Agents come next**, showing each one's status, model and placement. Enter shows an agent's recent transcript: its task, the tools it ran and what it said. For an agent in a pane, `f` jumps to it.
 
 `/inbox` opens the same panel. Without a TUI (RPC or print mode), `/inbox` lists the questions and `/answer <#> <text>` or `/answer <#> 1,3` replies.
 
-## herdr (optional)
+## Panes in herdr or tmux (optional)
 
-Everything works without [herdr](https://herdr.dev). Inside herdr, you also get:
+Everything works in a plain terminal. If pi runs inside [herdr](https://herdr.dev) or tmux, you also get:
 
-- **Visible children:** `pane: true` puts a child in its own pane, where you can watch it and talk to it. Its questions appear right there.
-- **Notifications:** the pane where a question should be answered is marked as waiting for you. That's the asking child's own pane, or the root's pane for everything else. herdr then notifies you, and the mark clears once the question is answered.
+- **Visible children:** `pane: true` puts a child in its own pane next to yours, where you can watch it and talk to it. Its questions appear right there. If tmux runs inside herdr, the panes open in tmux, the multiplexer you're actually looking at.
+- **Notifications:**
+  - **In herdr,** the pane where a question should be answered is marked as waiting for you, which is the asking child's own pane or the root's pane for everything else. The mark clears once the question is answered.
+  - **In tmux,** the pane rings the terminal bell, so tmux flags the window, and a short message names who is asking.
+
+Outside both, `pane: true` fails immediately with a clear message.
 
 ## Commands
 
@@ -85,13 +89,13 @@ Under [pi-verified-goal](https://github.com/jkeskikangas/pi-verified-goal)'s `/g
 ## Requirements
 
 - pi 1.0 or newer, running on Node 22.18 or newer.
-- Optional: herdr 0.9 or newer.
+- Optional: herdr 0.9 or newer, or tmux 3.2 or newer, for panes.
 
 ## Development
 
 ```
 npm install
 npm test            # unit, property, broker and extension tests (no model calls)
-npm run test:live   # real pi with a scripted model: round trip, fork, and a herdr pane (inside herdr only)
+npm run test:live   # real pi with a scripted model: round trip, fork, a tmux pane, and a herdr pane (inside herdr only)
 npm run model       # the Quint model: scenarios, simulation, and the injected-bug suite
 ```

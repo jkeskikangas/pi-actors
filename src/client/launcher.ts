@@ -11,6 +11,7 @@ export interface LaunchOptions {
 	treeId: string;
 	rootCwd: string;
 	limits?: Partial<Limits>;
+	mux?: "herdr" | "tmux";
 	rootPaneId?: string;
 	childArgs?: string[];
 	childCommand?: string[];
@@ -53,7 +54,7 @@ export async function ensureBroker(opts: LaunchOptions): Promise<string> {
 	let config: Config;
 	if (existsSync(configPath)) {
 		// The code snapshot stays pinned; where the root lives and how children start may change.
-		config = { ...JSON.parse(readFileSync(configPath, "utf8")), rootCwd: opts.rootCwd, rootPaneId: opts.rootPaneId, childArgs: opts.childArgs, childCommand: opts.childCommand };
+		config = { ...JSON.parse(readFileSync(configPath, "utf8")), rootCwd: opts.rootCwd, mux: opts.mux, rootPaneId: opts.rootPaneId, childArgs: opts.childArgs, childCommand: opts.childCommand };
 		writeFileSync(configPath, JSON.stringify(config, null, 1), { mode: 0o600 });
 	}
 	else {
@@ -63,6 +64,7 @@ export async function ensureBroker(opts: LaunchOptions): Promise<string> {
 			rootCwd: opts.rootCwd,
 			piCommand: opts.piCommand ?? piCommandFromProcess(),
 			runtimeDir: ensureSnapshot(),
+			mux: opts.mux,
 			rootPaneId: opts.rootPaneId,
 			childArgs: opts.childArgs,
 			childCommand: opts.childCommand,

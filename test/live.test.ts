@@ -2,7 +2,7 @@
 // Root spawns a child, receives its pushed report, sends a follow-up, receives the second
 // report, stops the child and receives its end notice.
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { after, test } from "node:test";
@@ -119,4 +119,37 @@ test("pane placement: an interactive child in a herdr pane reports and is stoppe
 	const texts = await runRoot("./fixtures/faux-root-pane.ts", "start", "PANE DONE");
 	assert.ok(texts.some((t) => t.includes("Report from panekid") && t.includes("hello from kid")), texts.join("\n"));
 	assert.ok(texts.some((t) => t.includes("has ended")), texts.join("\n"));
+});
+
+const hasTmux = (() => {
+	try {
+		return spawnSync("tmux", ["-V"]).status === 0;
+	} catch {
+		return false;
+	}
+})();
+
+test("tmux placement: a child in a tmux pane reports and its pane closes when stopped", { timeout: 120_000, skip: hasTmux ? false : "needs tmux" }, async () => {
+	const sock = `pia-test-${process.pid}`;
+	const t = (...args: string[]) => spawnSync("tmux", ["-L", sock, ...args], { encoding: "utf8" });
+	const childArgs = JSON.stringify([...base.slice(2), "-e", here("./fixtures/faux-kid.ts"), "--model", "faux/faux-1"]);
+	const root = ["pi", ...base.slice(2), "-e", here("../src/index.ts"), "-e", here("./fixtures/faux-root-pane.ts"), "--model", "faux/faux-1", "--session-dir", join(home, "tmux-sessions")];
+	t("new-session", "-d", "-s", "t", "-x", "220", "-y", "50", "-c", home, "-e", `PI_ACTORS_HOME=${join(home, "th")}`, "-e", `PI_ACTORS_SOCKET_DIR=${join(home, "ts")}`, "-e", `PI_ACTORS_CHILD_ARGS=${childArgs}`, "--", ...root);
+	try {
+		const screen = () => t("capture-pane", "-p", "-t", "t").stdout;
+		const waitFor = async (pred: () => boolean, what: string, ms = 60_000) => {
+			const end = Date.now() + ms;
+			while (!pred()) {
+				if (Date.now() > end) throw new Error(`timeout waiting for ${what}:\n${screen()}`);
+				await new Promise((r) => setTimeout(r, 300));
+			}
+		};
+		await waitFor(() => /faux-1/.test(screen()), "the root TUI");
+		t("send-keys", "-t", "t", "start", "Enter");
+		await waitFor(() => t("list-panes", "-t", "t", "-F", "#{pane_id}").stdout.trim().split("\n").length === 2, "the child's pane");
+		await waitFor(() => /PANE DONE/.test(screen()), "the report and the stop");
+		await waitFor(() => t("list-panes", "-t", "t", "-F", "#{pane_id}").stdout.trim().split("\n").length === 1, "the child's pane to close");
+	} finally {
+		t("kill-server");
+	}
 });

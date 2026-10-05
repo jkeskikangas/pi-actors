@@ -5,6 +5,7 @@ import { rmSync, writeFileSync } from "node:fs";
 import { createServer, type Server, type Socket } from "node:net";
 import { dirname, join } from "node:path";
 import { closePane, herdrAvailable, listPanes, paneAgentName, paneForegroundGroup, startPane } from "../placement/pane.ts";
+import { closeTmuxPane, listTmuxPanes, startTmuxPane, tmuxAvailable, tmuxPanePid } from "../placement/tmux.ts";
 import { signalGroup, startHeadless } from "../placement/headless.ts";
 import { decode, encode, PROTO, TIMING } from "../protocol.ts";
 import { acquireLock, type Config, ensureDir, ensurePrivateDir, pidAlive, releaseLock } from "../runtime.ts";
@@ -110,7 +111,7 @@ export async function startBroker(dir: string, sock: string, config: Config): Pr
 				const a = st.agents[e.id];
 				if (k) send(k, { t: "signal", sig: e.sig });
 				else if (a?.pid && a.spec?.placement === "headless") signalGroup(a.pid, e.sig);
-				else if (panes.has(e.id) && e.sig === "KILL") void closePane(panes.get(e.id)!);
+				else if (panes.has(e.id) && e.sig === "KILL") void mux.close(panes.get(e.id)!);
 				break;
 			}
 			case "start":
@@ -120,12 +121,30 @@ export async function startBroker(dir: string, sock: string, config: Config): Pr
 				const pane = panes.get(e.id);
 				if (pane) {
 					panes.delete(e.id);
-					void closePane(pane);
+					void mux.close(pane);
 				}
 				if (finished(st)) void shutdown();
 				break;
 			}
 		}
+	};
+
+	// ------------------------------------------------------------ the root's multiplexer (optional)
+
+	const mux = {
+		available: () => (config.mux === "tmux" ? tmuxAvailable(config.rootPaneId) : config.mux === "herdr" ? herdrAvailable(config.rootPaneId) : Promise.resolve(false)),
+		start: async (id: string, cwd: string, piArgs: string[]): Promise<string> => {
+			if (config.mux === "tmux") {
+				// A tmux pane starts with tmux's environment: pass what the child needs explicitly.
+				const env: Record<string, string> = {};
+				for (const k of ["PI_ACTORS_HOME", "PI_ACTORS_SOCKET_DIR", "PATH"]) if (process.env[k]) env[k] = process.env[k]!;
+				return startTmuxPane(config.rootPaneId!, cwd, [...config.piCommand, ...piArgs], env);
+			}
+			return (await startPane(config.rootPaneId!, paneAgentName(config.treeId, id), cwd, piArgs)).paneId;
+		},
+		pid: (pane: string) => (config.mux === "tmux" ? tmuxPanePid(pane) : paneForegroundGroup(pane)),
+		list: () => (config.mux === "tmux" ? listTmuxPanes() : listPanes()),
+		close: (pane: string) => (config.mux === "tmux" ? closeTmuxPane(pane) : closePane(pane)),
 	};
 
 	const humanPending = () => (st.mailbox[HUMAN] ?? []).length;
@@ -163,10 +182,10 @@ export async function startBroker(dir: string, sock: string, config: Config): Pr
 		const piArgs = childArgs(id, inc, spec, parentSession, resumeSession);
 		try {
 			if (spec.placement === "pane") {
-				if (!(await herdrAvailable(config.rootPaneId))) throw new Error("herdr_unavailable");
-				const h = await startPane(config.rootPaneId!, paneAgentName(config.treeId, id), cwd, piArgs);
-				panes.set(id, h.paneId);
-				run({ type: "placed", id, inc, paneId: h.paneId }); // logged: survives broker restarts (F5)
+				if (!(await mux.available())) throw new Error("no terminal multiplexer (herdr or tmux) for a pane child");
+				const paneId = await mux.start(id, cwd, piArgs);
+				panes.set(id, paneId);
+				run({ type: "placed", id, inc, paneId }); // logged: survives broker restarts (F5)
 				const held = pendingHello.get(id);
 				if (held) {
 					pendingHello.delete(id);
@@ -200,7 +219,7 @@ export async function startBroker(dir: string, sock: string, config: Config): Pr
 		if (a.pid !== undefined && a.pid === f.pid) return true; // the recorded pid (also after a restart)
 		if (a.spec?.placement === "pane") {
 			const pane = panes.get(f.id);
-			return pane ? (await paneForegroundGroup(pane)) === f.pid || a.pid === f.pid : false;
+			return pane ? (await mux.pid(pane)) === f.pid : false;
 		}
 		return a.pid === undefined || a.pid === f.pid;
 	};
@@ -302,7 +321,7 @@ export async function startBroker(dir: string, sock: string, config: Config): Pr
 
 	const processGone = async (a: TreeState["agents"][string]): Promise<boolean> => {
 		if (a.procGone) return true;
-		if (a.spec?.placement === "pane") return a.paneId ? !(await listPanes())?.has(a.paneId) : true;
+		if (a.spec?.placement === "pane") return a.paneId ? !(await mux.list())?.has(a.paneId) : true;
 		return !a.pid || !pidAlive(a.pid);
 	};
 
@@ -311,7 +330,7 @@ export async function startBroker(dir: string, sock: string, config: Config): Pr
 		self: forId,
 		agents: Object.values(st.agents).map((a) => ({
 			id: a.id, parent: a.parent, status: a.status, inc: a.inc, reason: a.reason, connected: a.connected,
-			placement: a.spec?.placement, model: a.spec?.model, mailbox: (st.mailbox[a.id] ?? []).length, spawns: a.spawns, limits: a.limits, sessionFile: a.sessionFile, task: a.spec?.task?.slice(0, 200),
+			placement: a.spec?.placement, paneId: a.paneId, model: a.spec?.model, mailbox: (st.mailbox[a.id] ?? []).length, spawns: a.spawns, limits: a.limits, sessionFile: a.sessionFile, task: a.spec?.task?.slice(0, 200),
 		})),
 		human: (st.mailbox[HUMAN] ?? []).map((m) => ({ ref: m.ref, from: m.from, body: m.body, fromPane: st.agents[m.from]?.spec?.placement === "pane" })),
 		pendingCalls: Object.entries(st.calls).filter(([, c]) => c.caller === forId).map(([ref]) => ref),
@@ -391,7 +410,7 @@ export async function startBroker(dir: string, sock: string, config: Config): Pr
 
 	const paneTimer = setInterval(async () => {
 		if (panes.size === 0) return;
-		const alive = await listPanes();
+		const alive = await mux.list();
 		if (!alive) return;
 		for (const [id, pane] of panes) {
 			if (alive.has(pane)) continue;

@@ -16,7 +16,7 @@ import { ensureBroker } from "./client/launcher.ts";
 import { ENTRY_TYPE, formatDelivery, Mailroom } from "./client/mailroom.ts";
 import { encodeQuestion, formatAnswer, itemsFrom, openCard, type PanelAction, type PanelKey, type PanelState, parseQuestion, press, readTranscript, render, summary } from "./client/panel.ts";
 import type { Snapshot } from "./client/connection.ts";
-import { paneAgentName, stateRoot } from "./runtime.ts";
+import { detectMux, paneAgentName, stateRoot } from "./runtime.ts";
 import { type Limits, TIMING } from "./protocol.ts";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -88,7 +88,8 @@ export default function piActors(pi: ExtensionAPI) {
 		// or a new one. A finished tree (stopped, or its root was gone too long) is replaced (F7).
 		let treeId = rootTreeId(ctx) ?? carriedTreeId() ?? newTreeId();
 		for (let attempt = 0; ; attempt++) {
-			const launch = { treeId, rootCwd: ctx.cwd, rootPaneId: process.env.HERDR_PANE_ID, childArgs: jsonEnv("PI_ACTORS_CHILD_ARGS"), childCommand: jsonEnv("PI_ACTORS_CHILD_COMMAND"), limits: readLimits() };
+			const where = detectMux();
+			const launch = { treeId, rootCwd: ctx.cwd, mux: where?.mux, rootPaneId: where?.pane, childArgs: jsonEnv("PI_ACTORS_CHILD_ARGS"), childCommand: jsonEnv("PI_ACTORS_CHILD_COMMAND"), limits: readLimits() };
 			try {
 				const socket = await ensureBroker(launch);
 				const c = await open(ctx, { socket, id: "root", inc: 1, pid: process.pid, sessionId: sm.getSessionId(), sessionFile: sm.getSessionFile() }, TIMING.rootGraceMs, () => ensureBroker(launch).then(() => {}));
@@ -256,15 +257,22 @@ export default function piActors(pi: ExtensionAPI) {
 	 * answers go through its panel. Edge-triggered and paired, so the integration's count is exact.
 	 */
 	function signalHerdr() {
-		if (process.env.HERDR_ENV !== "1" || ctxRef?.mode !== "tui") return;
+		const where = detectMux();
+		if (!where || ctxRef?.mode !== "tui") return;
 		let askers: string[] = [];
 		if (self === "root") askers = (lastSnap?.human ?? []).filter((q) => !q.fromPane).map((q) => q.from);
 		else if (awaitingHuman.size > 0) askers = [self];
 		const want = askers.length > 0;
 		const label = want ? `pi-actors: ${askers.length} question${askers.length === 1 ? "" : "s"} (${[...new Set(askers)].join(", ")})`.slice(0, 120) : "";
 		if (want === herdrBlocked && label === herdrLabel) return;
-		if (herdrBlocked) pi.events.emit("herdr:blocked", { active: false });
-		if (want) pi.events.emit("herdr:blocked", { active: true, label });
+		if (where.mux === "herdr") {
+			if (herdrBlocked) pi.events.emit("herdr:blocked", { active: false });
+			if (want) pi.events.emit("herdr:blocked", { active: true, label });
+		} else if (want && !herdrBlocked) {
+			// tmux has no "waiting for you" state: ring the bell (tmux flags the window) and say why.
+			process.stdout.write("\x07");
+			execFile("tmux", ["display-message", "-t", where.pane, "-d", "8000", label], () => {});
+		}
 		herdrBlocked = want;
 		herdrLabel = label;
 	}
@@ -362,7 +370,10 @@ export default function piActors(pi: ExtensionAPI) {
 			const typed = await ctx.ui.input(`Answer ${action.from}: ${action.q.text.slice(0, 200)}`, action.picked.length ? `with ${action.picked.join(", ")}` : "your answer");
 			if (typed?.trim()) body = formatAnswer(action.q, action.picked, typed);
 		} else if (action.type === "focusPane" && lastSnap) {
-			execFile("herdr", ["agent", "focus", paneAgentName(lastSnap.treeId, action.id)], () => {});
+			const where = detectMux();
+			const pane = lastSnap.agents.find((a) => a.id === action.id)?.paneId;
+			if (where?.mux === "herdr") execFile("herdr", ["agent", "focus", paneAgentName(lastSnap.treeId, action.id)], () => {});
+			else if (where?.mux === "tmux" && pane) execFile("tmux", ["select-window", "-t", pane, ";", "select-pane", "-t", pane], () => {});
 		}
 		if (body === undefined || (action.type !== "answer" && action.type !== "freeText")) return;
 		const r = await c.op("answer", { ref: action.ref, body });
@@ -482,7 +493,7 @@ export default function piActors(pi: ExtensionAPI) {
 			thinking: Type.Optional(Type.String({ description: "Thinking level, e.g. low, medium, high." })),
 			fork: Type.Optional(Type.Boolean({ description: "Start from a copy of this conversation instead of a fresh context." })),
 			cwd: Type.Optional(Type.String({ description: "Working directory, e.g. a git worktree." })),
-			pane: Type.Optional(Type.Boolean({ description: "Run in a visible herdr pane the human can watch and talk to (only when pi runs inside herdr)." })),
+			pane: Type.Optional(Type.Boolean({ description: "Run in a visible pane the human can watch and talk to (only when pi runs inside herdr or tmux)." })),
 			timeout_minutes: Type.Optional(Type.Number({ description: "Stop the child after this much active time." })),
 			resume: Type.Optional(Type.String({ description: "Id of an ended child to restart with its conversation." })),
 		}),
@@ -493,7 +504,7 @@ export default function piActors(pi: ExtensionAPI) {
 			const cwd = p.cwd ? resolve(ctx.cwd, p.cwd) : ctx.cwd;
 			if (!isDir(cwd)) throw new Error(`cwd ${cwd} is not a directory`);
 			// herdr is optional: without it, pane children are unavailable and headless is the default.
-			if (p.pane && process.env.HERDR_ENV !== "1") throw new Error("pane: true needs pi to run inside herdr; omit pane to run the child headless.");
+			if (p.pane && !detectMux()) throw new Error("pane: true needs pi to run inside herdr or tmux; omit pane to run the child headless.");
 			const r = await op(ctx, "spawn", {
 				req: { name: p.name, task: p.task, model: p.model, thinking: p.thinking, context: p.fork ? "fork" : "fresh", cwd, placement: p.pane ? "pane" : "headless", timeoutS: p.timeout_minutes ? p.timeout_minutes * 60 : undefined, resume: p.resume },
 			}, signal);

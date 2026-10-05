@@ -27,7 +27,7 @@ export interface FetchFilter {
 export interface Snapshot {
 	treeId: string;
 	self: string;
-	agents: { id: string; parent: string | null; status: string; inc: number; reason?: string; connected: boolean; placement?: string; model?: string; mailbox: number; spawns: number; sessionFile?: string; task?: string }[];
+	agents: { id: string; parent: string | null; status: string; inc: number; reason?: string; connected: boolean; placement?: string; paneId?: string; model?: string; mailbox: number; spawns: number; sessionFile?: string; task?: string }[];
 	human: { ref?: string; from: string; body: string; fromPane?: boolean }[];
 	pendingCalls: string[];
 	liveChildren: number;

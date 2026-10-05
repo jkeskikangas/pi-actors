@@ -10,7 +10,8 @@
     "agents",
     "orchestration",
     "fork",
-    "herdr"
+    "herdr",
+    "tmux"
   ],
   "license": "MIT",
   "author": "Jarno Keskikangas",

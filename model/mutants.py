@@ -13,7 +13,7 @@ MUTANTS = [
     # so only removing both must be caught.
     ("no-lease and no in-flight dedupe: parallel receives consume the same message (S2)",
      [(".select(m => not(s.leases.get(id).contains(m.uid)))", ".select(m => true)"),
-      ("if (seen or inFlight) s.fetched", "if (seen) s.fetched")], None),
+      ("if (seen or inFlight) s.fetched", "if (seen) s.fetched"), ("if (seen or inFlight) s.injected", "if (seen) s.injected")], None),
     ("no-link: parent DOWN does not kill children (INV-1)",
      "    killChildren(st2, id)\n", "    st2\n"),
     ("no-seq-resync after reload: fresh frames look like duplicates (R2)",
@@ -21,8 +21,11 @@ MUTANTS = [
      "nextSeq: s.nextSeq,"),
     ("no-client-dedupe: redelivery after reload is consumed again (INV-3)",
      "val seen = s.persisted.get(id).contains(m.uid)", "val seen = false"),
+    ("reclaim-too-early: reclaiming an injection that pi still holds delivers it twice (F4)",
+     "val gone = s.injected.get(id).filter(u => s.fetched.get(id).select(m => m.uid == u).length() == 0)",
+     "val gone = s.injected.get(id)"),
     ("no-in-flight-dedupe: a delivery in flight across a broker restart is consumed twice",
-     "if (seen or inFlight) s.fetched", "if (seen) s.fetched"),
+     [("if (seen or inFlight) s.fetched", "if (seen) s.fetched"), ("if (seen or inFlight) s.injected", "if (seen) s.injected")], None),
 ]
 
 src = open(os.path.join(os.path.dirname(__file__), "pi_actors.qnt")).read()

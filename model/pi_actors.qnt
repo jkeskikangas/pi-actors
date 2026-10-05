@@ -32,6 +32,9 @@ module pi_actors {
     nextSeq: str -> int,
     inflight: str -> List[Msg],
     fetched: str -> List[Msg],
+    // The client's in-flight ids: injected but not yet consumed. pi may drop an injection (it
+    // clears its queues on Esc); such ids stay here until reclaim releases them (fix F4).
+    injected: str -> Set[int],
     pendingAck: str -> Set[int],
     // --- client durable (the agent's own session) ---
     persisted: str -> Set[int],
@@ -75,6 +78,7 @@ module pi_actors {
     nextSeq: emptyMap(1),
     inflight: emptyMap(List()),
     fetched: emptyMap(List()),
+    injected: emptyMap(Set()),
     pendingAck: emptyMap(Set()),
     persisted: emptyMap(Set()),
     uidCounter: 0,
@@ -115,6 +119,7 @@ module pi_actors {
   pure def clientMemoryLost(st: State, id: str): State = { ...st,
     inflight: st.inflight.set(id, List()),
     fetched: st.fetched.set(id, List()),
+    injected: st.injected.set(id, Set()),
     pendingAck: st.pendingAck.set(id, Set()),
     nextSeq: st.nextSeq.set(id, 1),
   }
@@ -218,10 +223,11 @@ module pi_actors {
       val m = avail.head()
       val seen = s.persisted.get(id).contains(m.uid)
       // Also skip a message this client is still delivering (fetched before a broker restart).
-      val inFlight = s.fetched.get(id).select(x => x.uid == m.uid).length() > 0
+      val inFlight = s.injected.get(id).contains(m.uid)
       s' = { ...s,
         leases: s.leases.setBy(id, x => x.union(Set(m.uid))),
         fetched: if (seen or inFlight) s.fetched else s.fetched.setBy(id, l => l.append(m)),
+        injected: if (seen or inFlight) s.injected else s.injected.setBy(id, x => x.union(Set(m.uid))),
         pendingAck: if (seen) s.pendingAck.setBy(id, x => x.union(Set(m.uid))) else s.pendingAck,
         redeliveries: if (seen) s.redeliveries + 1 else s.redeliveries,
       },
@@ -236,6 +242,7 @@ module pi_actors {
     val prev = s.lastSeen.get(id).get(m.src)
     s' = { ...s,
       fetched: s.fetched.setBy(id, l => l.tail()),
+      injected: s.injected.setBy(id, x => x.exclude(Set(m.uid))),
       persisted: s.persisted.setBy(id, x => x.union(Set(m.uid))),
       pendingAck: s.pendingAck.setBy(id, x => x.union(Set(m.uid))),
       dupConsumed: s.dupConsumed or s.persisted.get(id).contains(m.uid),
@@ -255,6 +262,28 @@ module pi_actors {
       leases: s.leases.setBy(id, x => x.exclude(Set(mid))),
       pendingAck: s.pendingAck.setBy(id, x => x.exclude(Set(mid))),
       ackedUnpersisted: s.ackedUnpersisted or not(s.persisted.get(id).contains(mid)),
+    },
+  }
+
+  // pi drops an injected message before saving it (Esc clears its queues). The client does not
+  // know yet: the id stays in flight and the broker keeps the lease.
+  action piDrops(id: str): bool = all {
+    s.fetched.get(id).length() > 0, s.faults < MAX_FAULTS,
+    s' = { ...fault(s), fetched: s.fetched.setBy(id, l => l.tail()) },
+  }
+
+  // Reclaim (fix F4): an in-flight id that never reached the session is released and forgotten,
+  // so it is fetched and delivered again. Only ids that are really gone qualify (the age guard).
+  action reclaim(id: str): bool = all {
+    s.brokerUp, s.connected.get(id),
+    val gone = s.injected.get(id).filter(u => s.fetched.get(id).select(m => m.uid == u).length() == 0)
+    all {
+      gone.size() > 0,
+      nondet u = gone.oneOf()
+      s' = { ...s,
+        injected: s.injected.setBy(id, x => x.exclude(Set(u))),
+        leases: s.leases.setBy(id, x => x.exclude(Set(u))),
+      },
     },
   }
 
@@ -349,7 +378,7 @@ module pi_actors {
     nondet b = AGENTS.oneOf()
     any {
       spawn(a, b), hello(a), send(a, b), brokerAccept(a), clientAccepted(a),
-      fetch(a), persist(a), ack(a), exit(a), kill(a, b),
+      fetch(a), persist(a), ack(a), piDrops(a), reclaim(a), exit(a), kill(a, b),
       graceExpire(a), startTimeout(a), processEnds(a), procExitReported(a), killingExpire(a),
       processCrash(a), reload(a), connectionDrop(a), brokerCrash, brokerRestart,
     }
@@ -427,4 +456,12 @@ module pi_actors {
       .then(all { assert(s.fetched.get("a").length() == 1 and all_invariants), s' = s })
       .then(persist("a"))
       .then(all { assert(all_invariants), s' = s })
+
+  // Fix F4: pi drops an injection; reclaim releases it; it is delivered and consumed exactly once.
+  run droppedPushReclaimedTest =
+    init.then(spawn("r", "a")).then(hello("a")).then(send("r", "a")).then(brokerAccept("r"))
+      .then(clientAccepted("r")).then(fetch("a")).then(piDrops("a"))
+      .then(all { assert(s.fetched.get("a").length() == 0 and s.persisted.get("a").size() == 0), s' = s })
+      .then(reclaim("a")).then(fetch("a")).then(persist("a")).then(ack("a"))
+      .then(all { assert(s.persisted.get("a").size() == 1 and s.mailbox.get("a").length() == 0 and all_invariants), s' = s })
 }

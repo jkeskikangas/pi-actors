@@ -4,7 +4,7 @@ import { chmodSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync }
 import { join } from "node:path";
 import { after, test } from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { ensurePrivateDir } from "../src/runtime.ts";
+import { detectMux, ensurePrivateDir } from "../src/runtime.ts";
 
 const tmp = mkdtempSync("/tmp/pia-rt-");
 after(() => rmSync(tmp, { recursive: true, force: true }));
@@ -41,4 +41,10 @@ setTimeout(() => {}, 1000);`);
 		})));
 		assert.equal(outs.filter((o) => o.includes("WON")).length, 1, outs.join("|"));
 	}
+});
+
+test("the innermost multiplexer wins: tmux inside herdr places panes in tmux", () => {
+	assert.deepEqual(detectMux({ HERDR_ENV: "1", HERDR_PANE_ID: "w1:p2", TMUX: "/tmp/tmux-1/default,1,0", TMUX_PANE: "%3" }), { mux: "tmux", pane: "%3" });
+	assert.deepEqual(detectMux({ HERDR_ENV: "1", HERDR_PANE_ID: "w1:p2" }), { mux: "herdr", pane: "w1:p2" });
+	assert.equal(detectMux({}), undefined);
 });

@@ -53,7 +53,8 @@ export interface Config {
 	piCommand: string[];
 	/** Snapshot directory every process of this tree runs from. */
 	runtimeDir: string;
-	/** herdr pane of the root agent, for pane placement. */
+	/** Terminal multiplexer the root runs in (pane placement), and the root's pane there. */
+	mux?: "herdr" | "tmux";
 	rootPaneId?: string;
 	/** Extra pi arguments for every child (tests use this to add a scripted provider). */
 	childArgs?: string[];
@@ -200,3 +201,13 @@ export interface KeeperSpec {
 // herdr requires: lowercase letter first, then [a-z0-9_-], at most 32 characters.
 export const paneAgentName = (treeId: string, id: string) =>
 	`a${treeId.slice(-6)}-${id}`.toLowerCase().replace(/[^a-z0-9_-]/g, "-").slice(0, 32);
+
+/**
+ * Which multiplexer this process runs in, if any. The innermost wins: tmux sets TMUX only for its
+ * own panes, while herdr's variables are also inherited by a tmux started inside herdr.
+ */
+export function detectMux(env: NodeJS.ProcessEnv = process.env): { mux: "herdr" | "tmux"; pane: string } | undefined {
+	if (env.TMUX && env.TMUX_PANE) return { mux: "tmux", pane: env.TMUX_PANE };
+	if (env.HERDR_ENV === "1" && env.HERDR_PANE_ID) return { mux: "herdr", pane: env.HERDR_PANE_ID };
+	return undefined;
+}
