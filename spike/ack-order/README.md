@@ -1,0 +1,1 @@
+Result: toolResult entry is NOT in getEntries() (nor on disk) at tool_result, tool_execution_end or message_end(toolResult) — extension handlers run before persistence (agent-session.js:735-750). It IS present (in memory and on disk) from turn_end onward: turn_end, agent_end, agent_before_settle, agent_settled. turn_end also carries toolResultEntryIds (agent-session.js:489-499).

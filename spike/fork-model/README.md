@@ -1,0 +1,1 @@
+Result: `pi --mode rpc --fork <parent.jsonl> --model faux/faux-2` from another cwd starts fine; new session header cwd = process cwd (cwdB), parentSession = parent path; history copied; new turns use faux-2 (last --model wins). No model_change entry is written for the --model override (copied model_change says faux-1).

@@ -1,0 +1,1 @@
+Result: default = concurrent (two 500 ms tools overlap, both end at +502 ms; toolResult messages emitted only after ALL finish, in call order). executionMode:"sequential" on ANY tool in the batch serializes the WHOLE batch, including parallel-mode tools (par,seq -> par finishes before seq starts) — pi-agent-core agent-loop.js:368-372.

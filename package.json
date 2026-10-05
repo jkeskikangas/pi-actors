@@ -1,0 +1,21 @@
+{
+  "name": "pi-actors",
+  "version": "0.0.1",
+  "private": true,
+  "description": "OTP-inspired subagents for pi: spawn, fork, send, call, receive, links and supervision over one broker per agent tree.",
+  "type": "module",
+  "license": "MIT",
+  "author": "Jarno Keskikangas",
+  "engines": { "node": ">=22.18" },
+  "scripts": {
+    "test": "node --test test/*.test.ts",
+    "typecheck": "tsc --noEmit -p .",
+    "model": "quint typecheck model/pi_actors.qnt && sh model/check.sh"
+  },
+  "peerDependencies": { "@earendil-works/pi-coding-agent": "*", "typebox": "*" },
+  "devDependencies": {
+    "@informalsystems/quint": "^0.33.0",
+    "@types/node": "^26.6.4",
+    "typescript": "^7.0.2"
+  }
+}

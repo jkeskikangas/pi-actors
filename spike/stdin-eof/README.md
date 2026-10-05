@@ -1,0 +1,1 @@
+Result: closing stdin exits pi within ~7 ms, exit code 0, in idle, never-prompted and busy states; a running tool is aborted (signal fires) and session_shutdown(reason=quit) runs (rpc-mode.js:639-642 -> shutdown()).
