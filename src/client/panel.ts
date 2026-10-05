@@ -8,12 +8,71 @@ export type PanelItem =
 	| { kind: "question"; ref: string; from: string; body: string }
 	| { kind: "agent"; id: string; status: string; reason?: string; model?: string; placement?: string; mailbox: number; sessionFile?: string; task?: string; depth: number };
 
-export type PanelKey = "up" | "down" | "enter" | "escape" | "focus";
+export type PanelKey = "up" | "down" | "enter" | "escape" | "focus" | "space" | "decline" | "transcript";
+
+// ---------------------------------------------------------------- rich questions
+
+export interface Choice {
+	label: string;
+	description?: string;
+}
+
+export interface Question {
+	text: string;
+	choices: Choice[];
+	multi: boolean;
+}
+
+const QUESTION_TAG = "pi_actors_question";
+export const OTHER = "Type something…";
+
+/** A question to the human travels as the message body; plain text when it has no choices. */
+export function encodeQuestion(text: string, choices: (string | Choice)[] = [], multi = false): string {
+	if (choices.length === 0) return text;
+	const norm = choices.map((c) => (typeof c === "string" ? { label: c } : c));
+	return JSON.stringify({ [QUESTION_TAG]: 1, text, choices: norm, multi });
+}
+
+export function parseQuestion(body: string): Question {
+	try {
+		const q = JSON.parse(body);
+		if (q?.[QUESTION_TAG] === 1 && Array.isArray(q.choices)) return { text: String(q.text ?? ""), choices: q.choices, multi: !!q.multi };
+	} catch {
+		// plain text
+	}
+	return { text: body, choices: [], multi: false };
+}
+
+/** The answer as the agent reads it: unambiguous plain text. */
+export function formatAnswer(q: Question, picked: string[], text?: string): string {
+	const lines: string[] = [];
+	if (picked.length) lines.push(`${q.multi ? "Selected" : "Chose"}: ${picked.join(", ")}`);
+	if (text?.trim()) lines.push(picked.length ? `Note: ${text.trim()}` : text.trim());
+	return lines.join("\n") || "(no answer)";
+}
+
+export const DECLINED = "The human declined to answer this; use your own judgment and say what you decided.";
+
+export interface Card {
+	ref: string;
+	from: string;
+	task?: string;
+	q: Question;
+	/** Index into choices; choices.length is the "Type something…" row. */
+	cursor: number;
+	picked: number[];
+}
+
+export function openCard(item: Extract<PanelItem, { kind: "question" }>, task?: string): Card {
+	return { ref: item.ref, from: item.from, task, q: parseQuestion(item.body), cursor: 0, picked: [] };
+}
 
 export type PanelAction =
 	| { type: "none" }
 	| { type: "close" }
 	| { type: "answer"; ref: string; from: string; body: string }
+	/** Free text still needed: the caller asks for it, then sends formatAnswer(q, picked, text). */
+	| { type: "freeText"; ref: string; from: string; q: Question; picked: string[] }
 	| { type: "focusPane"; id: string };
 
 export interface PanelState {
@@ -21,6 +80,57 @@ export interface PanelState {
 	selected: number;
 	/** Agent whose transcript is shown, if any. */
 	viewing?: string;
+	/** The question being answered, if any. */
+	card?: Card;
+}
+
+function pressCard(st: PanelState, card: Card, key: PanelKey): { state: PanelState; action: PanelAction } {
+	const rows = card.q.choices.length + 1; // + "Type something…"
+	const onOther = card.cursor === card.q.choices.length;
+	const labels = () => card.picked.map((i) => card.q.choices[i].label);
+	const keep = (c: Card) => ({ state: { ...st, card: c }, action: { type: "none" } as PanelAction });
+	switch (key) {
+		case "up":
+			return keep({ ...card, cursor: (card.cursor - 1 + rows) % rows });
+		case "down":
+			return keep({ ...card, cursor: (card.cursor + 1) % rows });
+		case "space":
+			if (!card.q.multi || onOther) return keep(card);
+			return keep({ ...card, picked: card.picked.includes(card.cursor) ? card.picked.filter((i) => i !== card.cursor) : [...card.picked, card.cursor].sort((a, b) => a - b) });
+		case "escape":
+			return { state: { ...st, card: undefined }, action: { type: "none" } };
+		case "decline":
+			return { state: st, action: { type: "answer", ref: card.ref, from: card.from, body: DECLINED } };
+		case "transcript":
+			return { state: { ...st, viewing: card.from }, action: { type: "none" } };
+		case "enter": {
+			if (onOther) return { state: st, action: { type: "freeText", ref: card.ref, from: card.from, q: card.q, picked: card.q.multi ? labels() : [] } };
+			if (card.q.multi) {
+				const picked = card.picked.length ? labels() : [card.q.choices[card.cursor].label];
+				return { state: st, action: { type: "answer", ref: card.ref, from: card.from, body: formatAnswer(card.q, picked) } };
+			}
+			return { state: st, action: { type: "answer", ref: card.ref, from: card.from, body: formatAnswer(card.q, [card.q.choices[card.cursor].label]) } };
+		}
+		default:
+			return keep(card);
+	}
+}
+
+export function renderCard(card: Card): string[] {
+	// Keys first: in a short pane the bottom of an overlay can be cut off.
+	const lines = [
+		`${card.from} asks${card.task ? ` (working on: ${card.task.replace(/\s+/g, " ").slice(0, 80)})` : ""}  (↑↓ move${card.q.multi ? " · space toggle · enter confirm" : " · enter choose"} · t transcript · d decline · esc back)`,
+		"",
+	];
+	for (const l of card.q.text.split("\n")) lines.push(`  ${l}`);
+	lines.push("");
+	const rows = [...card.q.choices.map((c) => ({ ...c })), { label: OTHER }];
+	rows.forEach((c, i) => {
+		const cursor = i === card.cursor ? "❯ " : "  ";
+		const box = card.q.multi && i < card.q.choices.length ? (card.picked.includes(i) ? "[x] " : "[ ] ") : "";
+		lines.push(`${cursor}${box}${c.label}${"description" in c && c.description ? ` — ${c.description}` : ""}`);
+	});
+	return lines;
 }
 
 const ACTIVE = new Set(["starting", "live", "disconnected", "exiting", "killing"]);
@@ -53,6 +163,7 @@ export function summary(snap: Snapshot | undefined): string | undefined {
 }
 
 export function press(st: PanelState, key: PanelKey): { state: PanelState; action: PanelAction } {
+	if (st.card && !st.viewing) return pressCard(st, st.card, key);
 	if (st.viewing) {
 		if (key === "escape" || key === "enter") return { state: { ...st, viewing: undefined }, action: { type: "none" } };
 		if (key === "focus") return { state: st, action: { type: "focusPane", id: st.viewing } };
@@ -73,14 +184,20 @@ export function press(st: PanelState, key: PanelKey): { state: PanelState; actio
 		case "enter": {
 			const it = st.items[st.selected];
 			if (!it) return { state: st, action: { type: "close" } };
-			if (it.kind === "question") return { state: st, action: { type: "answer", ref: it.ref, from: it.from, body: it.body } };
+			if (it.kind === "question") {
+				const asker = st.items.find((x) => x.kind === "agent" && x.id === it.from);
+				return { state: { ...st, card: openCard(it, asker?.kind === "agent" ? asker.task : undefined) }, action: { type: "none" } };
+			}
 			return { state: { ...st, viewing: it.id }, action: { type: "none" } };
 		}
+		default:
+			return { state: st, action: { type: "none" } };
 	}
 }
 
 /** Plain-text lines (no styling): index.ts colours them. Width-limited by the caller. */
 export function render(st: PanelState, transcript: (item: Extract<PanelItem, { kind: "agent" }>) => string[]): string[] {
+	if (st.card && !st.viewing) return renderCard(st.card);
 	if (st.viewing) {
 		const it = st.items.find((x): x is Extract<PanelItem, { kind: "agent" }> => x.kind === "agent" && x.id === st.viewing);
 		const head = `── ${st.viewing} · ${it?.status ?? "?"}${it?.model ? ` · ${it.model}` : ""} ──  (esc back${it?.placement === "pane" ? " · f focus pane" : ""})`;
@@ -91,7 +208,7 @@ export function render(st: PanelState, transcript: (item: Extract<PanelItem, { k
 	const lines = [`pi-actors  (↑↓ move · enter open/answer${panes ? " · f focus pane" : ""} · esc close)`];
 	st.items.forEach((it, i) => {
 		const cursor = i === st.selected ? "❯ " : "  ";
-		if (it.kind === "question") lines.push(`${cursor}? ${it.from} asks: ${oneLine(it.body)}`);
+		if (it.kind === "question") lines.push(`${cursor}? ${it.from} asks: ${oneLine(parseQuestion(it.body).text)}`);
 		else lines.push(`${cursor}${"  ".repeat(it.depth)}${it.id} · ${it.status}${it.reason ? ` (${it.reason})` : ""}${it.model ? ` · ${it.model}` : ""}${it.placement === "pane" ? " · pane" : ""}${it.mailbox ? ` · ${it.mailbox} queued` : ""}`);
 	});
 	return lines;

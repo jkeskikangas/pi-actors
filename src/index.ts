@@ -14,7 +14,7 @@ import { Type } from "typebox";
 import { Client } from "./client/connection.ts";
 import { ensureBroker } from "./client/launcher.ts";
 import { ENTRY_TYPE, formatDelivery, Mailroom } from "./client/mailroom.ts";
-import { itemsFrom, type PanelAction, type PanelKey, type PanelState, press, readTranscript, render, summary } from "./client/panel.ts";
+import { encodeQuestion, formatAnswer, itemsFrom, openCard, type PanelAction, type PanelKey, type PanelState, parseQuestion, press, readTranscript, render, summary } from "./client/panel.ts";
 import type { Snapshot } from "./client/connection.ts";
 import { paneAgentName, stateRoot } from "./runtime.ts";
 import { type Limits, TIMING } from "./protocol.ts";
@@ -305,15 +305,14 @@ export default function piActors(pi: ExtensionAPI) {
 		});
 	}
 
-	async function openPanel(ctx: ExtensionContext) {
-		if (panelOpen || !client) return;
-		panelOpen = true;
-		try {
-			lastSnap = (await client.inspect()) ?? lastSnap;
-			if (!lastSnap) return ctx.ui.notify("pi-actors: broker not reachable.", "warning");
-			let state: PanelState = { items: itemsFrom(lastSnap), selected: 0 };
-			const action = await ctx.ui.custom<PanelAction>(
-				(tui, theme, _kb, done) => ({
+	/** Show the panel overlay from `initial`; resolves with the action that closed it. */
+	function showPanel(ctx: ExtensionContext, initial: PanelState, signal?: AbortSignal): Promise<PanelAction> {
+		let state = initial;
+		return ctx.ui.custom<PanelAction>(
+			(tui, theme, _kb, done) => {
+				// Answered elsewhere (root panel vs the asker's pane): close this one.
+				signal?.addEventListener("abort", () => done({ type: "close" }), { once: true });
+				return {
 					render(width: number) {
 						const rule = theme.fg("borderMuted", "─".repeat(Math.max(0, width)));
 						const body = render(state, (it) => readTranscript(it.sessionFile)).map((l, i) =>
@@ -323,7 +322,23 @@ export default function piActors(pi: ExtensionAPI) {
 						return [rule, ...body, rule];
 					},
 					handleInput(data: string) {
-						const key: PanelKey | undefined = matchesKey(data, "up") ? "up" : matchesKey(data, "down") ? "down" : matchesKey(data, "enter") ? "enter" : matchesKey(data, "escape") ? "escape" : data === "f" ? "focus" : undefined;
+						const key: PanelKey | undefined = matchesKey(data, "up")
+							? "up"
+							: matchesKey(data, "down")
+								? "down"
+								: matchesKey(data, "enter")
+									? "enter"
+									: matchesKey(data, "escape")
+										? "escape"
+										: data === " "
+											? "space"
+											: data === "f"
+												? "focus"
+												: data === "d"
+													? "decline"
+													: data === "t"
+														? "transcript"
+														: undefined;
 						if (!key) return;
 						const r = press(state, key);
 						state = r.state;
@@ -331,18 +346,36 @@ export default function piActors(pi: ExtensionAPI) {
 						else tui.requestRender();
 					},
 					invalidate() {},
-				}),
-				{ overlay: true, overlayOptions: { width: "100%", maxHeight: "70%", anchor: "center" } },
-			);
-			if (action.type === "answer") {
-				const answer = await ctx.ui.input(`Answer ${action.from}: ${action.body.slice(0, 300)}`, "your answer");
-				if (answer?.trim()) {
-					const r = await client.op("answer", { ref: action.ref, body: answer.trim() });
-					ctx.ui.notify(r.ok ? `Answered ${action.from}.` : `Not delivered: ${failText(r as { ok: false; error: string })}`, r.ok ? "info" : "warning");
-				}
-			} else if (action.type === "focusPane" && lastSnap) {
-				execFile("herdr", ["agent", "focus", paneAgentName(lastSnap.treeId, action.id)], () => {});
-			}
+				};
+			},
+			{ overlay: true, overlayOptions: { width: "100%", maxHeight: "70%", anchor: "center" } },
+		);
+	}
+
+	/** Carry out what the panel decided: the answer goes to exactly the agent and question selected. */
+	async function act(ctx: ExtensionContext, action: PanelAction) {
+		const c = client;
+		if (!c) return;
+		let body: string | undefined;
+		if (action.type === "answer") body = action.body;
+		else if (action.type === "freeText") {
+			const typed = await ctx.ui.input(`Answer ${action.from}: ${action.q.text.slice(0, 200)}`, action.picked.length ? `with ${action.picked.join(", ")}` : "your answer");
+			if (typed?.trim()) body = formatAnswer(action.q, action.picked, typed);
+		} else if (action.type === "focusPane" && lastSnap) {
+			execFile("herdr", ["agent", "focus", paneAgentName(lastSnap.treeId, action.id)], () => {});
+		}
+		if (body === undefined || (action.type !== "answer" && action.type !== "freeText")) return;
+		const r = await c.op("answer", { ref: action.ref, body });
+		ctx.ui.notify(r.ok ? `Answered ${action.from}.` : `Not delivered: ${failText(r as { ok: false; error: string })}`, r.ok ? "info" : "warning");
+	}
+
+	async function openPanel(ctx: ExtensionContext) {
+		if (panelOpen || !client) return;
+		panelOpen = true;
+		try {
+			lastSnap = (await client.inspect()) ?? lastSnap;
+			if (!lastSnap) return ctx.ui.notify("pi-actors: broker not reachable.", "warning");
+			await act(ctx, await showPanel(ctx, { items: itemsFrom(lastSnap), selected: 0 }));
 		} finally {
 			panelOpen = false;
 			void refreshUi();
@@ -410,15 +443,13 @@ export default function piActors(pi: ExtensionAPI) {
 	});
 
 	/** A pane child's question is answered in its own pane; the dialog closes if answered elsewhere. */
-	function askInThisPane(ctx: ExtensionContext, ref: string, question: string) {
+	function askInThisPane(ctx: ExtensionContext, ref: string, body: string) {
 		const ac = new AbortController();
 		openDialogs.set(ref, ac);
-		void ctx.ui.input(`Question from ${self}: ${question.slice(0, 300)}`, "your answer", { signal: ac.signal }).then(async (answer) => {
-			openDialogs.delete(ref);
-			if (!answer?.trim() || !client) return;
-			const r = await client.op("answer", { ref, body: answer.trim() });
-			if (!r.ok) ctx.ui.notify(`pi-actors: ${failText(r as { ok: false; error: string })}`, "warning");
-		});
+		const item = { kind: "question" as const, ref, from: self, body };
+		void showPanel(ctx, { items: [item], selected: 0, card: openCard(item) }, ac.signal)
+			.then((action) => act(ctx, action))
+			.finally(() => openDialogs.delete(ref));
 	}
 
 	// ------------------------------------------------------------ tools
@@ -485,6 +516,12 @@ export default function piActors(pi: ExtensionAPI) {
 			to: Type.String({ description: "Agent id, \"parent\" or \"human\"." }),
 			text: Type.String(),
 			reply_to: Type.Optional(Type.String({ description: "The msg id you are answering." })),
+			choices: Type.Optional(
+				Type.Array(Type.Object({ label: Type.String(), description: Type.Optional(Type.String()) }), {
+					description: "For a question: the options to pick from (the human can always type something else).",
+				}),
+			),
+			multi: Type.Optional(Type.Boolean({ description: "With choices: allow picking several." })),
 			urgent: Type.Optional(Type.Boolean({ description: "Deliver mid-turn instead of after the recipient's current run." })),
 		}),
 		async execute(_id, p, signal, _onUpdate, ctx) {
@@ -493,13 +530,16 @@ export default function piActors(pi: ExtensionAPI) {
 			const to = p.to === "parent" ? parent : p.to;
 			if (!to) throw new Error("this agent has no parent");
 			const kind = to === "human" ? "call" : "mail";
-			const r = await op(ctx, "send", { to, kind, body: p.text, ref: p.reply_to, urgent: !!p.urgent, timeoutS: to === "human" ? 24 * 3600 : undefined }, signal);
+			const choices = p.choices ?? [];
+			// The human gets a structured question (a card); an agent gets the options as text.
+			const body = to === "human" ? encodeQuestion(p.text, choices, !!p.multi) : choices.length ? `${p.text}\nOptions${p.multi ? " (pick any)" : ""}: ${choices.map((c) => c.label).join(" / ")}` : p.text;
+			const r = await op(ctx, "send", { to, kind, body, ref: p.reply_to, urgent: !!p.urgent, timeoutS: to === "human" ? 24 * 3600 : undefined }, signal);
 			if (!r.ok) throw new Error(failText(r));
 			const msgId = (r as { msgId: string }).msgId;
 			if (to === "human") {
 				awaitingHuman.add(msgId);
 				signalHerdr();
-				if (isChild() && ctx.mode === "tui") askInThisPane(ctx, msgId, p.text);
+				if (isChild() && ctx.mode === "tui") askInThisPane(ctx, msgId, body);
 			} else if (myChildren.has(to)) awaitingReport.add(to); // only a direct child owes us a report (F12)
 			updateWaiting();
 			return text(`Sent (msg ${msgId}).${to === "human" ? " The human's answer will arrive by itself." : ""}`);
@@ -562,12 +602,16 @@ export default function piActors(pi: ExtensionAPI) {
 			if (ctx.mode === "tui") return openPanel(ctx);
 			const qs = (await client.inspect())?.human ?? [];
 			if (qs.length === 0) return ctx.ui.notify("No pending questions.", "info");
-			ctx.ui.notify(qs.map((q, i) => `#${i + 1} from ${q.from}:\n${q.body}`).join("\n\n") + "\n\nAnswer with /answer <#> <text>", "info");
+			const show = (body: string) => {
+				const q = parseQuestion(body);
+				return q.choices.length ? `${q.text}\n${q.choices.map((c, i) => `  ${i + 1}. ${c.label}${c.description ? ` — ${c.description}` : ""}`).join("\n")}${q.multi ? "\n  (pick any)" : ""}` : q.text;
+			};
+			ctx.ui.notify(qs.map((q, i) => `#${i + 1} from ${q.from}:\n${show(q.body)}`).join("\n\n") + "\n\nAnswer with /answer <#> <text>, or pick options: /answer <#> 1,3", "info");
 		},
 	});
 
 	pi.registerCommand("answer", {
-		description: "Answer a question from an agent: /answer <#> <text>",
+		description: "Answer a question from an agent: /answer <#> <text>, or /answer <#> 1,3 to pick options",
 		handler: async (args, ctx) => {
 			ctxRef = ctx;
 			if (!client) return ctx.ui.notify("No agent tree.", "info");
@@ -576,7 +620,12 @@ export default function piActors(pi: ExtensionAPI) {
 			const qs = (await client.inspect())?.human ?? [];
 			const q = qs[Number(m[1]) - 1];
 			if (!q?.ref) return ctx.ui.notify(`No question #${m[1]}.`, "warning");
-			const r = await client.op("answer", { ref: q.ref, body: m[2].trim() });
+			// "1,3" picks options of a question with choices; anything else is free text.
+			const question = parseQuestion(q.body);
+			const nums = /^\d+(\s*,\s*\d+)*$/.test(m[2].trim()) ? m[2].split(",").map((x) => Number(x.trim()) - 1) : undefined;
+			const picked = nums && question.choices.length && nums.every((n) => question.choices[n]) ? nums.map((n) => question.choices[n].label) : undefined;
+			const body = picked ? formatAnswer(question, question.multi ? picked : picked.slice(0, 1)) : formatAnswer(question, [], m[2]);
+			const r = await client.op("answer", { ref: q.ref, body });
 			ctx.ui.notify(r.ok ? `Answered #${m[1]} (${q.from}).` : failText(r as { ok: false; error: string }), r.ok ? "info" : "warning");
 		},
 	});
