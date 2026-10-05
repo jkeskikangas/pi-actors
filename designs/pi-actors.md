@@ -442,6 +442,11 @@ Delivery: idle agent → `sendMessage(..., {triggerTurn: true})`; busy agent →
 
 User-confirmed 2026-10-05: G = 60 s for children and 300 s for the root; only two limits, max depth (2) and spawn count (40 per tree), both configurable; mailbox safety caps of 200 messages / 2 MiB of ordinary mail per agent, with a 400-slot reserve for DOWN notices and replies.
 
+## Decisions recorded at release (2026-10-05)
+
+- **Root grace stays 300 s.** A reload needs seconds; the case it serves is an accidentally closed terminal, recovered with `pi --continue`. The cost is bounded (children finish assigned work for at most 5 minutes), and deliberate stops are immediate via `/actors stop`.
+- **`spike/` stays in the repository, outside the npm package.** It is the evidence for the runtime assumptions under "Verification", and it is re-runnable against future pi versions, which is when those assumptions need re-checking.
+
 ## Revision log
 
 | Finding                                                                          | Resolution                                                                                                                                                                                          |
