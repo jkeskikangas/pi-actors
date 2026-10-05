@@ -211,4 +211,9 @@ Enforced by `test/conformance.test.ts`, which scans import statements:
 - Only `src/broker/server.ts` imports `src/placement/**`.
 - `package.json` has no `dependencies`; host packages appear only in `peerDependencies` with `"*"`.
 
-[DECISION NEEDED: G (link grace) defaults to 60 s, long enough to ride out a pi reload. Confirm, or name a value.] [DECISION NEEDED: default limits: max depth 2 (coordinator = 0 → item = 1 → frontend/backend/reviewer = 2), 6 live children per agent, 40 spawns per tree. Confirm.]
+## Confirmed defaults
+
+User-confirmed 2026-10-05:
+
+- **G (link grace):** 60 s.
+- **Limits:** max depth 2 (coordinator = 0 → item = 1 → frontend/backend/reviewer = 2); 6 live children per agent; 40 spawns per tree.
