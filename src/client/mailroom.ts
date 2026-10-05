@@ -11,6 +11,8 @@ const INLINE_LIMIT = 16 * 1024;
 export interface Stamp {
 	id: string;
 	consumed: string[];
+	/** The delivered messages themselves, so a duplicate can be cut out of the context (N1). */
+	messages?: Message[];
 }
 
 export interface Fetcher {
@@ -113,7 +115,7 @@ export class Mailroom {
 	}
 
 	stamp(messages: readonly Message[]): Stamp {
-		return { id: this.self, consumed: messages.map((m) => m.id) };
+		return { id: this.self, consumed: messages.map((m) => m.id), messages: [...messages] };
 	}
 }
 
@@ -123,11 +125,44 @@ function stampOf(entry: unknown): Stamp | undefined {
 	return s && typeof s.id === "string" && Array.isArray(s.consumed) ? s : undefined;
 }
 
+/**
+ * The last line of defence for "consumed at most once" (N1): before every model request, drop
+ * messages whose id already appeared earlier in this agent's context. A push can reach the
+ * session twice when pi keeps a queued injection that a reclaim also redelivered; the model sees
+ * it once. Partially duplicated entries are rebuilt from what is left.
+ */
+export function dedupeContext<T>(self: string, messages: readonly T[]): T[] | undefined {
+	const seen = new Set<string>();
+	let changed = false;
+	const out: T[] = [];
+	for (const msg of messages) {
+		const m = msg as { role?: string; customType?: string; details?: { actors?: Stamp } };
+		const stamp = m.role === "custom" && m.customType === ENTRY_TYPE ? m.details?.actors : undefined;
+		if (!stamp || stamp.id !== self) {
+			out.push(msg);
+			continue;
+		}
+		const fresh = stamp.consumed.filter((id) => !seen.has(id));
+		for (const id of stamp.consumed) seen.add(id);
+		if (fresh.length === stamp.consumed.length) {
+			out.push(msg);
+			continue;
+		}
+		changed = true;
+		if (fresh.length === 0 || !stamp.messages) continue;
+		const keep = stamp.messages.filter((x) => fresh.includes(x.id));
+		out.push({ ...msg, content: formatDelivery(self, keep), details: { actors: { ...stamp, consumed: fresh, messages: keep } } } as T);
+	}
+	return changed ? out : undefined;
+}
+
 /** Human-readable body for one pushed entry. Sender-labelled; never phrased as user input. */
 export function formatDelivery(self: string, messages: readonly Message[]): string {
 	const lines = [`[pi-actors] ${messages.length} update${messages.length === 1 ? "" : "s"} for ${self}:`];
 	for (const m of messages) {
-		const body = m.body.length > INLINE_LIMIT ? `${m.body.slice(0, INLINE_LIMIT)}\n…(truncated; ask the sender for the rest or for a file path)` : m.body;
+		// Shown in the TUI too: no terminal control sequences from other agents (N7).
+		const safe = m.body.replace(/[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/g, "");
+		const body = safe.length > INLINE_LIMIT ? `${safe.slice(0, INLINE_LIMIT)}\n…(truncated; ask the sender for the rest or for a file path)` : safe;
 		if (m.kind === "down") {
 			const d = safeJson(m.body) as { id?: string; reason?: string; result?: string } | undefined;
 			lines.push(`\n■ ${d?.id ?? "?"} has ended: ${d?.reason ?? "?"}${d?.result ? `\nIts result:\n${d.result}` : ""}`);

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { ENTRY_TYPE, type Fetcher, formatDelivery, Mailroom } from "../src/client/mailroom.ts";
+import { dedupeContext, ENTRY_TYPE, type Fetcher, formatDelivery, Mailroom } from "../src/client/mailroom.ts";
 import type { Message } from "../src/protocol.ts";
 
 function fetcher(queue: Message[]): Fetcher & { acked: string[] } {
@@ -86,4 +86,17 @@ test("F9: a drain requested while one runs is not dropped: the running drain fet
 		ack() {},
 	};
 	assert.deepEqual((await room.drain(f)).map((m) => m.id), ["m1", "m2"]);
+});
+
+test("N1: the model sees each message once, even when pi kept an injection that was also redelivered", () => {
+	const delivered = (self: string, ms: Message[]) => ({ role: "custom", customType: ENTRY_TYPE, content: formatDelivery(self, ms), details: { actors: { id: self, consumed: ms.map((m) => m.id), messages: ms } } });
+	const user = { role: "user", content: "hi" };
+	const first = delivered("a", [msg("m1"), msg("m2")]);
+	const other = delivered("b", [msg("m1")]); // a forked parent's entry: not ours, left alone
+	assert.equal(dedupeContext("a", [user, first, other]), undefined, "nothing to change");
+	const out = dedupeContext("a", [user, first, other, delivered("a", [msg("m1")]), delivered("a", [msg("m2"), msg("m3")])]) as any[];
+	assert.equal(out.length, 4, "the full duplicate is gone");
+	assert.deepEqual(out.at(-1).details.actors.consumed, ["m3"], "a partial duplicate keeps only the new message");
+	assert.match(out.at(-1).content, /body m3/);
+	assert.doesNotMatch(out.at(-1).content, /body m2/);
 });

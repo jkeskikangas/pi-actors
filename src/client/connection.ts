@@ -84,16 +84,21 @@ export class Client extends EventEmitter {
 	/** Connect and resolve on the first welcome; rejects on an identity rejection. */
 	start(): Promise<void> {
 		return new Promise((resolve, reject) => {
-			const onWelcome = () => {
-				this.off("rejected", onReject);
-				resolve();
-			};
-			const onReject = (reason: string) => {
+			// Every way this connection can end before the first welcome settles start() (N3).
+			const cleanup = () => {
 				this.off("welcome", onWelcome);
-				reject(new Error(`rejected: ${reason}`));
+				this.off("rejected", onReject);
+				this.off("lost", onLost);
+				this.off("superseded", onSuperseded);
 			};
+			const onWelcome = () => (cleanup(), resolve());
+			const onReject = (reason: string) => (cleanup(), reject(new Error(`rejected: ${reason}`)));
+			const onLost = () => (cleanup(), reject(new Error("lost: broker unreachable")));
+			const onSuperseded = () => (cleanup(), reject(new Error("superseded")));
 			this.once("welcome", onWelcome);
 			this.once("rejected", onReject);
+			this.once("lost", onLost);
+			this.once("superseded", onSuperseded);
 			this.dial();
 		});
 	}
@@ -126,8 +131,17 @@ export class Client extends EventEmitter {
 			}
 			const delay = Math.min(5000, 500 * 2 ** Math.min(4, this.counter++ % 5));
 			setTimeout(() => {
-				if (this.redial) void this.redial().catch(() => {}).finally(() => this.dial());
-				else this.dial();
+				if (!this.redial) return this.dial();
+				this.redial().then(
+					() => this.dial(),
+					(err) => {
+						// The tree is over: no point retrying for the whole grace period.
+						if (/finished/.test(String(err))) {
+							this.shut("tree finished");
+							this.emit("rejected", "down");
+						} else this.dial();
+					},
+				);
 			}, delay).unref();
 		});
 	}

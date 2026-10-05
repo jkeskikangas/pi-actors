@@ -3,6 +3,7 @@
 
 import assert from "node:assert/strict";
 import { execSync } from "node:child_process";
+import { createServer } from "node:net";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { after, before, test } from "node:test";
@@ -154,4 +155,17 @@ test("F3: concurrent launchers for one tree start exactly one broker", async () 
 	await root.start();
 	root.stopTree();
 	root.close();
+});
+
+test("N3: a broker that goes away before welcoming fails the connect instead of hanging it", async () => {
+	const sock = join(home, "n3.sock");
+	const server = createServer((s) => s.destroy());
+	await new Promise<void>((r) => server.listen(sock, r));
+	try {
+		const c = new Client({ socket: sock, id: "root", inc: 1, pid: process.pid }, 200);
+		const outcome = await Promise.race([c.start().then(() => "welcomed", (e: Error) => `failed: ${e.message}`), new Promise((r) => setTimeout(() => r("hung"), 5000))]);
+		assert.match(String(outcome), /^failed/);
+	} finally {
+		server.close();
+	}
 });

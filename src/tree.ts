@@ -242,7 +242,9 @@ function hello(st: TreeState, ev: Extract<Event, { type: "hello" }>, fx: Effect[
 		const reloadOrFirst = a.pid === undefined || a.pid === ev.pid;
 		const takeover = a.sessionId !== undefined && a.sessionId === ev.sessionId && ev.recordedPidAlive === false;
 		if (!reloadOrFirst && !takeover) return fx.push({ type: "reject", to: ev.id, reason: "root_fence" });
-		if (a.sessionId === undefined) a.sessionId = ev.sessionId;
+		// The same process may have switched sessions (/new, /resume, /fork): the root now lives in
+		// that session, so a later `pi --continue` of it may take over (N4).
+		if (reloadOrFirst && ev.sessionId) a.sessionId = ev.sessionId;
 	} else {
 		if (!a.procStarted && a.spec?.placement === "headless") return fx.push({ type: "hold", to: ev.id });
 		if (!ev.ownsPid) return fx.push({ type: "reject", to: ev.id, reason: "pid_mismatch" });

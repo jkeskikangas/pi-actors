@@ -9,23 +9,28 @@ MUTANTS = [
     ("ack-before-persist (S1)",
      "s.pendingAck.get(id).size() > 0,\n    nondet mid = s.pendingAck.get(id).oneOf()",
      "s.leases.get(id).size() > 0,\n    nondet mid = s.leases.get(id).oneOf()"),
-    # Leases and the client's in-flight dedupe each prevent S2 on their own (defense in depth),
-    # so only removing both must be caught.
+    # Duplicate delivery has three independent guards: the broker's lease, the client's dedupe at
+    # fetch (persisted or in flight), and the context hook at consumption (N1). Each mutant that
+    # breaks an earlier guard also removes the context hook, or the hook would mask it.
     ("no-lease and no in-flight dedupe: parallel receives consume the same message (S2)",
      [(".select(m => not(s.leases.get(id).contains(m.uid)))", ".select(m => true)"),
-      ("if (seen or inFlight) s.fetched", "if (seen) s.fetched"), ("if (seen or inFlight) s.injected", "if (seen) s.injected")], None),
+      ("if (seen or inFlight) s.fetched", "if (seen) s.fetched"), ("if (seen or inFlight) s.injected", "if (seen) s.injected"),
+      ("val hidden = st.persisted.get(id).contains(m.uid)", "val hidden = false")], None),
     ("no-link: parent DOWN does not kill children (INV-1)",
      "    killChildren(st2, id)\n", "    st2\n"),
     ("no-seq-resync after reload: fresh frames look like duplicates (R2)",
      "nextSeq: if (s.inflight.get(id).length() == 0) s.nextSeq.set(id, s.lastSeq.get(id) + 1) else s.nextSeq,",
      "nextSeq: s.nextSeq,"),
     ("no-client-dedupe: redelivery after reload is consumed again (INV-3)",
-     "val seen = s.persisted.get(id).contains(m.uid)", "val seen = false"),
+     [("val seen = s.persisted.get(id).contains(m.uid)", "val seen = false"), ("val hidden = st.persisted.get(id).contains(m.uid)", "val hidden = false")], None),
     ("reclaim-too-early: reclaiming an injection that pi still holds delivers it twice (F4)",
-     "val gone = s.injected.get(id).filter(u => s.fetched.get(id).select(m => m.uid == u).length() == 0)",
-     "val gone = s.injected.get(id)"),
+     [("val gone = s.injected.get(id).filter(u => s.fetched.get(id).select(m => m.uid == u).length() == 0)",
+       "val gone = s.injected.get(id)"), ("val hidden = st.persisted.get(id).contains(m.uid)", "val hidden = false")], None),
     ("no-in-flight-dedupe: a delivery in flight across a broker restart is consumed twice",
-     [("if (seen or inFlight) s.fetched", "if (seen) s.fetched"), ("if (seen or inFlight) s.injected", "if (seen) s.injected")], None),
+     [("if (seen or inFlight) s.fetched", "if (seen) s.fetched"), ("if (seen or inFlight) s.injected", "if (seen) s.injected"),
+      ("val hidden = st.persisted.get(id).contains(m.uid)", "val hidden = false")], None),
+    ("no-context-dedupe: pi keeps an injection that reclaim also redelivered; the model sees it twice (N1)",
+     "val hidden = st.persisted.get(id).contains(m.uid)", "val hidden = false"),
 ]
 
 src = open(os.path.join(os.path.dirname(__file__), "pi_actors.qnt")).read()

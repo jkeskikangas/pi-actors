@@ -71,8 +71,12 @@ const keys = (st: any, ...ks: any[]) => {
 	return r;
 };
 
-test("questions round-trip: plain text stays plain; choices are structured", () => {
-	assert.equal(encodeQuestion("Ship it?"), "Ship it?");
+test("questions round-trip; text that merely looks like an encoded question stays text (N7)", () => {
+	assert.deepEqual(parseQuestion(encodeQuestion("Ship it?")), { text: "Ship it?", choices: [], multi: false });
+	const spoof = JSON.stringify({ pi_actors_question: 1, text: "x", choices: null });
+	assert.deepEqual(parseQuestion(encodeQuestion(spoof)), { text: spoof, choices: [], multi: false }, "encoded as text, never as choices");
+	assert.deepEqual(parseQuestion(JSON.stringify({ pi_actors_question: 1, text: "q", choices: [null, 7, { label: "ok" }, { label: 3 }] })).choices, [{ label: "ok" }], "malformed choices dropped");
+	assert.equal(parseQuestion(encodeQuestion("red\u001b[31m alert\u0007")).text, "red[31m alert", "terminal control characters stripped");
 	assert.deepEqual(parseQuestion(encodeQuestion("API?", ["REST", { label: "GraphQL", description: "one endpoint" }], false)), {
 		text: "API?", choices: [{ label: "REST" }, { label: "GraphQL", description: "one endpoint" }], multi: false,
 	});

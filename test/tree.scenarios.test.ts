@@ -140,6 +140,14 @@ test("identity: the root is fenced by pid and session id", () => {
 	assert.equal(d.hello(ROOT, 2, { sessionId: "S", recordedPidAlive: false }).at(-1)?.type, "welcome", "--continue after a crash");
 });
 
+test("N4: a root that switched sessions (/new) can be continued from the new session after a crash", () => {
+	const d = driver();
+	d.hello(ROOT, 1, { sessionId: "S" });
+	assert.equal(d.hello(ROOT, 1, { sessionId: "NEW" }).at(-1)?.type, "welcome", "same process, new session");
+	assert.equal(d.hello(ROOT, 2, { sessionId: "S", recordedPidAlive: false })[0].type, "reject", "the old session no longer owns the root");
+	assert.equal(d.hello(ROOT, 2, { sessionId: "NEW", recordedPidAlive: false }).at(-1)?.type, "welcome", "pi --continue of the new session");
+});
+
 test("identity: a down agent and a stale incarnation are rejected", () => {
 	const d = withChild();
 	d.run({ type: "procExit", now: 0, id: "a", inc: 1, code: 0, signal: null });

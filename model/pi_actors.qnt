@@ -35,6 +35,9 @@ module pi_actors {
     // The client's in-flight ids: injected but not yet consumed. pi may drop an injection (it
     // clears its queues on Esc); such ids stay here until reclaim releases them (fix F4).
     injected: str -> Set[int],
+    // Injections pi kept queued across an aborted run; it hands them to the model later, in
+    // order, ahead of anything injected after them. The client cannot see this queue.
+    held: str -> List[Msg],
     pendingAck: str -> Set[int],
     // --- client durable (the agent's own session) ---
     persisted: str -> Set[int],
@@ -79,6 +82,7 @@ module pi_actors {
     inflight: emptyMap(List()),
     fetched: emptyMap(List()),
     injected: emptyMap(Set()),
+    held: emptyMap(List()),
     pendingAck: emptyMap(Set()),
     persisted: emptyMap(Set()),
     uidCounter: 0,
@@ -120,6 +124,7 @@ module pi_actors {
     inflight: st.inflight.set(id, List()),
     fetched: st.fetched.set(id, List()),
     injected: st.injected.set(id, Set()),
+    held: st.held.set(id, List()),
     pendingAck: st.pendingAck.set(id, Set()),
     nextSeq: st.nextSeq.set(id, 1),
   }
@@ -234,21 +239,29 @@ module pi_actors {
     },
   }
 
-  // The tool result reaches the session: the model has consumed the message.
+  // A delivery reaches the session. The context hook shows the model only ids the session does
+  // not hold yet (fix N1), so a second copy is saved but never consumed again.
+  pure def consume(st: State, id: str, m: Msg): State = {
+    val hidden = st.persisted.get(id).contains(m.uid)
+    val prev = st.lastSeen.get(id).get(m.src)
+    { ...st,
+      injected: st.injected.setBy(id, x => x.exclude(Set(m.uid))),
+      persisted: st.persisted.setBy(id, x => x.union(Set(m.uid))),
+      pendingAck: st.pendingAck.setBy(id, x => x.union(Set(m.uid))),
+      dupConsumed: st.dupConsumed or (st.persisted.get(id).contains(m.uid) and not(hidden)),
+      fifoViolated: st.fifoViolated or (not(hidden) and m.kind == "mail" and m.seq <= prev),
+      lastSeen: if (hidden or m.kind != "mail") st.lastSeen else st.lastSeen.setBy(id, mm => mm.set(m.src, m.seq)),
+    }
+  }
+
+  // The tool result reaches the session: the model has consumed the message. pi's queue is
+  // FIFO, so anything it kept goes first.
   action persist(id: str): bool = all {
     s.procAlive.get(id),
+    s.held.get(id).length() == 0,
     s.fetched.get(id).length() > 0,
     val m = s.fetched.get(id).head()
-    val prev = s.lastSeen.get(id).get(m.src)
-    s' = { ...s,
-      fetched: s.fetched.setBy(id, l => l.tail()),
-      injected: s.injected.setBy(id, x => x.exclude(Set(m.uid))),
-      persisted: s.persisted.setBy(id, x => x.union(Set(m.uid))),
-      pendingAck: s.pendingAck.setBy(id, x => x.union(Set(m.uid))),
-      dupConsumed: s.dupConsumed or s.persisted.get(id).contains(m.uid),
-      fifoViolated: s.fifoViolated or (m.kind == "mail" and m.seq <= prev),
-      lastSeen: if (m.kind != "mail") s.lastSeen else s.lastSeen.setBy(id, mm => mm.set(m.src, m.seq)),
-    },
+    s' = { ...consume(s, id, m), fetched: s.fetched.setBy(id, l => l.tail()) },
   }
 
   // Deferred ack (D3): only persisted ids are acked.
@@ -270,6 +283,21 @@ module pi_actors {
   action piDrops(id: str): bool = all {
     s.fetched.get(id).length() > 0, s.faults < MAX_FAULTS,
     s' = { ...fault(s), fetched: s.fetched.setBy(id, l => l.tail()) },
+  }
+
+  // pi keeps an injected message queued across an aborted run (RPC abort keeps queues). The
+  // client cannot tell it from a dropped one: after the age guard, reclaim redelivers it.
+  action piKeeps(id: str): bool = all {
+    s.fetched.get(id).length() > 0, s.faults < MAX_FAULTS,
+    s' = { ...fault(s), fetched: s.fetched.setBy(id, l => l.tail()), held: s.held.setBy(id, l => l.append(s.fetched.get(id).head())) },
+  }
+
+  // The next run: pi hands the model what it kept.
+  action piDeliversKept(id: str): bool = all {
+    s.procAlive.get(id),
+    s.held.get(id).length() > 0,
+    val m = s.held.get(id).head()
+    s' = { ...consume(s, id, m), held: s.held.setBy(id, l => l.tail()) },
   }
 
   // Reclaim (fix F4): an in-flight id that never reached the session is released and forgotten,
@@ -378,7 +406,7 @@ module pi_actors {
     nondet b = AGENTS.oneOf()
     any {
       spawn(a, b), hello(a), send(a, b), brokerAccept(a), clientAccepted(a),
-      fetch(a), persist(a), ack(a), piDrops(a), reclaim(a), exit(a), kill(a, b),
+      fetch(a), persist(a), ack(a), piDrops(a), piKeeps(a), piDeliversKept(a), reclaim(a), exit(a), kill(a, b),
       graceExpire(a), startTimeout(a), processEnds(a), procExitReported(a), killingExpire(a),
       processCrash(a), reload(a), connectionDrop(a), brokerCrash, brokerRestart,
     }
@@ -463,5 +491,15 @@ module pi_actors {
       .then(clientAccepted("r")).then(fetch("a")).then(piDrops("a"))
       .then(all { assert(s.fetched.get("a").length() == 0 and s.persisted.get("a").size() == 0), s' = s })
       .then(reclaim("a")).then(fetch("a")).then(persist("a")).then(ack("a"))
+      .then(all { assert(s.persisted.get("a").size() == 1 and s.mailbox.get("a").length() == 0 and all_invariants), s' = s })
+
+  // Fix N1: pi keeps an injection, reclaim redelivers it, then pi delivers its kept copy too.
+  // The session holds both; the model consumes the message once.
+  run keptPushNotSeenTwiceTest =
+    init.then(spawn("r", "a")).then(hello("a")).then(send("r", "a")).then(brokerAccept("r"))
+      .then(clientAccepted("r")).then(fetch("a")).then(piKeeps("a"))
+      .then(reclaim("a")).then(fetch("a"))
+      .then(all { assert(s.held.get("a").length() == 1 and s.fetched.get("a").length() == 1), s' = s })
+      .then(piDeliversKept("a")).then(persist("a")).then(ack("a"))
       .then(all { assert(s.persisted.get("a").size() == 1 and s.mailbox.get("a").length() == 0 and all_invariants), s' = s })
 }

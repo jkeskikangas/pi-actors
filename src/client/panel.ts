@@ -26,9 +26,11 @@ export interface Question {
 const QUESTION_TAG = "pi_actors_question";
 export const OTHER = "Type something…";
 
-/** A question to the human travels as the message body; plain text when it has no choices. */
+/**
+ * A question to the human travels as the message body, always encoded: plain text that merely
+ * looks like an encoded question can then never be mistaken for one (N7).
+ */
 export function encodeQuestion(text: string, choices: (string | Choice)[] = [], multi = false): string {
-	if (choices.length === 0) return text;
 	const norm = choices.map((c) => (typeof c === "string" ? { label: c } : c));
 	return JSON.stringify({ [QUESTION_TAG]: 1, text, choices: norm, multi });
 }
@@ -36,11 +38,22 @@ export function encodeQuestion(text: string, choices: (string | Choice)[] = [], 
 export function parseQuestion(body: string): Question {
 	try {
 		const q = JSON.parse(body);
-		if (q?.[QUESTION_TAG] === 1 && Array.isArray(q.choices)) return { text: String(q.text ?? ""), choices: q.choices, multi: !!q.multi };
+		if (q?.[QUESTION_TAG] === 1) {
+			// Only well-formed choices: an object with a string label (N7).
+			const choices = (Array.isArray(q.choices) ? q.choices : [])
+				.filter((c: unknown): c is Choice => !!c && typeof c === "object" && typeof (c as Choice).label === "string")
+				.map((c: Choice) => (typeof c.description === "string" ? { label: clean(c.label), description: clean(c.description) } : { label: clean(c.label) }));
+			return { text: clean(String(q.text ?? "")), choices, multi: !!q.multi };
+		}
 	} catch {
 		// plain text
 	}
-	return { text: body, choices: [], multi: false };
+	return { text: clean(body), choices: [], multi: false };
+}
+
+/** Agent-supplied text is shown in the terminal: strip control characters except newline and tab. */
+export function clean(s: string): string {
+	return s.replace(/[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/g, "");
 }
 
 /** The answer as the agent reads it: unambiguous plain text. */
@@ -214,7 +227,7 @@ export function render(st: PanelState, transcript: (item: Extract<PanelItem, { k
 	return lines;
 }
 
-const oneLine = (s: string) => s.replace(/\s+/g, " ").slice(0, 160);
+const oneLine = (s: string) => clean(s).replace(/\s+/g, " ").slice(0, 160);
 
 /** Last messages of an agent's session file: what it was asked, what it did, what it said. */
 export function readTranscript(sessionFile: string | undefined, max = 30): string[] {

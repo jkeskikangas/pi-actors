@@ -48,3 +48,30 @@ test("the innermost multiplexer wins: tmux inside herdr places panes in tmux", (
 	assert.deepEqual(detectMux({ HERDR_ENV: "1", HERDR_PANE_ID: "w1:p2" }), { mux: "herdr", pane: "w1:p2" });
 	assert.equal(detectMux({}), undefined);
 });
+
+test("N2: racing to take over a stale lock (dead pid), exactly one contender wins", async () => {
+	let multi = 0;
+	for (let round = 0; round < 6; round++) {
+		const dir = join(tmp, `stale${round}`);
+		mkdirSync(dir);
+		writeFileSync(join(dir, "broker.lock"), JSON.stringify({ pid: 999_999, bootTime: Math.round(Date.now() / 1000) }));
+		const file = join(tmp, `stale${round}.mjs`);
+		writeFileSync(file, `import { acquireLock } from ${JSON.stringify(pathToFileURL(runtime).href)};
+const start = Number(process.argv[2]); while (Date.now() < start) {}
+console.log(acquireLock(${JSON.stringify(dir)}) ? "WON" : "lost");
+setTimeout(() => {}, 1000);`);
+		const start = Date.now() + 1200;
+		const outs = await Promise.all(Array.from({ length: 16 }, () => new Promise<string>((resolve) => {
+			// A 30 ms pause between "this lock is stale" and replacing it makes the race certain to bite.
+			const p = spawn(process.execPath, [file, String(start)], { env: { ...process.env, PI_ACTORS_TEST_LOCK_PAUSE_MS: "30" } });
+			let out = "";
+			p.stdout.on("data", (d) => (out += d));
+			p.stderr.on("data", (d) => (out += d));
+			p.on("close", () => resolve(out));
+		})));
+		const won = outs.filter((o) => o.includes("WON")).length;
+		if (won > 1) multi++;
+		assert.ok(won <= 1, `round ${round}: ${won} winners`);
+	}
+	assert.equal(multi, 0);
+});

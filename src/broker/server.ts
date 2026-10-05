@@ -8,7 +8,7 @@ import { closePane, herdrAvailable, listPanes, paneAgentName, paneForegroundGrou
 import { closeTmuxPane, listTmuxPanes, startTmuxPane, tmuxAvailable, tmuxPanePid } from "../placement/tmux.ts";
 import { signalGroup, startHeadless } from "../placement/headless.ts";
 import { decode, encode, PROTO, TIMING } from "../protocol.ts";
-import { acquireLock, type Config, ensureDir, ensurePrivateDir, pidAlive, releaseLock } from "../runtime.ts";
+import { acquireLock, type Config, ensureDir, ensurePrivateDir, holdsLock, pidAlive, releaseLock } from "../runtime.ts";
 import { apply, type Effect, type Event, finished, HUMAN, initial, nextDeadline, replay, ROOT, type SpawnRequest, type TreeState } from "../tree.ts";
 import { EventLog } from "./log.ts";
 
@@ -403,6 +403,17 @@ export async function startBroker(dir: string, sock: string, config: Config): Pr
 			for (const c of conns) c.lastSeen = wall;
 		}
 		for (const c of conns) if (wall - c.lastSeen > TIMING.heartbeatTimeoutMs) c.socket.destroy();
+		// Never run alongside another broker on the same log (N2).
+		if (!holdsLock(dir)) {
+			console.error("lost the broker lock; stopping");
+			stopping = true; // no compaction or status writes: the log is not ours any more
+			for (const c of conns) c.socket.destroy();
+			server.close();
+			clearInterval(timer);
+			clearInterval(paneTimer);
+			resolveDone();
+			return;
+		}
 		const due = nextDeadline(st);
 		if (due !== undefined && wall >= due) run({ type: "tick", now: wall });
 		if (log.needsCompaction()) log.compact(st, wall);
