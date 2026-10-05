@@ -1,4 +1,4 @@
-# pi-actors — Design (v3)
+# pi-actors — Design (v4)
 
 **Spec:** `specs/pi-actors.md` · **Frame:** default 3-layer split (domain / presentation / shell) plus the conventions of `~/work/pi-verified-goal`: TypeScript under `src/` with erasable syntax only, `node --test`, pi and `typebox` as `*` peers, extension tests through a fake pi host. · **Scope note:** one package on one machine (NFR-2). · **Revision:** v3 addresses re-review findings S1–S5 and the round-2 P2/P3 items; v2 addressed R1–R21. The runtime claims were checked by `spike/` against real pi 1.0.3; results are under "Verification".
 
@@ -164,24 +164,27 @@ A reload loses the unaccepted frames held in memory. A tool interrupted by the r
 - After a sleep it applies `slept{duration}`, and Tree shifts every *active-time* deadline (`disconnected.until`, `start_deadline`, `timeout_s`, call deadlines, `killing` and `exiting` deadlines) by exactly that duration. Grace is extended by the sleep, not reset, so an agent that is really dead still goes down within G of real activity (fixes the "reset for everyone" issue).
 - Apart from `slept`, Tree sees time only through the `now` field logged on each event.
 
-### Tool contracts (v3.2: four orthogonal tools, per user direction)
+### Tool contracts (v4: three tools, push delivery — per user direction)
 
-Erlang gets by with spawn, send, receive and exit; so do the tools. Requests, replies and kills are compositions, not tools. `Tree` and the wire frames are unchanged: `call` and `reply` stay internal message kinds.
+Three single-purpose tools. Everything the model needs to *know* arrives by push; tools exist only for things the model *does*. Replaces v3.2's four pull-based tools (`receive`, `exit`, the `expect_reply` flag), and the blocking `ask` considered in between: an answer is just another pushed message.
 
-| Tool      | Params                                                                                                                 | Result                                                                                                                                                                                                                                                                      |
-| --------- | ---------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `spawn`   | `task, name?, model?, thinking?, context: fresh\|fork, cwd?, placement?: headless\|pane, limits?, timeout_s?, resume?` | `{id, inc}`; a failed start arrives later as a DOWN                                                                                                                                                                                                                         |
-| `send`    | `to, body, tag?, urgent?, expect_reply?, ref?`                                                                         | `{msg_id}`. With `expect_reply: true` the message is a request and `msg_id` is its `ref`. With `ref` the message is the reply to that request: only the request's target may send it (`not_authorized`), and only once (`stale_ref`). `to: "human"` requires `expect_reply` |
-| `receive` | `from?, tag?, kind?: mail\|request\|down\|reply, ref?, timeout_s`                                                      | The next matching message, or `timeout`. A request carries the `ref` to reply to. **Replies are returned only to `receive{ref}` or `receive{kind: reply}`**, never to an unfiltered receive (S2)                                                                            |
-| `exit`    | `result?, target?`                                                                                                     | Without `target`: ends this agent with `result`; later tool calls are rejected. With `target`: ends that descendant (ancestors only) and returns once it is down                                                                                                            |
+| Tool    | Params                                                                                          | Result                                                                                      |
+| ------- | ----------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------- |
+| `spawn` | `task, name?, model?, thinking?, fork?: bool, cwd?, pane?: bool, timeout_minutes?, resume?: id` | `{id}` immediately; never blocks. The child's reports arrive later by push                  |
+| `send`  | `to: id \| "parent" \| "human", text, reply_to?, urgent?`                                       | `{msg_id}` once durably accepted. `reply_to` marks the message as an answer to that message |
+| `stop`  | `id`                                                                                            | Descendants only. Returns once the agent is down                                            |
 
-Compositions:
+**Pushed into the conversation** (one coalesced entry per delivery, labelled by sender, never as user input):
 
-- **Request/reply:** `send{expect_reply}` → `ref`, then `receive{ref, timeout_s}`. If a reload interrupts the wait, the reply stays in the mailbox for a later `receive{ref}`.
-- **Wait for children:** `receive{kind: down}`.
-- **Escalate to the human:** `send{to: "human", expect_reply}`, then `receive{ref}`.
+- messages and answers from other agents and from the human (`reply_to` shown);
+- a **report** each time a child finishes a run: its final answer (≤ 16 KiB inline; longer answers say where the full text is);
+- DOWN notices (crash, stop, lost) with the reason.
 
-All four tools run in parallel like other tools: the spike showed that one sequential tool serializes the whole tool batch of that message. Instead the broker **leases** each fetched message to one `fetch_id` until it is acked, released, or the connection drops. Concurrent fetches therefore never return the same message twice (S2). The client's in-flight dedupe (Data flow, step 3) independently prevents the same double consumption; the Quint mutation suite shows that removing both is caught, and removing either alone is not (defense in depth).
+Delivery: idle agent → `sendMessage(..., {triggerTurn: true})`; busy agent → `deliverAs: "followUp"`, or `"steer"` when `urgent`. **Waiting** is ending the turn; pushes wake the agent. **A child's result** is simply its final answer — no `exit` tool, no done-nudge (D10 is superseded). A finished child is idle but alive; `send` continues it; it ends when stopped, when its parent goes down, or when the tree stops.
+
+**Exactness is kept (D3 revised):** every pushed entry carries `details.actors = {id, consumed: [msg_id…]}`. The client leases the messages it fetches, injects them, and acks them once the entry is persisted (checked at `turn_end` and `agent_settled`); the consumed set is rebuilt from session entries on reload, and IDs still being delivered are skipped (the property-tested in-flight dedupe). Internally the protocol is unchanged: a question to the human is a `call` frame (so the human's answer is routed and authorized as before); agent-to-agent messages are `mail` with an optional `ref`.
+
+**Goal integration:** the extension emits `actors:waiting {waiting: boolean}` on `pi.events` — true while the agent has a child that has not reported since it was last addressed, or an unanswered question to the human. pi-verified-goal does not continue (and does not count a stall) while waiting; the next push wakes the agent.
 
 ## Spec traceability
 
@@ -313,7 +316,7 @@ All four tools run in parallel like other tools: the spike showed that one seque
 - **Alternatives:** a cap on pending calls per caller (v3 draft). Rejected: another workload parameter; the reserve bounds the same thing with no new knob.
 - **Validated by:** `test/tree.property.test.ts`: neither class exceeds its bound, and an exempt message is never rejected.
 
-### D10: Done-nudge only when truly idle (unchanged from v2)
+### D10: Done-nudge — [SUPERSEDED by v4: a child's final answer is its report; there is no exit tool to forget]
 
 ### D11: Identity via CLI flags; incarnation; `ownsPid`; root session fence (v3, supersedes v2's environment approach)
 
@@ -457,3 +460,4 @@ User-confirmed 2026-10-05: G = 60 s for children and 300 s for the root; only tw
 | P3s (answer authorization, inbox IDs, `status.json`, polling, `ownsPid`, growth) | HumanInbox, failure table, Placement interface                                                                                                                                                      |
 | Implementation of Tree (property tests, 2026-10-05)                              | `recover` became a logged event (a second broker restart replayed without the first recovery); client dedupe also skips messages still being delivered (double consumption across a broker restart) |
 | Seven tools (user, 2026-10-05)                                                   | Four orthogonal tools: `spawn`, `send` (with `expect_reply` / `ref`), `receive`, `exit` (with `target`); `call`, `reply` and `kill` are compositions                                                |
+| Four pull-based tools (user, 2026-10-05)                                         | v4: three tools (`spawn`, `send`, `stop`), push delivery, reports instead of `exit`; blocking `ask` rejected (an answer is a pushed message)                                                        |
