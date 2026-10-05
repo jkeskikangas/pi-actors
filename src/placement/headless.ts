@@ -8,7 +8,7 @@ import { childEnv, type KeeperSpec, nodeBinary } from "../runtime.ts";
 
 
 /** Launch a Keeper for one child; returns the Keeper's pid. */
-export function startHeadless(runtimeDir: string, spec: KeeperSpec): number {
+export function startHeadless(runtimeDir: string, spec: KeeperSpec, onError: (err: Error) => void): number {
 	const specPath = join(spec.logDir, `${spec.id}.${spec.inc}.keeper.json`);
 	writeFileSync(specPath, JSON.stringify(spec), { mode: 0o600 });
 	const out = openSync(join(spec.logDir, `${spec.id}.${spec.inc}.keeper.log`), "a");
@@ -18,6 +18,7 @@ export function startHeadless(runtimeDir: string, spec: KeeperSpec): number {
 		stdio: ["ignore", out, out],
 		env: childEnv(),
 	});
+	keeper.on("error", onError); // e.g. ENOENT for a missing cwd: never crash the broker (F1)
 	keeper.unref();
 	return keeper.pid ?? -1;
 }

@@ -21,9 +21,10 @@ export interface Fetcher {
 export class Mailroom {
 	private readonly self: string;
 	private consumed = new Set<string>();
-	/** Injected but not yet seen persisted. */
-	private inFlight = new Set<string>();
+	/** Injected but not yet seen persisted: id -> when it was injected. */
+	private inFlight = new Map<string, number>();
 	private draining = false;
+	private rerun = false;
 
 	constructor(self: string) {
 		this.self = self;
@@ -42,13 +43,22 @@ export class Mailroom {
 	 * messages still in flight are dropped (their lease came back after a reconnect).
 	 */
 	async drain(f: Fetcher, max = 50): Promise<Message[]> {
-		if (this.draining) return [];
+		// A request during a drain is not dropped: the running drain loops once more (F9).
+		if (this.draining) {
+			this.rerun = true;
+			return [];
+		}
 		this.draining = true;
 		try {
 			const out: Message[] = [];
 			for (let i = 0; i < max; i++) {
+				if (i === 0) this.rerun = false;
 				const m = await f.fetch({ all: true });
-				if (!m) break;
+				if (!m) {
+					if (!this.rerun) break;
+					this.rerun = false;
+					continue;
+				}
 				if (this.consumed.has(m.id)) {
 					f.ack(m.id);
 					continue;
@@ -56,7 +66,8 @@ export class Mailroom {
 				if (this.inFlight.has(m.id) || out.some((x) => x.id === m.id)) continue;
 				out.push(m);
 			}
-			for (const m of out) this.inFlight.add(m.id);
+			const now = Date.now();
+			for (const m of out) this.inFlight.set(m.id, now);
 			return out;
 		} finally {
 			this.draining = false;
@@ -78,6 +89,22 @@ export class Mailroom {
 			}
 		}
 		return acked;
+	}
+
+	/**
+	 * At settle: injected messages whose entry never reached the session were dropped by pi (it
+	 * clears its queues on Esc). Forget them so they are fetched and delivered again (F4).
+	 */
+	reclaim(entries: readonly unknown[], minAgeMs = 5000, now = Date.now()): string[] {
+		const persisted = new Set<string>();
+		for (const e of entries) {
+			const stamp = stampOf(e);
+			if (stamp?.id === this.self) for (const id of stamp.consumed) persisted.add(id);
+		}
+		// Young injections may simply not be saved yet (a push made while the agent settles).
+		const lost = [...this.inFlight].filter(([id, at]) => !persisted.has(id) && now - at >= minAgeMs).map(([id]) => id);
+		for (const id of lost) this.inFlight.delete(id);
+		return lost;
 	}
 
 	/** A reload loses everything injected but not persisted: it will be redelivered. */

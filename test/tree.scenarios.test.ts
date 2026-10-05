@@ -315,3 +315,20 @@ test("nextDeadline tracks the earliest pending timer", () => {
 	d.run({ type: "disconnect", now: 0, id: "a", conn: d.st.agents.a.conn });
 	assert.equal(nextDeadline(d.st), TIMING.childGraceMs);
 });
+
+test("F5: a pane child's pane id is logged, so it survives replay and recover", () => {
+	const d = driver();
+	d.hello(ROOT, 1);
+	d.spawn(ROOT, { name: "p", placement: "pane" });
+	d.run({ type: "placed", id: "p", inc: 1, paneId: "w1:p9" });
+	const st = recover(replay(initial("t", DEFAULT_LIMITS, 0), d.log), 0);
+	assert.equal(st.agents.p.paneId, "w1:p9");
+});
+
+test("F1: a start failure ends the child with error:start_failed", () => {
+	const d = driver();
+	d.hello(ROOT, 1);
+	d.spawn(ROOT, { name: "x" });
+	d.run({ type: "procExit", now: 0, id: "x", inc: 1, code: null, signal: "start_failed" });
+	assert.equal(d.st.agents.x.reason, "error:start_failed");
+});

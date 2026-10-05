@@ -1,13 +1,13 @@
 // BrokerServer: the only writer of a tree's state. Socket frames become Tree events; every
 // event is logged (fsync) before its effects run (design D1, D2, D4, D13).
 
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { rmSync, writeFileSync } from "node:fs";
 import { createServer, type Server, type Socket } from "node:net";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { closePane, herdrAvailable, listPanes, paneAgentName, paneForegroundGroup, startPane } from "../placement/pane.ts";
 import { signalGroup, startHeadless } from "../placement/headless.ts";
 import { decode, encode, PROTO, TIMING } from "../protocol.ts";
-import { acquireLock, type Config, ensureDir, releaseLock } from "../runtime.ts";
+import { acquireLock, type Config, ensureDir, ensurePrivateDir, pidAlive, releaseLock } from "../runtime.ts";
 import { apply, type Effect, type Event, finished, HUMAN, initial, nextDeadline, replay, ROOT, type SpawnRequest, type TreeState } from "../tree.ts";
 import { EventLog } from "./log.ts";
 
@@ -151,6 +151,13 @@ export async function startBroker(dir: string, sock: string, config: Config): Pr
 		return args;
 	};
 
+	/** A child that cannot start ends now with a reason, instead of after the start timeout (F1). */
+	const startFailed = (id: string, inc: number, err: unknown) => {
+		writeFileSync(join(logsDir, `${id}.${inc}.start-error`), String(err));
+		const a = st.agents[id];
+		if (a && a.inc === inc && a.status !== "down") run({ type: "procExit", now: Date.now(), id, inc, code: null, signal: "start_failed" });
+	};
+
 	const start = async (id: string, inc: number, spec: SpawnRequest, parentSession?: string, resumeSession?: string) => {
 		const cwd = spec.cwd ?? config.rootCwd;
 		const piArgs = childArgs(id, inc, spec, parentSession, resumeSession);
@@ -159,6 +166,7 @@ export async function startBroker(dir: string, sock: string, config: Config): Pr
 				if (!(await herdrAvailable(config.rootPaneId))) throw new Error("herdr_unavailable");
 				const h = await startPane(config.rootPaneId!, paneAgentName(config.treeId, id), cwd, piArgs);
 				panes.set(id, h.paneId);
+				run({ type: "placed", id, inc, paneId: h.paneId }); // logged: survives broker restarts (F5)
 				const held = pendingHello.get(id);
 				if (held) {
 					pendingHello.delete(id);
@@ -167,10 +175,9 @@ export async function startBroker(dir: string, sock: string, config: Config): Pr
 				return;
 			}
 			const argv = config.childCommand ? [...config.childCommand, ...piArgs] : [...config.piCommand, "--mode", "rpc", ...piArgs];
-			startHeadless(config.runtimeDir, { id, inc, socket: sock, argv, cwd, logDir: logsDir, graceMs: TIMING.childGraceMs });
+			startHeadless(config.runtimeDir, { id, inc, socket: sock, argv, cwd, logDir: logsDir, graceMs: TIMING.childGraceMs }, (err) => startFailed(id, inc, err));
 		} catch (err) {
-			// The start deadline turns this into DOWN error:start_timeout; record why for /actors.
-			writeFileSync(join(logsDir, `${id}.${inc}.start-error`), String(err));
+			startFailed(id, inc, err);
 		}
 	};
 
@@ -190,6 +197,7 @@ export async function startBroker(dir: string, sock: string, config: Config): Pr
 	const ownsPid = async (f: HelloFrame): Promise<boolean> => {
 		const a = st.agents[f.id];
 		if (!a || f.id === ROOT) return true;
+		if (a.pid !== undefined && a.pid === f.pid) return true; // the recorded pid (also after a restart)
 		if (a.spec?.placement === "pane") {
 			const pane = panes.get(f.id);
 			return pane ? (await paneForegroundGroup(pane)) === f.pid || a.pid === f.pid : false;
@@ -212,7 +220,7 @@ export async function startBroker(dir: string, sock: string, config: Config): Pr
 		}
 		const fx = run({
 			type: "hello", now: Date.now(), id: f.id, inc: f.inc, pid: f.pid, sessionId: f.sessionId, sessionFile: f.sessionFile,
-			ownsPid: await ownsPid(f), recordedPidAlive: f.id === ROOT ? pidAlive(st.agents[ROOT]?.pid) : undefined,
+			ownsPid: await ownsPid(f), recordedPidAlive: f.id === ROOT ? !!st.agents[ROOT]?.pid && pidAlive(st.agents[ROOT].pid!) : undefined,
 		}, c);
 		if (fx.some((e) => e.type === "hold")) pendingHello.set(f.id, { conn: c, frame: f });
 	};
@@ -248,14 +256,24 @@ export async function startBroker(dir: string, sock: string, config: Config): Pr
 			case "hb":
 				return send(c, { t: "hb" });
 		}
-		// Everything below needs an accepted agent connection.
-		if (c.role !== "agent" || !c.id || agentConn.get(c.id) !== c) return;
+		// Everything below needs the agent's current connection. A stale one gets an answer, never silence (F2).
+		if (c.role !== "agent" || !c.id || agentConn.get(c.id) !== c) {
+			if (f.t === "op") send(c, { t: "resp", seq: f.seq, response: { ok: false, error: "not_live", detail: "not the current connection" } });
+			if (f.t === "fetch") send(c, { t: "fetched", fetchId: f.fetchId, message: null });
+			return;
+		}
 		const id = c.id;
 		switch (f.t) {
 			case "op": {
 				const seq = Number(f.seq);
 				const op = String(f.op);
-				if (op === "spawn") run({ type: "spawn", now, from: id, seq, req: f.req as SpawnRequest, resumeProcGone: f.resumeProcGone as boolean | undefined });
+				if (op === "spawn") {
+					const req = f.req as SpawnRequest;
+					// Resume only once the broker itself sees the old process gone (F15).
+					const old = req?.resume ? st.agents[req.resume] : undefined;
+					const resumeProcGone = old ? await processGone(old) : undefined;
+					run({ type: "spawn", now, from: id, seq, req, resumeProcGone });
+				}
 				else if (op === "send") run({ type: "send", now, from: id, seq, to: String(f.to ?? ""), kind: f.kind as "mail" | "call" | "reply", body: String(f.body ?? ""), tag: f.tag as string | undefined, ref: f.ref as string | undefined, urgent: !!f.urgent, timeoutS: f.timeoutS as number | undefined });
 				else if (op === "answer") run({ type: "answer", now, from: id, seq, ref: String(f.ref), body: String(f.body ?? "") });
 				else if (op === "exit") run({ type: "exit", now, from: id, seq, result: String(f.result ?? ""), truncated: !!f.truncated, error: !!f.error });
@@ -263,10 +281,10 @@ export async function startBroker(dir: string, sock: string, config: Config): Pr
 				return;
 			}
 			case "fetch":
-				run({ type: "fetch", id: f.human ? HUMAN : id, fetchId: String(f.fetchId), all: !!f.all, kind: f.kind as never, from: f.from as string | undefined, tag: f.tag as string | undefined, ref: f.ref as string | undefined }, c);
+				run({ type: "fetch", id: f.human && id === ROOT ? HUMAN : id, fetchId: String(f.fetchId), all: !!f.all, kind: f.kind as never, from: f.from as string | undefined, tag: f.tag as string | undefined, ref: f.ref as string | undefined }, c);
 				return;
 			case "ack":
-				run({ type: "ack", id: f.human ? HUMAN : id, msgId: String(f.msgId) });
+				run({ type: "ack", id: f.human && id === ROOT ? HUMAN : id, msgId: String(f.msgId) });
 				return;
 			case "release":
 				run({ type: "release", id, msgId: String(f.msgId) });
@@ -280,6 +298,12 @@ export async function startBroker(dir: string, sock: string, config: Config): Pr
 				run({ type: "stop", now });
 				return;
 		}
+	};
+
+	const processGone = async (a: TreeState["agents"][string]): Promise<boolean> => {
+		if (a.procGone) return true;
+		if (a.spec?.placement === "pane") return a.paneId ? !(await listPanes())?.has(a.paneId) : true;
+		return !a.pid || !pidAlive(a.pid);
 	};
 
 	const inspect = (forId: string) => ({
@@ -312,12 +336,8 @@ export async function startBroker(dir: string, sock: string, config: Config): Pr
 
 	// ------------------------------------------------------------ server
 
-	try {
-		mkdirSync(join(sock, ".."), { recursive: true, mode: 0o700 });
-		rmSync(sock, { force: true }); // we hold the lock, so any socket file here is stale
-	} catch {
-		// ignore
-	}
+	ensurePrivateDir(dirname(sock)); // shared /tmp: must be ours and private (F6)
+	rmSync(sock, { force: true }); // we hold the lock, so any socket file here is stale
 	const server: Server = createServer((socket) => {
 		const c: Conn = { socket, lastSeen: Date.now(), buf: "" };
 		conns.add(c);
@@ -345,6 +365,8 @@ export async function startBroker(dir: string, sock: string, config: Config): Pr
 	// Recovery: replayed state, downtime-shifted deadlines, swept orphans; logged (D2).
 	const downtime = loaded.lastTime ? Math.max(0, Date.now() - loaded.lastTime) : 0;
 	if (loaded.events.length > 0 || loaded.snapshot) run({ type: "recover", now: Date.now(), downtimeMs: downtime });
+	// Panes placed before a restart are known again (F5).
+	for (const a of Object.values(st.agents)) if (a.paneId && a.status !== "down") panes.set(a.id, a.paneId);
 	if (log.needsCompaction() || loaded.events.length > 1000) log.compact(st, Date.now());
 
 	// ------------------------------------------------------------ timers: ticks, heartbeats, sleep, panes
@@ -401,6 +423,9 @@ export async function startBroker(dir: string, sock: string, config: Config): Pr
 		resolveDone();
 	};
 
+	// A finished tree has nothing to serve: exit instead of lingering forever (F7).
+	if (finished(st)) void shutdown();
+
 	return {
 		stop: shutdown,
 		get state() {
@@ -410,12 +435,3 @@ export async function startBroker(dir: string, sock: string, config: Config): Pr
 	};
 }
 
-function pidAlive(pid: number | undefined): boolean {
-	if (!pid) return false;
-	try {
-		process.kill(pid, 0);
-		return true;
-	} catch (e) {
-		return (e as NodeJS.ErrnoException).code === "EPERM";
-	}
-}

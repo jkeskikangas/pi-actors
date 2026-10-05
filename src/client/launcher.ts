@@ -3,9 +3,9 @@
 import { spawn } from "node:child_process";
 import { existsSync, openSync, readFileSync, writeFileSync } from "node:fs";
 import { connect } from "node:net";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { DEFAULT_LIMITS, type Limits } from "../protocol.ts";
-import { type Config, ensureDir, ensureSnapshot, nodeBinary, piCommandFromProcess, socketPath, treeDir } from "../runtime.ts";
+import { type Config, ensureDir, ensurePrivateDir, ensureSnapshot, nodeBinary, piCommandFromProcess, socketPath, treeDir } from "../runtime.ts";
 
 export interface LaunchOptions {
 	treeId: string;
@@ -15,6 +15,15 @@ export interface LaunchOptions {
 	childArgs?: string[];
 	childCommand?: string[];
 	piCommand?: string[];
+}
+
+/** The broker writes status.json; a finished tree is never restarted (F7). */
+function treeFinished(dir: string): boolean {
+	try {
+		return JSON.parse(readFileSync(join(dir, "status.json"), "utf8")).finished === true;
+	} catch {
+		return false;
+	}
 }
 
 function canConnect(sock: string): Promise<boolean> {
@@ -36,11 +45,17 @@ function canConnect(sock: string): Promise<boolean> {
 export async function ensureBroker(opts: LaunchOptions): Promise<string> {
 	const dir = treeDir(opts.treeId);
 	const sock = socketPath(opts.treeId);
+	ensurePrivateDir(dirname(sock)); // never trust a listener in a directory someone else controls (F6)
 	if (await canConnect(sock)) return sock;
+	if (treeFinished(dir)) throw new Error(`tree ${opts.treeId} finished`);
 	ensureDir(dir);
 	const configPath = join(dir, "config.json");
 	let config: Config;
-	if (existsSync(configPath)) config = JSON.parse(readFileSync(configPath, "utf8"));
+	if (existsSync(configPath)) {
+		// The code snapshot stays pinned; where the root lives and how children start may change.
+		config = { ...JSON.parse(readFileSync(configPath, "utf8")), rootCwd: opts.rootCwd, rootPaneId: opts.rootPaneId, childArgs: opts.childArgs, childCommand: opts.childCommand };
+		writeFileSync(configPath, JSON.stringify(config, null, 1), { mode: 0o600 });
+	}
 	else {
 		config = {
 			treeId: opts.treeId,

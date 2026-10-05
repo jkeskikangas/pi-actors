@@ -57,3 +57,33 @@ test("formatting labels senders, reports, answers and ends; never as user input"
 	assert.match(text, /kid has ended: killed/);
 	assert.match(formatDelivery("a", [msg("big", { body: "x".repeat(20_000) })]), /truncated/);
 });
+
+test("F4: reclaim returns only injections that are old enough and never reached the session", async () => {
+	const room = new Mailroom("a");
+	await room.drain(fetcher([msg("old"), msg("saved")]));
+	const later = Date.now() + 6000;
+	assert.deepEqual(room.reclaim([entry(["saved"])], 5000, Date.now()), [], "too young to call lost");
+	assert.deepEqual(room.reclaim([entry(["saved"])], 5000, later), ["old"]);
+	assert.deepEqual((await room.drain(fetcher([msg("old")]))).map((m) => m.id), ["old"], "redelivered");
+});
+
+test("F9: a drain requested while one runs is not dropped: the running drain fetches again", async () => {
+	const room = new Mailroom("a");
+	const queue = [msg("m1")];
+	let notified = false;
+	const f: Fetcher = {
+		fetch: async () => {
+			const m = queue.shift() ?? null;
+			if (!m && !notified) {
+				// The worst moment: the running drain just found the mailbox empty when new mail
+				// arrives and its notice asks for another drain.
+				notified = true;
+				queue.push(msg("m2"));
+				void room.drain(f);
+			}
+			return m;
+		},
+		ack() {},
+	};
+	assert.deepEqual((await room.drain(f)).map((m) => m.id), ["m1", "m2"]);
+});

@@ -2,7 +2,7 @@
 // Used by both the agent side (Launcher) and the broker; no pi or typebox imports.
 
 import { createHash } from "node:crypto";
-import { closeSync, cpSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, rmSync, statSync, writeSync } from "node:fs";
+import { closeSync, cpSync, existsSync, linkSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync, writeSync } from "node:fs";
 import { homedir, tmpdir, uptime, userInfo } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -30,6 +30,18 @@ export function socketPath(treeId: string): string {
 
 export function ensureDir(dir: string): void {
 	mkdirSync(dir, { recursive: true, mode: 0o700 });
+}
+
+/**
+ * The socket directory lives in shared /tmp: it must be ours, a real directory, and private (F6).
+ * Fails closed: another user could otherwise pre-create it and serve a fake broker.
+ */
+export function ensurePrivateDir(dir: string): void {
+	mkdirSync(dir, { recursive: true, mode: 0o700 });
+	const st = lstatSync(dir);
+	if (st.isSymbolicLink() || !st.isDirectory()) throw new Error(`${dir} is not a plain directory; refusing to use it`);
+	if (typeof process.getuid === "function" && st.uid !== process.getuid()) throw new Error(`${dir} belongs to uid ${st.uid}, not you; refusing to use it`);
+	if ((st.mode & 0o077) !== 0) throw new Error(`${dir} is accessible to other users (mode ${(st.mode & 0o777).toString(8)}); refusing to use it`);
 }
 
 export interface Config {
@@ -72,15 +84,16 @@ export function ensureSnapshot(): string {
 	const version = JSON.parse(readFileSync(join(PKG_ROOT, "package.json"), "utf8")).version as string;
 	const dir = join(stateRoot(), "runtime", `${version}-${hash.digest("hex").slice(0, 12)}`);
 	if (!existsSync(join(dir, ".complete"))) {
-		const tmp = `${dir}.tmp-${process.pid}`;
-		rmSync(tmp, { recursive: true, force: true });
+		// Build aside, then rename into place: a crash or a concurrent copy never leaves a partial
+		// snapshot marked complete.
+		const tmp = `${dir}.tmp-${process.pid}-${Date.now()}`;
 		cpSync(SRC_ROOT, tmp, { recursive: true });
 		writeFileAtomicSync(join(tmp, "package.json"), JSON.stringify({ type: "module", version }));
 		writeFileAtomicSync(join(tmp, ".complete"), "");
 		try {
-			cpSync(tmp, dir, { recursive: true });
-		} finally {
-			rmSync(tmp, { recursive: true, force: true });
+			renameSync(tmp, dir);
+		} catch {
+			rmSync(tmp, { recursive: true, force: true }); // another process won the race
 		}
 	}
 	return dir;
@@ -109,7 +122,7 @@ export interface LockInfo {
 
 export const bootTime = () => Math.round(Date.now() / 1000 - uptime());
 
-function pidAlive(pid: number): boolean {
+export function pidAlive(pid: number): boolean {
 	try {
 		process.kill(pid, 0);
 		return true;
@@ -118,29 +131,37 @@ function pidAlive(pid: number): boolean {
 	}
 }
 
-/** Take the single-instance lock (O_EXCL). A lock from an earlier boot or a dead pid is stale. */
+/**
+ * Take the single-instance lock. The content is written to a private temp file first and then
+ * link()ed into place, which is atomic: nobody ever sees an empty lock (F3). A lock from an earlier
+ * boot or of a dead pid is stale; an unreadable one is treated as live.
+ */
 export function acquireLock(dir: string): boolean {
 	const path = join(dir, "broker.lock");
-	for (let attempt = 0; attempt < 2; attempt++) {
-		try {
-			const fd = openSync(path, "wx", 0o600);
-			writeSync(fd, JSON.stringify({ pid: process.pid, bootTime: bootTime() } satisfies LockInfo));
-			closeSync(fd);
-			return true;
-		} catch (e) {
-			if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
-			let info: LockInfo | undefined;
+	const tmp = `${path}.${process.pid}.${Date.now()}`;
+	writeFileSync(tmp, JSON.stringify({ pid: process.pid, bootTime: bootTime() } satisfies LockInfo), { mode: 0o600 });
+	try {
+		for (let attempt = 0; attempt < 2; attempt++) {
 			try {
-				info = JSON.parse(readFileSync(path, "utf8"));
-			} catch {
-				info = undefined;
+				linkSync(tmp, path);
+				return true;
+			} catch (e) {
+				if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
+				let info: LockInfo | undefined;
+				try {
+					info = JSON.parse(readFileSync(path, "utf8"));
+				} catch {
+					return false; // unreadable: assume a live owner
+				}
+				const stale = !info || Math.abs(info.bootTime - bootTime()) > 5 || !pidAlive(info.pid);
+				if (!stale) return false;
+				rmSync(path, { force: true });
 			}
-			const stale = !info || Math.abs(info.bootTime - bootTime()) > 5 || !pidAlive(info.pid);
-			if (!stale) return false;
-			rmSync(path, { force: true });
 		}
+		return false;
+	} finally {
+		rmSync(tmp, { force: true });
 	}
-	return false;
 }
 
 export function releaseLock(dir: string): void {

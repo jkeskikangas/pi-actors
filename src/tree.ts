@@ -45,6 +45,7 @@ export interface Agent {
 	procStarted: boolean;
 	procGone: boolean;
 	pid?: number;
+	paneId?: string;
 	sessionId?: string;
 	sessionFile?: string;
 	spec?: SpawnRequest;
@@ -96,6 +97,8 @@ export type Event =
 	| { type: "release"; id: string; msgId: string }
 	| { type: "procStart"; id: string; inc: number; pid: number }
 	| { type: "procExit"; now: number; id: string; inc: number; code: number | null; signal: string | null }
+	/** A pane child was placed: its pane id survives broker restarts (F5). */
+	| { type: "placed"; id: string; inc: number; paneId: string }
 	| { type: "tick"; now: number }
 	| { type: "slept"; ms: number }
 	/** Applied and logged once after every broker restart (replay + recover must itself be replayable). */
@@ -181,6 +184,11 @@ export function apply(input: TreeState, ev: Event): Result {
 		case "procExit":
 			procExit(st, ev, fx);
 			break;
+		case "placed": {
+			const a = st.agents[ev.id];
+			if (a && a.inc === ev.inc) a.paneId = ev.paneId;
+			break;
+		}
 		case "tick":
 			tick(st, ev.now, fx);
 			break;
@@ -523,6 +531,7 @@ function procExit(st: TreeState, ev: Extract<Event, { type: "procExit" }>, fx: E
 	let reason: string;
 	if (a.status === "exiting") reason = a.exitResult?.error ? "error" : "normal";
 	else if (a.status === "killing") reason = a.pendingReason ?? "killed";
+	else if (ev.signal === "start_failed") reason = "error:start_failed";
 	else reason = `error:crashed(${ev.code ?? ev.signal ?? "?"})`;
 	goDown(st, a, ev.now, reason, fx);
 }

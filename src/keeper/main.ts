@@ -22,11 +22,9 @@ const stderrFd = openSync(stderrPath, "a");
 const [cmd, ...args] = spec.argv;
 const child = spawn(cmd, args, { cwd: spec.cwd, detached: true, stdio: ["pipe", "pipe", "pipe"], env: childEnv() });
 
-let stdoutRing = "";
 let stdoutBuf = "";
 child.stdout.setEncoding("utf8");
 child.stdout.on("data", (d: string) => {
-	stdoutRing = (stdoutRing + d).slice(-RING);
 	stdoutBuf += d;
 	let i: number;
 	while ((i = stdoutBuf.indexOf("\n")) >= 0) {
@@ -52,6 +50,14 @@ child.stderr.on("data", (d: Buffer) => {
 	}
 });
 child.stdin.on("error", () => {});
+// The child could not start at all (missing command or cwd): report it as an exit.
+child.on("error", (err) => {
+	writeSync(stderrFd, `keeper: ${err.message}\n`);
+	if (!exitReport) {
+		exitReport = { code: 127, signal: "start_failed" };
+		sendFrame({ t: "proc_exit", ...exitReport });
+	}
+});
 
 // ---------------------------------------------------------------- broker connection
 
@@ -132,6 +138,9 @@ setInterval(() => {
 		setTimeout(() => signal("SIGKILL"), 5000).unref();
 	} else process.exit(0);
 }, 1000);
+
+// Heartbeat, so the broker does not drop this connection as dead (F14).
+setInterval(() => sendFrame({ t: "hb" }), 15_000).unref();
 
 // Keep the child's stdin open for its whole life: never end it here.
 process.on("SIGTERM", () => signal("SIGTERM"));

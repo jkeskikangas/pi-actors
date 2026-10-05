@@ -4,7 +4,7 @@
 
 import { EventEmitter } from "node:events";
 import { connect, type Socket } from "node:net";
-import { decode, encode, type Message, type MessageKind, PROTO, type Response, TIMING } from "../protocol.ts";
+import { decode, encode, LIMITS, type Message, type MessageKind, PROTO, type Response, TIMING } from "../protocol.ts";
 
 export interface Identity {
 	socket: string;
@@ -56,11 +56,29 @@ export class Client extends EventEmitter {
 
 	readonly identity: Identity;
 	private readonly graceMs: number;
+	/** Runs before every reconnect attempt: the root relaunches its broker here (F10). */
+	private readonly redial: (() => Promise<void>) | undefined;
 
-	constructor(identity: Identity, graceMs: number = TIMING.childGraceMs) {
+	constructor(identity: Identity, graceMs: number = TIMING.childGraceMs, redial?: () => Promise<void>) {
 		super();
 		this.identity = identity;
 		this.graceMs = graceMs;
+		this.redial = redial;
+	}
+
+	get isClosed(): boolean {
+		return this.closed;
+	}
+
+	/** Closed for good: settle everything still waiting, so no tool call hangs (F2). */
+	private shut(reason: string) {
+		this.closed = true;
+		clearInterval(this.hb);
+		for (const [, w] of this.waiters) w({ ok: false, error: "not_live", detail: reason });
+		this.waiters.clear();
+		this.inflight = [];
+		for (const [, r] of this.fetches) r(null);
+		this.fetches.clear();
 	}
 
 	/** Connect and resolve on the first welcome; rejects on an identity rejection. */
@@ -103,10 +121,14 @@ export class Client extends EventEmitter {
 			if (this.closed) return;
 			this.lostSince ??= Date.now();
 			if (Date.now() - this.lostSince > this.graceMs) {
-				this.closed = true;
+				this.shut("broker unreachable");
 				return void this.emit("lost");
 			}
-			setTimeout(() => this.dial(), Math.min(5000, 500 * 2 ** Math.min(4, this.counter++ % 5))).unref();
+			const delay = Math.min(5000, 500 * 2 ** Math.min(4, this.counter++ % 5));
+			setTimeout(() => {
+				if (this.redial) void this.redial().catch(() => {}).finally(() => this.dial());
+				else this.dial();
+			}, delay).unref();
 		});
 	}
 
@@ -152,14 +174,16 @@ export class Client extends EventEmitter {
 					this.emit("terminate", f.reason);
 					break;
 				case "superseded":
-					this.closed = true;
+					this.shut("superseded");
 					this.emit("superseded");
 					break;
 				case "reject":
-				case "proto_mismatch":
-					this.closed = true;
-					this.emit("rejected", f.t === "reject" ? f.reason : `protocol ${f.client} vs broker ${f.broker}`);
+				case "proto_mismatch": {
+					const reason = f.t === "reject" ? f.reason : `protocol ${f.client} vs broker ${f.broker}`;
+					this.shut(`rejected: ${reason}`);
+					this.emit("rejected", reason);
 					break;
+				}
 			}
 		}
 	}
@@ -169,11 +193,21 @@ export class Client extends EventEmitter {
 	}
 
 	/** A sequenced operation (spawn, send, answer, exit, kill); idempotent across reconnects. */
-	op(op: string, fields: Record<string, unknown>): Promise<Response> {
+	op(op: string, fields: Record<string, unknown>, signal?: AbortSignal): Promise<Response> {
 		if (this.closed) return Promise.resolve({ ok: false, error: "not_live", detail: "connection closed" });
+		// Size first: an oversized frame must not consume a sequence number (F8).
+		if (Buffer.byteLength(JSON.stringify(fields)) > LIMITS.frameBytes + 4096) {
+			return Promise.resolve({ ok: false, error: "too_large", detail: `over ${LIMITS.frameBytes} bytes; write it to a file and send the path` });
+		}
 		const frame: OpFrame = { t: "op", seq: this.nextSeq++, op, ...fields };
 		this.inflight.push(frame);
-		const p = new Promise<Response>((resolve) => this.waiters.set(frame.seq, resolve));
+		const p = new Promise<Response>((resolve) => {
+			this.waiters.set(frame.seq, resolve);
+			// Aborting stops waiting; the frame stays queued (sequence order) and its effect may still happen.
+			signal?.addEventListener("abort", () => {
+				if (this.waiters.delete(frame.seq)) resolve({ ok: false, error: "not_live", detail: "aborted" });
+			}, { once: true });
+		});
 		if (this.connected) this.write(frame);
 		return p;
 	}
@@ -227,8 +261,7 @@ export class Client extends EventEmitter {
 	/** Leave; the broker treats the drop as a disconnect (grace applies). */
 	close(reason: "reload" | "quit" = "quit") {
 		this.write({ t: "bye", reason });
-		this.closed = true;
-		clearInterval(this.hb);
+		this.shut("closed");
 		this.sock?.end();
 	}
 }

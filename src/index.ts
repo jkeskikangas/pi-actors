@@ -3,9 +3,10 @@
 // lazily on its first spawn and records its tree in its session so it can reattach.
 
 import { execFile } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { randomBytes } from "node:crypto";
+import { mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { matchesKey, truncateToWidth } from "@earendil-works/pi-tui";
@@ -15,7 +16,7 @@ import { ensureBroker } from "./client/launcher.ts";
 import { ENTRY_TYPE, formatDelivery, Mailroom } from "./client/mailroom.ts";
 import { itemsFrom, type PanelAction, type PanelKey, type PanelState, press, readTranscript, render, summary } from "./client/panel.ts";
 import type { Snapshot } from "./client/connection.ts";
-import { paneAgentName } from "./runtime.ts";
+import { paneAgentName, stateRoot } from "./runtime.ts";
 import { type Limits, TIMING } from "./protocol.ts";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -44,6 +45,7 @@ export default function piActors(pi: ExtensionAPI) {
 	/** Children that owe a report, and questions to the human awaiting an answer. */
 	const awaitingReport = new Set<string>();
 	const awaitingHuman = new Set<string>();
+	const myChildren = new Set<string>();
 	let herdrBlocked = false;
 	let herdrLabel = "";
 	let lastSnap: Snapshot | undefined;
@@ -57,54 +59,111 @@ export default function piActors(pi: ExtensionAPI) {
 
 	// ------------------------------------------------------------ connection
 
-	async function connect(ctx: ExtensionContext): Promise<Client> {
-		if (client?.connected) return client;
+	let connecting: Promise<Client> | undefined;
+
+	/** Run an op; if the connection closed underneath it (tree finished, superseded), reconnect once. */
+	async function op(ctx: ExtensionContext, name: string, fields: Record<string, unknown>, signal?: AbortSignal) {
+		const c = await connect(ctx);
+		const r = await c.op(name, fields, signal);
+		if (!r.ok && r.error === "not_live" && c.isClosed && !signal?.aborted) return (await connect(ctx)).op(name, fields, signal);
+		return r;
+	}
+
+	/** One connection per agent: concurrent tool calls share the same in-flight connect (F2). */
+	function connect(ctx: ExtensionContext): Promise<Client> {
+		if (client && !client.isClosed) return Promise.resolve(client); // ops queue while it reconnects
+		connecting ??= doConnect(ctx).finally(() => (connecting = undefined));
+		return connecting;
+	}
+
+	async function doConnect(ctx: ExtensionContext): Promise<Client> {
 		const sm = ctx.sessionManager;
-		let identity: ConstructorParameters<typeof Client>[0];
-		let grace: number = TIMING.childGraceMs;
 		if (isChild()) {
-			identity = {
+			return open(ctx, {
 				socket: String(pi.getFlag("actors-socket")), id: String(pi.getFlag("actors-id")), inc: Number(pi.getFlag("actors-inc")),
 				pid: process.pid, sessionId: sm.getSessionId(), sessionFile: sm.getSessionFile(),
-			};
-		} else {
-			const treeId = rootTreeId(ctx) ?? sm.getSessionId().replace(/[^A-Za-z0-9]/g, "").slice(0, 10);
-			const socket = await ensureBroker({ treeId, rootCwd: ctx.cwd, rootPaneId: process.env.HERDR_PANE_ID, childArgs: childArgsFromEnv(), limits: readLimits() });
-			if (!rootTreeId(ctx)) pi.appendEntry(ROOT_ENTRY, { treeId });
-			identity = { socket, id: "root", inc: 1, pid: process.pid, sessionId: sm.getSessionId(), sessionFile: sm.getSessionFile() };
-			grace = TIMING.rootGraceMs;
+			}, TIMING.childGraceMs);
 		}
-		const c = new Client(identity, grace);
+		// The root: this session's tree, or the tree this process carried across a session switch,
+		// or a new one. A finished tree (stopped, or its root was gone too long) is replaced (F7).
+		let treeId = rootTreeId(ctx) ?? carriedTreeId() ?? newTreeId();
+		for (let attempt = 0; ; attempt++) {
+			const launch = { treeId, rootCwd: ctx.cwd, rootPaneId: process.env.HERDR_PANE_ID, childArgs: jsonEnv("PI_ACTORS_CHILD_ARGS"), childCommand: jsonEnv("PI_ACTORS_CHILD_COMMAND"), limits: readLimits() };
+			try {
+				const socket = await ensureBroker(launch);
+				const c = await open(ctx, { socket, id: "root", inc: 1, pid: process.pid, sessionId: sm.getSessionId(), sessionFile: sm.getSessionFile() }, TIMING.rootGraceMs, () => ensureBroker(launch).then(() => {}));
+				if (rootTreeId(ctx) !== treeId) pi.appendEntry(ROOT_ENTRY, { treeId });
+				carryTreeId(treeId);
+				return c;
+			} catch (err) {
+				if (attempt > 0 || !/rejected: down|finished/.test(String(err))) throw err;
+				treeId = newTreeId();
+			}
+		}
+	}
+
+	async function open(ctx: ExtensionContext, identity: ConstructorParameters<typeof Client>[0], grace: number, redial?: () => Promise<void>): Promise<Client> {
+		const c = new Client(identity, grace, redial);
 		c.usage = () => usage;
-		mailroom = new Mailroom(identity.id);
-		mailroom.restore(sm.getEntries());
+		const room = new Mailroom(identity.id);
+		room.restore(ctx.sessionManager.getEntries());
+		const current = () => client === c;
 		c.on("welcome", (w: { parent?: string | null; mailbox?: number }) => {
+			if (!current()) return;
 			parent = w.parent ?? null;
 			if ((w.mailbox ?? 0) > 0) void deliver();
 		});
-		c.on("mail", (urgent: boolean, human: number) => {
-			void human;
+		c.on("mail", (urgent: boolean) => {
+			if (!current()) return;
 			void deliver(urgent);
 			void refreshUi();
 		});
-		c.on("terminate", () => terminate());
-		c.on("superseded", () => (client = undefined));
-		c.on("rejected", () => (client = undefined));
-		c.on("lost", () => {
+		c.on("terminate", () => current() && terminate());
+		const gone = () => {
+			if (!current()) return;
+			client = undefined;
+			// A child that lost its identity (tree finished, superseded, or the broker gone past G)
+			// must not run on unlinked (F5).
 			if (isChild()) terminate();
-		});
+		};
+		c.on("superseded", gone);
+		c.on("rejected", gone);
+		c.on("lost", gone);
 		// Set before start(): the welcome handler delivers queued mail immediately.
 		client = c;
+		mailroom = room;
 		self = identity.id;
 		try {
 			await c.start();
 		} catch (err) {
-			client = undefined;
+			if (client === c) client = undefined;
 			throw err;
 		}
-		if (ctxRef) startUi(ctxRef);
+		if (ctxRef) {
+			startUi(ctxRef);
+			startReclaim(ctxRef);
+		}
 		void refreshUi();
 		return c;
+	}
+
+	const newTreeId = () => randomBytes(5).toString("hex"); // F16: random, not UUIDv7 timestamp bits
+	const carryPath = () => join(stateRoot(), "roots", `${process.pid}.json`);
+	/** A root's session switch (/new, /resume, /fork) replaces the runtime in the same process (F11). */
+	function carriedTreeId(): string | undefined {
+		try {
+			return JSON.parse(readFileSync(carryPath(), "utf8")).treeId;
+		} catch {
+			return undefined;
+		}
+	}
+	function carryTreeId(treeId: string) {
+		try {
+			mkdirSync(dirname(carryPath()), { recursive: true, mode: 0o700 });
+			writeFileSync(carryPath(), JSON.stringify({ treeId }), { mode: 0o600 });
+		} catch {
+			// best effort: without it a session switch starts a new tree
+		}
 	}
 
 	function rootTreeId(ctx: ExtensionContext): string | undefined {
@@ -128,10 +187,10 @@ export default function piActors(pi: ExtensionAPI) {
 		}
 	}
 
-	/** Test hook: extra pi args for children (e.g. a scripted provider), as a JSON array. */
-	function childArgsFromEnv(): string[] | undefined {
+	/** Test hooks: PI_ACTORS_CHILD_ARGS (extra pi args) and PI_ACTORS_CHILD_COMMAND, as JSON arrays. */
+	function jsonEnv(name: string): string[] | undefined {
 		try {
-			return process.env.PI_ACTORS_CHILD_ARGS ? JSON.parse(process.env.PI_ACTORS_CHILD_ARGS) : undefined;
+			return process.env[name] ? JSON.parse(process.env[name]!) : undefined;
 		} catch {
 			return undefined;
 		}
@@ -154,7 +213,8 @@ export default function piActors(pi: ExtensionAPI) {
 		if (batch.length === 0) return;
 		for (const m of batch) {
 			if (m.kind === "down" || m.tag === "report") awaitingReport.delete(m.kind === "down" ? safeId(m.body) : m.from);
-			if (m.from === "human" && m.ref) {
+			// Any reply to our question clears it: the human's answer, or the broker's timeout/root_down (F12).
+			if (m.ref && awaitingHuman.has(m.ref)) {
 				awaitingHuman.delete(m.ref);
 				openDialogs.get(m.ref)?.abort();
 				openDialogs.delete(m.ref);
@@ -163,7 +223,9 @@ export default function piActors(pi: ExtensionAPI) {
 		updateWaiting();
 		signalHerdr();
 		const content = formatDelivery(self, batch);
-		const options = idle ? { triggerTurn: true } : { deliverAs: (urgent || batch.some((m) => m.urgent) ? "steer" : "followUp") as "steer" | "followUp" };
+		// Always ask for a turn: pi queues it while a run is active and starts one when idle. Our own idle
+		// flag lags pi's at settle time, which lost wake-ups (F9).
+		const options = { triggerTurn: true, deliverAs: (urgent || batch.some((m) => m.urgent) ? "steer" : "followUp") as "steer" | "followUp" };
 		pi.sendMessage({ customType: ENTRY_TYPE, content, display: true, details: { actors: room.stamp(batch) } }, options);
 	}
 
@@ -216,6 +278,19 @@ export default function piActors(pi: ExtensionAPI) {
 		const line = summary(lastSnap);
 		ctx.ui.setWidget("pi-actors", line ? [line] : undefined, { placement: "belowEditor" });
 		signalHerdr();
+	}
+
+	/** Every agent, any mode: catch pushes pi dropped while the agent sits idle (F4). */
+	let reclaimTimer: NodeJS.Timeout | undefined;
+	function startReclaim(ctx: ExtensionContext) {
+		if (reclaimTimer) return;
+		reclaimTimer = setInterval(() => {
+			if (!idle || !client || !mailroom) return;
+			const lost = mailroom.reclaim(ctx.sessionManager.getEntries());
+			for (const id of lost) client.release(id);
+			if (lost.length) void deliver();
+		}, 10_000);
+		reclaimTimer.unref();
 	}
 
 	function startUi(ctx: ExtensionContext) {
@@ -279,7 +354,7 @@ export default function piActors(pi: ExtensionAPI) {
 	pi.on("session_start", async (event, ctx) => {
 		ctxRef = ctx;
 		if (event.reason === "reload") mailroom?.forgetInFlight();
-		if (isChild() || rootTreeId(ctx)) {
+		if (isChild() || rootTreeId(ctx) || carriedTreeId()) {
 			try {
 				await connect(ctx);
 			} catch (err) {
@@ -291,13 +366,17 @@ export default function piActors(pi: ExtensionAPI) {
 	pi.on("session_shutdown", async (event) => {
 		clearInterval(uiTimer);
 		uiTimer = undefined;
+		clearInterval(reclaimTimer);
+		reclaimTimer = undefined;
 		const c = client;
-		if (!c) return;
-		if (isChild() && (event.reason === "new" || event.reason === "resume" || event.reason === "fork")) {
-			await c.op("exit", { result: "session switched", error: true });
-		}
-		c.close(event.reason === "reload" ? "reload" : "quit");
 		client = undefined;
+		if (!c) return;
+		const switching = event.reason === "new" || event.reason === "resume" || event.reason === "fork";
+		if (isChild() && switching) await c.op("exit", { result: "session switched", error: true });
+		// A root keeps its tree across reloads and session switches (the next runtime reattaches);
+		// on quit the tree runs on for the root's grace period, then stops.
+		if (!isChild() && event.reason === "quit") rmSync(carryPath(), { force: true });
+		c.close(event.reason === "quit" && isChild() ? "quit" : "reload");
 	});
 
 	pi.on("input", async (event) => {
@@ -317,6 +396,9 @@ export default function piActors(pi: ExtensionAPI) {
 	pi.on("agent_settled", async (_e, ctx) => {
 		idle = true;
 		ackPersisted(ctx);
+		// Pushes pi dropped (its queues are cleared on Esc) never reached the session: release their
+		// leases and deliver them again (F4).
+		if (client && mailroom) for (const id of mailroom.reclaim(ctx.sessionManager.getEntries())) client.release(id);
 		// A child's final answer is its report (no exit tool to forget).
 		if (isChild() && client && parent && lastAssistantText.trim() && !lastRunInteractive) {
 			const body = lastAssistantText.length > REPORT_LIMIT ? `${lastAssistantText.slice(0, REPORT_LIMIT)}\n…(truncated; full text in ${ctx.sessionManager.getSessionFile()})` : lastAssistantText;
@@ -342,7 +424,15 @@ export default function piActors(pi: ExtensionAPI) {
 	// ------------------------------------------------------------ tools
 
 	const text = (s: string) => ({ content: [{ type: "text" as const, text: s }], details: undefined });
-	const failText = (r: { ok: false; error: string; detail?: string }) => `${r.error}${r.detail ? `: ${r.detail}` : ""}`;
+	const isDir = (p: string) => {
+		try {
+			return statSync(p).isDirectory();
+		} catch {
+			return false;
+		}
+	};
+	const failText = (r: { ok: false; error: string; detail?: string }) =>
+		r.error === "too_large" ? `message too large (${r.detail ?? "over 64 KiB"})` : `${r.error}${r.detail ? `: ${r.detail}` : ""}`;
 
 	pi.registerTool({
 		name: "spawn",
@@ -365,18 +455,20 @@ export default function piActors(pi: ExtensionAPI) {
 			timeout_minutes: Type.Optional(Type.Number({ description: "Stop the child after this much active time." })),
 			resume: Type.Optional(Type.String({ description: "Id of an ended child to restart with its conversation." })),
 		}),
-		async execute(_id, p, _signal, _onUpdate, ctx) {
+		async execute(_id, p, signal, _onUpdate, ctx) {
 			ctxRef = ctx;
-			const c = await connect(ctx);
 			if (p.fork && !ctx.sessionManager.getSessionFile()) throw new Error("fork needs a saved session; send a message first, then fork.");
+			// Relative paths are the agent's, not the broker's (F1).
+			const cwd = p.cwd ? resolve(ctx.cwd, p.cwd) : ctx.cwd;
+			if (!isDir(cwd)) throw new Error(`cwd ${cwd} is not a directory`);
 			// herdr is optional: without it, pane children are unavailable and headless is the default.
 			if (p.pane && process.env.HERDR_ENV !== "1") throw new Error("pane: true needs pi to run inside herdr; omit pane to run the child headless.");
-			const r = await c.op("spawn", {
-				req: { name: p.name, task: p.task, model: p.model, thinking: p.thinking, context: p.fork ? "fork" : "fresh", cwd: p.cwd, placement: p.pane ? "pane" : "headless", timeoutS: p.timeout_minutes ? p.timeout_minutes * 60 : undefined, resume: p.resume },
-				resumeProcGone: !!p.resume,
-			});
+			const r = await op(ctx, "spawn", {
+				req: { name: p.name, task: p.task, model: p.model, thinking: p.thinking, context: p.fork ? "fork" : "fresh", cwd, placement: p.pane ? "pane" : "headless", timeoutS: p.timeout_minutes ? p.timeout_minutes * 60 : undefined, resume: p.resume },
+			}, signal);
 			if (!r.ok) throw new Error(r.error === "limit_depth" ? "limit_depth: do this work yourself; this agent may not spawn deeper." : failText(r));
 			const id = (r as { id: string }).id;
+			myChildren.add(id);
 			awaitingReport.add(id);
 			updateWaiting();
 			return text(`Started ${id}. Its report will arrive by itself; end your turn when you have nothing else to do.`);
@@ -395,20 +487,20 @@ export default function piActors(pi: ExtensionAPI) {
 			reply_to: Type.Optional(Type.String({ description: "The msg id you are answering." })),
 			urgent: Type.Optional(Type.Boolean({ description: "Deliver mid-turn instead of after the recipient's current run." })),
 		}),
-		async execute(_id, p, _signal, _onUpdate, ctx) {
+		async execute(_id, p, signal, _onUpdate, ctx) {
 			ctxRef = ctx;
-			const c = await connect(ctx);
+			await connect(ctx);
 			const to = p.to === "parent" ? parent : p.to;
 			if (!to) throw new Error("this agent has no parent");
 			const kind = to === "human" ? "call" : "mail";
-			const r = await c.op("send", { to, kind, body: p.text, ref: p.reply_to, urgent: !!p.urgent, timeoutS: to === "human" ? 24 * 3600 : undefined });
+			const r = await op(ctx, "send", { to, kind, body: p.text, ref: p.reply_to, urgent: !!p.urgent, timeoutS: to === "human" ? 24 * 3600 : undefined }, signal);
 			if (!r.ok) throw new Error(failText(r));
 			const msgId = (r as { msgId: string }).msgId;
 			if (to === "human") {
 				awaitingHuman.add(msgId);
 				signalHerdr();
 				if (isChild() && ctx.mode === "tui") askInThisPane(ctx, msgId, p.text);
-			} else if (to !== parent) awaitingReport.add(to); // the child owes us a new report
+			} else if (myChildren.has(to)) awaitingReport.add(to); // only a direct child owes us a report (F12)
 			updateWaiting();
 			return text(`Sent (msg ${msgId}).${to === "human" ? " The human's answer will arrive by itself." : ""}`);
 		},
@@ -417,13 +509,12 @@ export default function piActors(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "stop",
 		label: "Stop agent",
-		description: "Stop a descendant agent (and its own children). Returns once it has ended.",
+		description: "Stop a descendant agent (and its own children). Its end notice arrives by itself.",
 		promptSnippet: "stop: end a child agent you no longer need",
 		parameters: Type.Object({ id: Type.String() }),
-		async execute(_id, p, _signal, _onUpdate, ctx) {
+		async execute(_id, p, signal, _onUpdate, ctx) {
 			ctxRef = ctx;
-			const c = await connect(ctx);
-			const r = await c.op("kill", { target: p.id });
+			const r = await op(ctx, "kill", { target: p.id }, signal);
 			if (!r.ok) throw new Error(failText(r));
 			awaitingReport.delete(p.id);
 			updateWaiting();
@@ -448,12 +539,15 @@ export default function piActors(pi: ExtensionAPI) {
 				if (self !== "root") return ctx.ui.notify("Only the root can stop the whole tree.", "warning");
 				if (ctx.hasUI && !(await ctx.ui.confirm("Stop the whole agent tree?", "Every agent is stopped."))) return;
 				c.stopTree();
+				// The tree is over: forget it, so the next spawn starts a new one (F7).
+				client = undefined;
+				rmSync(carryPath(), { force: true });
+				setTimeout(() => c.close("quit"), 500).unref();
 				return ctx.ui.notify("Stopping the agent tree.", "info");
 			}
 			const snap = await c.inspect();
 			if (!snap) return ctx.ui.notify("Broker not reachable.", "warning");
 			const lines = snap.agents
-				.filter((a) => a.id !== "root" || true)
 				.map((a) => `${"  ".repeat(a.id === "root" ? 0 : a.id.split(".").length)}${a.id} · ${a.status}${a.reason ? ` (${a.reason})` : ""}${a.model ? ` · ${a.model}` : ""}${a.placement === "pane" ? " · pane" : ""}${a.mailbox ? ` · ${a.mailbox} queued` : ""}`);
 			if (snap.human.length) lines.push(`${snap.human.length} question(s) for the human: /inbox`);
 			ctx.ui.notify(lines.join("\n"), "info");

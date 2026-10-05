@@ -42,6 +42,7 @@ interface World {
 	accepted: Map<string, string>; // msgId -> receiver, for mail the sender saw accepted
 	violations: string[];
 	faults: number;
+	redeliveries: number;
 	pidCounter: number;
 	fetchCounter: number;
 }
@@ -57,7 +58,7 @@ function newClient(pid: number, alive: boolean): Client {
 function world(): World {
 	const w: World = {
 		st: initial("p", LIMITS, 0), log: [], brokerUp: true, now: 0, clients: new Map([[ROOT, newClient(1, true)]]),
-		downEffects: new Map(), accepted: new Map(), violations: [], faults: 0, pidCounter: 10, fetchCounter: 0,
+		downEffects: new Map(), accepted: new Map(), violations: [], faults: 0, redeliveries: 0, pidCounter: 10, fetchCounter: 0,
 	};
 	w.clients.get(ROOT)!.keeperReported = true;
 	run(w, { type: "hello", now: 0, id: ROOT, inc: 1, pid: 1, sessionId: "S", ownsPid: true });
@@ -162,11 +163,14 @@ const actions: Record<string, Action> = {
 		const fx = run(w, { type: "fetch", id, fetchId: `f${++w.fetchCounter}` });
 		const f = fx.find((e) => e.type === "fetched");
 		const m = f && f.type === "fetched" ? f.message : null;
-		if (!m) return true;
+		if (!m) return false; // nothing fetched: no progress (lets the quiet phase end)
 		const c = w.clients.get(id)!;
 		// Client dedupe at fetch time: already consumed, or still being delivered (in flight
 		// across a broker restart).
-		if (c.persisted.has(m.id)) c.pendingAck.add(m.id);
+		if (c.persisted.has(m.id)) {
+			c.pendingAck.add(m.id);
+			w.redeliveries++;
+		}
 		else if (!c.fetched.some((x) => x.id === m.id)) c.fetched.push(m);
 		return true;
 	},
@@ -296,6 +300,33 @@ function checkInvariants(w: World) {
 	}
 }
 
+/**
+ * Eventual delivery (strengthened INV-3, review F13): with faults stopped, let every agent
+ * reconnect and drain. Then every message the sender saw accepted, to an agent still alive, has
+ * been consumed — "still queued" or "leased forever" no longer passes.
+ */
+function quiesce(w: World) {
+	// Each pass tries every candidate for every action, so no agent is starved and the phase
+	// ends only when nothing anywhere can make progress.
+	const order = ["brokerRestart", "keeperStart", "hello", "brokerAccept", "clientAccepted", "fetch", "persist", "ack"];
+	for (let pass = 0; pass < 500; pass++) {
+		let fired = false;
+		for (const name of order) {
+			for (let j = 0; j < 12; j++) {
+				const nth = <T>(xs: T[]) => xs[j % Math.max(1, xs.length)];
+				if (actions[name](w, nth)) fired = true;
+			}
+		}
+		if (!fired) break;
+	}
+	for (const [msgId, to] of w.accepted) {
+		const a = w.st.agents[to];
+		const alive = a && a.status !== "down" && a.status !== "killing" && a.status !== "exiting" && w.clients.get(to)?.procAlive;
+		if (!alive) continue;
+		assert.ok(w.clients.get(to)!.persisted.has(msgId), `INV-3 eventual delivery: ${msgId} to ${to} never consumed`);
+	}
+}
+
 function simulate(seed: number, steps: number) {
 	const rand = prng(seed);
 	const pick = <T>(xs: T[]): T | undefined => (xs.length ? xs[Math.floor(rand() * xs.length)] : undefined);
@@ -309,6 +340,8 @@ function simulate(seed: number, steps: number) {
 		if (actions[name](w, pick)) fired[name] = (fired[name] ?? 0) + 1;
 		checkInvariants(w);
 	}
+	quiesce(w);
+	checkInvariants(w);
 	return { w, fired };
 }
 
@@ -321,7 +354,7 @@ test("Tree satisfies the model's invariants over random executions (3k seeds × 
 			const { w, fired } = simulate(seed, 150);
 			for (const [k, v] of Object.entries(fired)) coverage[k] = (coverage[k] ?? 0) + v;
 			downs += [...w.downEffects.values()].length;
-			redelivered += [...w.clients.values()].filter((c) => [...c.pendingAck].some((id) => c.persisted.has(id))).length;
+			redelivered += w.redeliveries;
 		} catch (err) {
 			(err as Error).message = `seed ${seed}: ${(err as Error).message}`;
 			throw err;
