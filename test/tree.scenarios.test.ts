@@ -4,7 +4,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { DEFAULT_LIMITS, TIMING } from "../src/protocol.ts";
-import { apply, type Effect, type Event, HUMAN, initial, recover, replay, ROOT, type SpawnRequest, type TreeState } from "../src/tree.ts";
+import { apply, type Effect, type Event, finished, HUMAN, initial, nextDeadline, recover, replay, ROOT, type SpawnRequest, type TreeState } from "../src/tree.ts";
 
 /** A tiny driver: applies events, remembers the log, and hands out sender seq numbers. */
 function driver(limits = DEFAULT_LIMITS) {
@@ -297,4 +297,21 @@ test("apply never mutates its input", () => {
 	apply(d.st, { type: "send", now: 0, from: ROOT, seq: 99, to: "a", kind: "mail", body: "x" });
 	apply(d.st, { type: "procExit", now: 0, id: "a", inc: 1, code: 1, signal: null });
 	assert.deepEqual(d.st, before);
+});
+
+test("stop: every agent is killed and the root goes down; the tree finishes", () => {
+	const d = withChild();
+	d.run({ type: "stop", now: 0 });
+	assert.equal(d.st.agents[ROOT].status, "down");
+	assert.equal(d.st.agents.a.status, "killing");
+	d.run({ type: "procExit", now: 0, id: "a", inc: 1, code: 143, signal: null });
+	assert.equal(d.st.agents.a.reason, "killed:tree_stopped");
+	assert.ok(finished(d.st));
+});
+
+test("nextDeadline tracks the earliest pending timer", () => {
+	const d = withChild();
+	assert.equal(nextDeadline(d.st), undefined, "all live, nothing pending");
+	d.run({ type: "disconnect", now: 0, id: "a", conn: d.st.agents.a.conn });
+	assert.equal(nextDeadline(d.st), TIMING.childGraceMs);
 });

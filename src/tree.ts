@@ -99,7 +99,9 @@ export type Event =
 	| { type: "tick"; now: number }
 	| { type: "slept"; ms: number }
 	/** Applied and logged once after every broker restart (replay + recover must itself be replayable). */
-	| { type: "recover"; now: number; downtimeMs: number };
+	| { type: "recover"; now: number; downtimeMs: number }
+	/** `/actors stop`: every agent, the root included, is killed. */
+	| { type: "stop"; now: number };
 
 export type Effect =
 	| { type: "respond"; to: string; seq: number; response: Response }
@@ -187,6 +189,10 @@ export function apply(input: TreeState, ev: Event): Result {
 			break;
 		case "recover":
 			recoverInPlace(st, ev.now, ev.downtimeMs);
+			break;
+		case "stop":
+			for (const a of Object.values(st.agents)) if (a.id !== ROOT) beginKill(a, ev.now, "killed:tree_stopped", fx);
+			goDown(st, st.agents[ROOT], ev.now, "stopped", fx);
 			break;
 	}
 	return { state: st, effects: fx };
@@ -615,4 +621,27 @@ export function replay(start: TreeState, events: readonly Event[]): TreeState {
 	let st = start;
 	for (const ev of events) st = apply(st, ev).state;
 	return st;
+}
+
+/** Earliest wall-clock time at which a `tick` would change something (undefined: nothing pending). */
+export function nextDeadline(st: TreeState): number | undefined {
+	let t: number | undefined;
+	const consider = (x: number | undefined) => {
+		if (x !== undefined && (t === undefined || x < t)) t = x;
+	};
+	for (const a of Object.values(st.agents)) {
+		if (a.status === "down") continue;
+		consider(a.deadline);
+		if (isActive(a)) consider(a.timeoutAt);
+		if (a.status === "killing" && a.killStart !== undefined) {
+			consider(a.killStep === 0 ? a.killStart + TIMING.killTermMs : a.killStep === 1 ? a.killStart + TIMING.killKillMs : undefined);
+		}
+	}
+	for (const c of Object.values(st.calls)) consider(c.deadline);
+	return t;
+}
+
+/** True when every agent is down: the broker can compact and exit. */
+export function finished(st: TreeState): boolean {
+	return Object.values(st.agents).every((a) => a.status === "down");
 }
