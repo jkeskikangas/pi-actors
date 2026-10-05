@@ -287,9 +287,9 @@ export async function startBroker(dir: string, sock: string, config: Config): Pr
 		self: forId,
 		agents: Object.values(st.agents).map((a) => ({
 			id: a.id, parent: a.parent, status: a.status, inc: a.inc, reason: a.reason, connected: a.connected,
-			placement: a.spec?.placement, model: a.spec?.model, mailbox: (st.mailbox[a.id] ?? []).length, spawns: a.spawns, limits: a.limits,
+			placement: a.spec?.placement, model: a.spec?.model, mailbox: (st.mailbox[a.id] ?? []).length, spawns: a.spawns, limits: a.limits, sessionFile: a.sessionFile, task: a.spec?.task?.slice(0, 200),
 		})),
-		human: (st.mailbox[HUMAN] ?? []).map((m) => ({ ref: m.ref, from: m.from, body: m.body })),
+		human: (st.mailbox[HUMAN] ?? []).map((m) => ({ ref: m.ref, from: m.from, body: m.body, fromPane: st.agents[m.from]?.spec?.placement === "pane" })),
 		pendingCalls: Object.entries(st.calls).filter(([, c]) => c.caller === forId).map(([ref]) => ref),
 		liveChildren: Object.values(st.agents).filter((a) => a.parent === forId && a.status !== "down").length,
 	});

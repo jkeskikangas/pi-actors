@@ -2,15 +2,20 @@
 // Identity: children get --actors-* flags (never inherited by subprocesses); the root connects
 // lazily on its first spawn and records its tree in its session so it can reattach.
 
+import { execFile } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { matchesKey, truncateToWidth } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { Client } from "./client/connection.ts";
 import { ensureBroker } from "./client/launcher.ts";
 import { ENTRY_TYPE, formatDelivery, Mailroom } from "./client/mailroom.ts";
+import { itemsFrom, type PanelAction, type PanelKey, type PanelState, press, readTranscript, render, summary } from "./client/panel.ts";
+import type { Snapshot } from "./client/connection.ts";
+import { paneAgentName } from "./runtime.ts";
 import { type Limits, TIMING } from "./protocol.ts";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -39,8 +44,13 @@ export default function piActors(pi: ExtensionAPI) {
 	/** Children that owe a report, and questions to the human awaiting an answer. */
 	const awaitingReport = new Set<string>();
 	const awaitingHuman = new Set<string>();
-	let humanPending = 0;
 	let herdrBlocked = false;
+	let herdrLabel = "";
+	let lastSnap: Snapshot | undefined;
+	let panelOpen = false;
+	let uiTimer: NodeJS.Timeout | undefined;
+	/** Dialogs open in this pane for our own questions, dismissed when the answer arrives elsewhere. */
+	const openDialogs = new Map<string, AbortController>();
 	let wasWaiting = false;
 
 	const isChild = () => !!pi.getFlag("actors-id");
@@ -73,11 +83,9 @@ export default function piActors(pi: ExtensionAPI) {
 			if ((w.mailbox ?? 0) > 0) void deliver();
 		});
 		c.on("mail", (urgent: boolean, human: number) => {
-			if (self === "root" && human !== humanPending) {
-				humanPending = human;
-				signalHerdr();
-			}
+			void human;
 			void deliver(urgent);
+			void refreshUi();
 		});
 		c.on("terminate", () => terminate());
 		c.on("superseded", () => (client = undefined));
@@ -94,6 +102,8 @@ export default function piActors(pi: ExtensionAPI) {
 			client = undefined;
 			throw err;
 		}
+		if (ctxRef) startUi(ctxRef);
+		void refreshUi();
 		return c;
 	}
 
@@ -144,7 +154,11 @@ export default function piActors(pi: ExtensionAPI) {
 		if (batch.length === 0) return;
 		for (const m of batch) {
 			if (m.kind === "down" || m.tag === "report") awaitingReport.delete(m.kind === "down" ? safeId(m.body) : m.from);
-			if (m.from === "human" && m.ref) awaitingHuman.delete(m.ref);
+			if (m.from === "human" && m.ref) {
+				awaitingHuman.delete(m.ref);
+				openDialogs.get(m.ref)?.abort();
+				openDialogs.delete(m.ref);
+			}
 		}
 		updateWaiting();
 		signalHerdr();
@@ -174,13 +188,90 @@ export default function piActors(pi: ExtensionAPI) {
 		pi.events.emit("actors:waiting", { waiting, children: [...awaitingReport], human: awaitingHuman.size });
 	}
 
-	/** Inside herdr: blocked while this agent has an unanswered human question (or, for the root, any pending). */
+	/**
+	 * herdr: block the pane where the human would answer. A pane child blocks its own pane for its
+	 * own questions; the root blocks for questions from headless agents (and itself), whose
+	 * answers go through its panel. Edge-triggered and paired, so the integration's count is exact.
+	 */
 	function signalHerdr() {
 		if (process.env.HERDR_ENV !== "1" || ctxRef?.mode !== "tui") return;
-		const want = awaitingHuman.size > 0 || (self === "root" && humanPending > 0);
-		if (want === herdrBlocked) return;
+		let askers: string[] = [];
+		if (self === "root") askers = (lastSnap?.human ?? []).filter((q) => !q.fromPane).map((q) => q.from);
+		else if (awaitingHuman.size > 0) askers = [self];
+		const want = askers.length > 0;
+		const label = want ? `pi-actors: ${askers.length} question${askers.length === 1 ? "" : "s"} (${[...new Set(askers)].join(", ")})`.slice(0, 120) : "";
+		if (want === herdrBlocked && label === herdrLabel) return;
+		if (herdrBlocked) pi.events.emit("herdr:blocked", { active: false });
+		if (want) pi.events.emit("herdr:blocked", { active: true, label });
 		herdrBlocked = want;
-		pi.events.emit("herdr:blocked", want ? { active: true, label: "pi-actors: question for the human" } : { active: false });
+		herdrLabel = label;
+	}
+
+	// ------------------------------------------------------------ panel and widget (TUI)
+
+	async function refreshUi() {
+		const ctx = ctxRef;
+		if (!ctx || ctx.mode !== "tui" || !client?.connected) return;
+		lastSnap = await client.inspect();
+		const line = summary(lastSnap);
+		ctx.ui.setWidget("pi-actors", line ? [line] : undefined, { placement: "belowEditor" });
+		signalHerdr();
+	}
+
+	function startUi(ctx: ExtensionContext) {
+		if (ctx.mode !== "tui" || uiTimer) return;
+		uiTimer = setInterval(() => void refreshUi(), 5000);
+		uiTimer.unref();
+		ctx.ui.onTerminalInput((data) => {
+			if (panelOpen || !matchesKey(data, "down") || ctx.ui.getEditorText() !== "") return undefined;
+			if (!lastSnap || itemsFrom(lastSnap).length === 0) return undefined;
+			void openPanel(ctx);
+			return { consume: true };
+		});
+	}
+
+	async function openPanel(ctx: ExtensionContext) {
+		if (panelOpen || !client) return;
+		panelOpen = true;
+		try {
+			lastSnap = (await client.inspect()) ?? lastSnap;
+			if (!lastSnap) return ctx.ui.notify("pi-actors: broker not reachable.", "warning");
+			let state: PanelState = { items: itemsFrom(lastSnap), selected: 0 };
+			const action = await ctx.ui.custom<PanelAction>(
+				(tui, theme, _kb, done) => ({
+					render(width: number) {
+						const rule = theme.fg("borderMuted", "─".repeat(Math.max(0, width)));
+						const body = render(state, (it) => readTranscript(it.sessionFile)).map((l, i) =>
+							// Padded to the full width so the overlay covers what is underneath.
+							truncateToWidth(i === 0 ? theme.fg("accent", l) : l.startsWith("❯") ? theme.fg("text", l) : theme.fg("muted", l), width, "…", true),
+						);
+						return [rule, ...body, rule];
+					},
+					handleInput(data: string) {
+						const key: PanelKey | undefined = matchesKey(data, "up") ? "up" : matchesKey(data, "down") ? "down" : matchesKey(data, "enter") ? "enter" : matchesKey(data, "escape") ? "escape" : data === "f" ? "focus" : undefined;
+						if (!key) return;
+						const r = press(state, key);
+						state = r.state;
+						if (r.action.type !== "none") done(r.action);
+						else tui.requestRender();
+					},
+					invalidate() {},
+				}),
+				{ overlay: true, overlayOptions: { width: "100%", maxHeight: "70%", anchor: "center" } },
+			);
+			if (action.type === "answer") {
+				const answer = await ctx.ui.input(`Answer ${action.from}: ${action.body.slice(0, 300)}`, "your answer");
+				if (answer?.trim()) {
+					const r = await client.op("answer", { ref: action.ref, body: answer.trim() });
+					ctx.ui.notify(r.ok ? `Answered ${action.from}.` : `Not delivered: ${failText(r as { ok: false; error: string })}`, r.ok ? "info" : "warning");
+				}
+			} else if (action.type === "focusPane" && lastSnap) {
+				execFile("herdr", ["agent", "focus", paneAgentName(lastSnap.treeId, action.id)], () => {});
+			}
+		} finally {
+			panelOpen = false;
+			void refreshUi();
+		}
 	}
 
 	// ------------------------------------------------------------ lifecycle
@@ -198,6 +289,8 @@ export default function piActors(pi: ExtensionAPI) {
 	});
 
 	pi.on("session_shutdown", async (event) => {
+		clearInterval(uiTimer);
+		uiTimer = undefined;
 		const c = client;
 		if (!c) return;
 		if (isChild() && (event.reason === "new" || event.reason === "resume" || event.reason === "fork")) {
@@ -234,6 +327,18 @@ export default function piActors(pi: ExtensionAPI) {
 		void deliver(); // anything that arrived while busy
 	});
 
+	/** A pane child's question is answered in its own pane; the dialog closes if answered elsewhere. */
+	function askInThisPane(ctx: ExtensionContext, ref: string, question: string) {
+		const ac = new AbortController();
+		openDialogs.set(ref, ac);
+		void ctx.ui.input(`Question from ${self}: ${question.slice(0, 300)}`, "your answer", { signal: ac.signal }).then(async (answer) => {
+			openDialogs.delete(ref);
+			if (!answer?.trim() || !client) return;
+			const r = await client.op("answer", { ref, body: answer.trim() });
+			if (!r.ok) ctx.ui.notify(`pi-actors: ${failText(r as { ok: false; error: string })}`, "warning");
+		});
+	}
+
 	// ------------------------------------------------------------ tools
 
 	const text = (s: string) => ({ content: [{ type: "text" as const, text: s }], details: undefined });
@@ -256,7 +361,7 @@ export default function piActors(pi: ExtensionAPI) {
 			thinking: Type.Optional(Type.String({ description: "Thinking level, e.g. low, medium, high." })),
 			fork: Type.Optional(Type.Boolean({ description: "Start from a copy of this conversation instead of a fresh context." })),
 			cwd: Type.Optional(Type.String({ description: "Working directory, e.g. a git worktree." })),
-			pane: Type.Optional(Type.Boolean({ description: "Run in a visible herdr pane the human can watch and talk to." })),
+			pane: Type.Optional(Type.Boolean({ description: "Run in a visible herdr pane the human can watch and talk to (only when pi runs inside herdr)." })),
 			timeout_minutes: Type.Optional(Type.Number({ description: "Stop the child after this much active time." })),
 			resume: Type.Optional(Type.String({ description: "Id of an ended child to restart with its conversation." })),
 		}),
@@ -264,6 +369,8 @@ export default function piActors(pi: ExtensionAPI) {
 			ctxRef = ctx;
 			const c = await connect(ctx);
 			if (p.fork && !ctx.sessionManager.getSessionFile()) throw new Error("fork needs a saved session; send a message first, then fork.");
+			// herdr is optional: without it, pane children are unavailable and headless is the default.
+			if (p.pane && process.env.HERDR_ENV !== "1") throw new Error("pane: true needs pi to run inside herdr; omit pane to run the child headless.");
 			const r = await c.op("spawn", {
 				req: { name: p.name, task: p.task, model: p.model, thinking: p.thinking, context: p.fork ? "fork" : "fresh", cwd: p.cwd, placement: p.pane ? "pane" : "headless", timeoutS: p.timeout_minutes ? p.timeout_minutes * 60 : undefined, resume: p.resume },
 				resumeProcGone: !!p.resume,
@@ -300,6 +407,7 @@ export default function piActors(pi: ExtensionAPI) {
 			if (to === "human") {
 				awaitingHuman.add(msgId);
 				signalHerdr();
+				if (isChild() && ctx.mode === "tui") askInThisPane(ctx, msgId, p.text);
 			} else if (to !== parent) awaitingReport.add(to); // the child owes us a new report
 			updateWaiting();
 			return text(`Sent (msg ${msgId}).${to === "human" ? " The human's answer will arrive by itself." : ""}`);
@@ -353,12 +461,12 @@ export default function piActors(pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("inbox", {
-		description: "List questions agents have sent to the human",
+		description: "Open the agents panel (questions for you and the agent tree); same as ↓ on an empty editor",
 		handler: async (_args, ctx) => {
 			ctxRef = ctx;
 			if (!client) return ctx.ui.notify("No agent tree.", "info");
-			const snap = await client.inspect();
-			const qs = snap?.human ?? [];
+			if (ctx.mode === "tui") return openPanel(ctx);
+			const qs = (await client.inspect())?.human ?? [];
 			if (qs.length === 0) return ctx.ui.notify("No pending questions.", "info");
 			ctx.ui.notify(qs.map((q, i) => `#${i + 1} from ${q.from}:\n${q.body}`).join("\n\n") + "\n\nAnswer with /answer <#> <text>", "info");
 		},

@@ -22,18 +22,33 @@ Everything else arrives by itself:
 
 A typical pattern: spawn a few children, end your turn, and react to their reports as they arrive. To ask a child something, `send` it and end your turn. Its answer arrives as its next report.
 
+## The agents panel
+
+While a tree has agents or open questions, a line under the editor says so: `pi-actors · 2 agents · 1 question for you — ↓ to open`. Press **↓ on an empty editor** to open the panel:
+
+- **Questions for you:** these come first. Enter on a question to type your answer, and it is delivered right away.
+- **The agent tree:** each agent's status, model and placement. Enter on an agent to see its recent transcript: what it was asked, the tools it ran, what it said. For a child in a herdr pane, `f` focuses its pane.
+- **Keys:** ↑/↓ move, Esc goes back or closes. A non-empty editor is never intercepted.
+
+`/inbox` opens the same panel. In RPC or print mode, where there is no TUI, `/inbox` prints the questions and `/answer <#> <text>` replies.
+
 ## Escalating to you
 
-An agent that needs a decision only a human can make sends to `"human"`.
+An agent that needs a decision only a human can make sends to `"human"`. The question appears in the root's panel. A child running in a herdr pane also asks right in its own pane, and answering in either place closes the question in both.
 
-- **`/inbox`** lists the questions. **`/answer <#> <text>`** replies from the root session.
-- **Children in a herdr pane** can be answered right in their pane. The pane is also marked *blocked*, so herdr notifies you.
+## herdr (optional)
+
+pi-actors works without [herdr](https://herdr.dev): children run headless and the panel lives in the root's TUI. Inside herdr, two things are added:
+
+- **Visible children:** `pane: true` runs a child in a visible pane, which you can watch and talk to.
+- **The blocked signal:** the pane where you'd answer a question is marked *blocked*, through herdr's official pi integration. That is the child's own pane for questions from pane children, and the root's pane for everything else. The label names who is asking, and the mark clears as soon as the question is answered.
+
+Outside herdr, `pane: true` fails immediately with a clear message, and nothing else changes.
 
 ## Commands
 
-- **`/actors`** shows the tree: each agent's status, model, placement and queued messages.
-- **`/actors stop <id>`** stops one agent. **`/actors stop`** stops the whole tree.
-- **`/inbox`** and **`/answer <#> <text>`** handle questions sent to the human.
+- **`/actors`** prints the tree. **`/actors stop <id>`** stops one agent, and **`/actors stop`** stops the whole tree.
+- **`/inbox`** opens the agents panel. **`/answer <#> <text>`** answers without the TUI.
 
 ## Limits
 
@@ -67,7 +82,7 @@ Under [pi-verified-goal](https://github.com/jkeskikangas/pi-verified-goal)'s `/g
 ## Requirements
 
 - pi 1.0 or newer, running on Node 22.18 or newer (for native TypeScript type stripping).
-- herdr 0.9 or newer, only for `pane: true`.
+- Optional: herdr 0.9 or newer, for `pane: true` and the blocked signal.
 
 ## Development
 

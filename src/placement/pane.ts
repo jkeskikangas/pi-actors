@@ -2,6 +2,9 @@
 // Identity is passed as pi flags after `--`, never through the pane's shell environment.
 
 import { execFile } from "node:child_process";
+import { paneAgentName } from "../runtime.ts";
+
+export { paneAgentName };
 
 export interface PaneHandle {
 	paneId: string;
@@ -31,11 +34,6 @@ export async function herdrAvailable(rootPaneId: string | undefined): Promise<bo
 		return false;
 	}
 }
-
-/** herdr agent names are global across herdr: prefix with the tree id. */
-// herdr requires: lowercase letter first, then [a-z0-9_-], at most 32 characters.
-export const paneAgentName = (treeId: string, id: string) =>
-	`a${treeId.slice(-6)}-${id}`.toLowerCase().replace(/[^a-z0-9_-]/g, "-").slice(0, 32);
 
 /** Split a pane next to the root's and start pi in it with the given pi arguments. */
 export async function startPane(rootPaneId: string, name: string, cwd: string, piArgs: string[]): Promise<PaneHandle> {

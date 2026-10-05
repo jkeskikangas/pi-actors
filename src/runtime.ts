@@ -174,3 +174,8 @@ export interface KeeperSpec {
 	/** How long the Keeper keeps a finished child's exit report while the broker is unreachable. */
 	graceMs: number;
 }
+
+/** herdr agent names are global across herdr: prefix with the tree id. */
+// herdr requires: lowercase letter first, then [a-z0-9_-], at most 32 characters.
+export const paneAgentName = (treeId: string, id: string) =>
+	`a${treeId.slice(-6)}-${id}`.toLowerCase().replace(/[^a-z0-9_-]/g, "-").slice(0, 32);

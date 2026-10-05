@@ -37,7 +37,7 @@
     ]
   },
   "scripts": {
-    "test": "node --test test/tree.scenarios.test.ts test/tree.property.test.ts test/mailroom.test.ts test/conformance.test.ts test/broker.test.ts",
+    "test": "node --test test/tree.scenarios.test.ts test/tree.property.test.ts test/mailroom.test.ts test/panel.test.ts test/conformance.test.ts test/broker.test.ts",
     "test:live": "node --test test/live.test.ts",
     "typecheck": "tsc --noEmit -p .",
     "model": "quint typecheck model/pi_actors.qnt && sh model/check.sh"
