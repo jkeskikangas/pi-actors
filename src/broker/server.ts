@@ -9,7 +9,7 @@ import { closeTmuxPane, listTmuxPanes, startTmuxPane, tmuxAvailable, tmuxPanePid
 import { signalGroup, startHeadless } from "../placement/headless.ts";
 import { decode, encode, PROTO, TIMING } from "../protocol.ts";
 import { acquireLock, type Config, ensureDir, ensurePrivateDir, holdsLock, pidAlive, releaseLock } from "../runtime.ts";
-import { apply, type Effect, type Event, finished, HUMAN, initial, nextDeadline, replay, ROOT, type SpawnRequest, type TreeState } from "../tree.ts";
+import { apply, type Effect, type Event, finished, HUMAN, initial, nextDeadline, replay, ROOT, type SpawnRequest, type TreeState, UNSYNCED_EVENTS } from "../tree.ts";
 import { EventLog } from "./log.ts";
 
 type Role = "agent" | "keeper";
@@ -58,10 +58,34 @@ export async function startBroker(dir: string, sock: string, config: Config): Pr
 
 	// ------------------------------------------------------------ events and effects
 
+	let timer: NodeJS.Timeout | undefined;
+	let paneTimer: NodeJS.Timeout | undefined;
+	let lockLost = false;
+	function loseLock() {
+		if (lockLost) return;
+		lockLost = true;
+		console.error("lost the broker lock; stopping");
+		stopping = true; // no compaction or status writes: the log is not ours any more
+		for (const c of conns) c.socket.destroy();
+		// No server.close(): it unlinks the socket path, which is now the new broker's. The
+		// process exits (main.ts); stop accepting until then.
+		server.removeAllListeners("connection");
+		server.on("connection", (s) => s.destroy());
+		clearInterval(timer);
+		clearInterval(paneTimer);
+		resolveDone();
+	}
+
 	const run = (ev: Event, ctx?: Conn): Effect[] => {
+		// Never write to a log another broker owns, not even before the next timer check (N2).
+		// Cheap next to the fsync: one small read.
+		if (lockLost || !holdsLock(dir)) {
+			loseLock();
+			return [];
+		}
 		const r = apply(st, ev);
 		st = r.state;
-		log.append(ev, Date.now());
+		log.append(ev, Date.now(), !UNSYNCED_EVENTS.has(ev.type));
 		for (const e of r.effects) perform(e, ctx);
 		writeStatus();
 		return r.effects;
@@ -392,7 +416,7 @@ export async function startBroker(dir: string, sock: string, config: Config): Pr
 
 	let lastWall = Date.now();
 	let lastMono = performance.now();
-	const timer = setInterval(() => {
+	timer = setInterval(() => {
 		const wall = Date.now();
 		const mono = performance.now();
 		const slept = wall - lastWall - (mono - lastMono);
@@ -404,22 +428,13 @@ export async function startBroker(dir: string, sock: string, config: Config): Pr
 		}
 		for (const c of conns) if (wall - c.lastSeen > TIMING.heartbeatTimeoutMs) c.socket.destroy();
 		// Never run alongside another broker on the same log (N2).
-		if (!holdsLock(dir)) {
-			console.error("lost the broker lock; stopping");
-			stopping = true; // no compaction or status writes: the log is not ours any more
-			for (const c of conns) c.socket.destroy();
-			server.close();
-			clearInterval(timer);
-			clearInterval(paneTimer);
-			resolveDone();
-			return;
-		}
+		if (lockLost || !holdsLock(dir)) return loseLock();
 		const due = nextDeadline(st);
 		if (due !== undefined && wall >= due) run({ type: "tick", now: wall });
 		if (log.needsCompaction()) log.compact(st, wall);
 	}, 1000);
 
-	const paneTimer = setInterval(async () => {
+	paneTimer = setInterval(async () => {
 		if (panes.size === 0) return;
 		const alive = await mux.list();
 		if (!alive) return;

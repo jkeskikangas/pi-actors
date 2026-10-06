@@ -12,7 +12,7 @@ export interface Stamp {
 	id: string;
 	consumed: string[];
 	/** The delivered messages themselves, so a duplicate can be cut out of the context (N1). */
-	messages?: Message[];
+	messages: Message[];
 }
 
 export interface Fetcher {
@@ -115,7 +115,10 @@ export class Mailroom {
 	}
 
 	stamp(messages: readonly Message[]): Stamp {
-		return { id: this.self, consumed: messages.map((m) => m.id), messages: [...messages] };
+		// Only what formatDelivery shows (one char over the limit keeps its "truncated" note):
+		// the session must not store every large body twice. End notices stay whole (JSON).
+		const kept = messages.map((m) => (m.kind === "down" || m.body.length <= INLINE_LIMIT ? m : { ...m, body: clean(m.body).slice(0, INLINE_LIMIT + 1) }));
+		return { id: this.self, consumed: messages.map((m) => m.id), messages: kept };
 	}
 }
 
@@ -138,7 +141,8 @@ export function dedupeContext<T>(self: string, messages: readonly T[]): T[] | un
 	for (const msg of messages) {
 		const m = msg as { role?: string; customType?: string; details?: { actors?: Stamp } };
 		const stamp = m.role === "custom" && m.customType === ENTRY_TYPE ? m.details?.actors : undefined;
-		if (!stamp || stamp.id !== self) {
+		// A stamp without its messages (an unreleased early build) cannot be rebuilt: leave it be.
+		if (!stamp || stamp.id !== self || !Array.isArray(stamp.messages)) {
 			out.push(msg);
 			continue;
 		}
@@ -149,23 +153,25 @@ export function dedupeContext<T>(self: string, messages: readonly T[]): T[] | un
 			continue;
 		}
 		changed = true;
-		if (fresh.length === 0 || !stamp.messages) continue;
+		if (fresh.length === 0) continue;
 		const keep = stamp.messages.filter((x) => fresh.includes(x.id));
 		out.push({ ...msg, content: formatDelivery(self, keep), details: { actors: { ...stamp, consumed: fresh, messages: keep } } } as T);
 	}
 	return changed ? out : undefined;
 }
 
+const clean = (s: string) => s.replace(/[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/g, "");
+
 /** Human-readable body for one pushed entry. Sender-labelled; never phrased as user input. */
 export function formatDelivery(self: string, messages: readonly Message[]): string {
 	const lines = [`[pi-actors] ${messages.length} update${messages.length === 1 ? "" : "s"} for ${self}:`];
 	for (const m of messages) {
 		// Shown in the TUI too: no terminal control sequences from other agents (N7).
-		const safe = m.body.replace(/[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/g, "");
+		const safe = clean(m.body);
 		const body = safe.length > INLINE_LIMIT ? `${safe.slice(0, INLINE_LIMIT)}\n…(truncated; ask the sender for the rest or for a file path)` : safe;
 		if (m.kind === "down") {
 			const d = safeJson(m.body) as { id?: string; reason?: string; result?: string } | undefined;
-			lines.push(`\n■ ${d?.id ?? "?"} has ended: ${d?.reason ?? "?"}${d?.result ? `\nIts result:\n${d.result}` : ""}`);
+			lines.push(`\n■ ${d?.id ?? "?"} has ended: ${d?.reason ?? "?"}${d?.result ? `\nIts result:\n${clean(d.result)}` : ""}`);
 		} else if (m.tag === "task") {
 			lines.push(`\n■ Task from ${m.from} (msg ${m.id}):\n${body}`);
 		} else if (m.tag === "report") {

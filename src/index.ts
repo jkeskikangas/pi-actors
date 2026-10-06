@@ -74,6 +74,7 @@ export default function piActors(pi: ExtensionAPI) {
 	/** One connection per agent: concurrent tool calls share the same in-flight connect (F2). */
 	function connect(ctx: ExtensionContext, signal?: AbortSignal): Promise<Client> {
 		if (client && !client.isClosed) return Promise.resolve(client); // ops queue while it reconnects
+		if (signal?.aborted) return Promise.reject(new Error("aborted"));
 		connecting ??= doConnect(ctx).finally(() => (connecting = undefined));
 		if (!signal) return connecting;
 		// A tool call can stop waiting; the shared connect carries on for the next caller (N3).
@@ -161,14 +162,15 @@ export default function piActors(pi: ExtensionAPI) {
 	const carryPath = () => join(stateRoot(), "roots", `${process.pid}.json`);
 	/**
 	 * A root's session switch (/new, /resume, /fork) replaces the runtime in the same process (F11).
-	 * The file is keyed by pid and stamped with this process's start time, so a later process that
-	 * reuses the pid after a crash ignores it (N8).
+	 * The file is keyed by pid and stamped with a token that lives as long as this process (it
+	 * survives runtime replacement), so a later process that reuses the pid ignores it (N8). Not a
+	 * clock: uptime stops while the machine sleeps.
 	 */
-	const processStart = Math.round(Date.now() / 1000 - process.uptime());
+	const processToken: string = ((globalThis as Record<symbol, string>)[Symbol.for("pi-actors.process")] ??= randomBytes(8).toString("hex"));
 	function carriedTreeId(): string | undefined {
 		try {
-			const c = JSON.parse(readFileSync(carryPath(), "utf8")) as { treeId?: string; started?: number };
-			return c.started !== undefined && Math.abs(c.started - processStart) <= 2 ? c.treeId : undefined;
+			const c = JSON.parse(readFileSync(carryPath(), "utf8")) as { treeId?: string; process?: string };
+			return c.process === processToken ? c.treeId : undefined;
 		} catch {
 			return undefined;
 		}
@@ -176,7 +178,7 @@ export default function piActors(pi: ExtensionAPI) {
 	function carryTreeId(treeId: string) {
 		try {
 			mkdirSync(dirname(carryPath()), { recursive: true, mode: 0o700 });
-			writeFileSync(carryPath(), JSON.stringify({ treeId, started: processStart }), { mode: 0o600 });
+			writeFileSync(carryPath(), JSON.stringify({ treeId, process: processToken }), { mode: 0o600 });
 		} catch {
 			// best effort: without it a session switch starts a new tree
 		}

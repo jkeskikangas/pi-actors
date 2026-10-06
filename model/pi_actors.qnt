@@ -240,7 +240,9 @@ module pi_actors {
   }
 
   // A delivery reaches the session. The context hook shows the model only ids the session does
-  // not hold yet (fix N1), so a second copy is saved but never consumed again.
+  // not hold yet (fix N1), so a second copy is saved but never consumed again. Abstraction: the
+  // real hook sees the current context, not the whole session; after a compaction an earlier
+  // copy may be summarized away, so the model's "never twice" holds per context window.
   pure def consume(st: State, id: str, m: Msg): State = {
     val hidden = st.persisted.get(id).contains(m.uid)
     val prev = st.lastSeen.get(id).get(m.src)

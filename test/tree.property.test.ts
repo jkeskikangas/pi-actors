@@ -6,7 +6,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { DEFAULT_LIMITS, type Limits, type Message } from "../src/protocol.ts";
-import { apply, type Effect, type Event, initial, replay, ROOT, type TreeState } from "../src/tree.ts";
+import { apply, type Effect, type Event, initial, replay, ROOT, type TreeState, UNSYNCED_EVENTS } from "../src/tree.ts";
 
 function prng(seed: number) {
 	let a = seed >>> 0;
@@ -265,6 +265,17 @@ const actions: Record<string, Action> = {
 		w.brokerUp = false;
 		return true;
 	},
+	// A machine crash: the log loses the trailing events written without fsync.
+	brokerCrashLosingTail(w) {
+		if (w.faults >= MAX_FAULTS || !w.brokerUp) return false;
+		let keep = w.log.length;
+		while (keep > 0 && UNSYNCED_EVENTS.has(w.log[keep - 1].type)) keep--;
+		if (keep === w.log.length) return false;
+		w.faults++;
+		w.log.length = keep;
+		w.brokerUp = false;
+		return true;
+	},
 	brokerRestart(w) {
 		if (w.brokerUp) return false;
 		w.brokerUp = true;
@@ -332,7 +343,7 @@ function simulate(seed: number, steps: number) {
 	const pick = <T>(xs: T[]): T | undefined => (xs.length ? xs[Math.floor(rand() * xs.length)] : undefined);
 	const w = world();
 	// Weighted choice: the message flow often, faults rarely, so traces reach deep paths.
-	const weight: Record<string, number> = { tick: 2, reload: 1, brokerCrash: 1, brokerRestart: 3, processCrash: 1, kill: 1, exit: 2 };
+	const weight: Record<string, number> = { tick: 2, reload: 1, brokerCrash: 1, brokerCrashLosingTail: 1, brokerRestart: 3, processCrash: 1, kill: 1, exit: 2 };
 	const names = Object.keys(actions).flatMap((n) => Array(weight[n] ?? 6).fill(n) as string[]);
 	const fired: Record<string, number> = {};
 	for (let i = 0; i < steps; i++) {

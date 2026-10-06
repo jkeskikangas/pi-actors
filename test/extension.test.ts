@@ -188,3 +188,27 @@ test("N6: in herdr, the waiting mark and the widget clear when the tree stops an
 		for (const [k, v] of Object.entries(saved)) v === undefined ? delete process.env[k] : (process.env[k] = v);
 	}
 });
+
+test("a session switch keeps the tree even when the process uptime clock jumped (system sleep)", async () => {
+	const a = root();
+	await a.tool("spawn", { task: "serve", name: "sleeper" });
+	await a.fire("session_shutdown", { reason: "new" });
+	const uptime = process.uptime;
+	process.uptime = () => uptime() - 3600; // an hour of sleep, as the monotonic clock sees it
+	try {
+		const b = root({}, true);
+		await b.fire("session_start", { reason: "new" });
+		await b.tool("send", { to: "sleeper", text: "awake?" });
+		await b.waitFor(() => /echo:awake\?/.test(b.inbox()));
+	} finally {
+		process.uptime = uptime;
+	}
+});
+
+test("a tool call whose signal is already aborted does not start anything", async () => {
+	const h = root();
+	await assert.rejects(h.tools.spawn.execute("c1", { task: "echo", name: "never" }, AbortSignal.abort(), undefined, h.ctx), /abort/i);
+	assert.equal(h.pushed.length, 0);
+	await new Promise((r) => setTimeout(r, 300));
+	assert.equal(treeOf(h), undefined, "no tree was started or recorded");
+});

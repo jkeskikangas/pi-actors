@@ -145,6 +145,15 @@ function clone(state: TreeState): TreeState {
 	return structuredClone(state);
 }
 
+/**
+ * Events the log writes without waiting for the disk: leases only, which `recover` clears
+ * anyway, so a crash that loses a trailing run of them changes nothing a restart keeps
+ * (test/tree.property.test.ts: brokerCrashLosingTail). Acks stay durable: pi does not fsync its
+ * session, so after a machine crash a lost ack would redeliver a message whose consumption the
+ * session lost too, and the agent would act on it twice.
+ */
+export const UNSYNCED_EVENTS: ReadonlySet<Event["type"]> = new Set(["fetch", "release"]);
+
 export function apply(input: TreeState, ev: Event): Result {
 	const st = clone(input);
 	const fx: Effect[] = [];

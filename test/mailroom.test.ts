@@ -100,3 +100,29 @@ test("N1: the model sees each message once, even when pi kept an injection that 
 	assert.match(out.at(-1).content, /body m3/);
 	assert.doesNotMatch(out.at(-1).content, /body m2/);
 });
+
+test("stamps keep at most what the delivery shows, and a rebuilt entry still says it was truncated", () => {
+	const room = new Mailroom("a");
+	const stamp = room.stamp([msg("big", { body: "x".repeat(200_000) }), msg("d", { kind: "down", body: JSON.stringify({ id: "kid", reason: "normal", result: "r".repeat(30_000) }) })]);
+	assert.ok(stamp.messages![0].body.length <= 16 * 1024 + 1, "no 200 kB body in the session entry");
+	assert.match(formatDelivery("a", stamp.messages!), /truncated/);
+	assert.match(formatDelivery("a", stamp.messages!), /kid has ended: normal/, "an end notice still parses");
+});
+
+test("an end notice's result is shown without terminal control sequences", () => {
+	const text = formatDelivery("root", [msg("d", { from: "broker", kind: "down", body: JSON.stringify({ id: "kid", reason: "normal", result: "ok\u001b[2J\u0007done" }) })]);
+	assert.doesNotMatch(text, /[\u001b\u0007]/);
+	assert.match(text, /ok\[2Jdone/);
+});
+
+test("a stamp cut by the shown (cleaned) length keeps the truncated note when rebuilt", () => {
+	const room = new Mailroom("a");
+	const m = msg("ctl", { body: "\u0007".repeat(100) + "x".repeat(16 * 1024 + 50) });
+	assert.match(formatDelivery("a", [m]), /truncated/);
+	assert.match(formatDelivery("a", room.stamp([m]).messages), /truncated/);
+});
+
+test("the context hook passes over a stamp without its messages instead of failing", () => {
+	const bare = (ids: string[]) => ({ role: "custom", customType: ENTRY_TYPE, content: ids.join(","), details: { actors: { id: "a", consumed: ids } } });
+	assert.doesNotThrow(() => dedupeContext("a", [bare(["m1"]), bare(["m1", "m2"])]));
+});

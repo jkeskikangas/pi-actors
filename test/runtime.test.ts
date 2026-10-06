@@ -75,3 +75,72 @@ setTimeout(() => {}, 1000);`);
 	}
 	assert.equal(multi, 0);
 });
+
+test("a broker that lost its lock stops without removing the socket of the broker that took over", async () => {
+	const { ensureBroker } = await import("../src/client/launcher.ts");
+	const { treeDir, socketPath } = await import("../src/runtime.ts");
+	const { createServer, connect } = await import("node:net");
+	const { readFileSync } = await import("node:fs");
+	const home = mkdtempSync("/tmp/pia-lock-");
+	const saved = { h: process.env.PI_ACTORS_HOME, s: process.env.PI_ACTORS_SOCKET_DIR };
+	process.env.PI_ACTORS_HOME = join(home, "h");
+	process.env.PI_ACTORS_SOCKET_DIR = join(home, "s");
+	const treeId = "lostlock01";
+	try {
+		const sock = await ensureBroker({ treeId, rootCwd: home });
+		const dir = treeDir(treeId);
+		const oldPid = JSON.parse(readFileSync(join(dir, "broker.lock"), "utf8")).pid as number;
+		// Another broker took over: it holds the lock and listens on the same path.
+		rmSync(sock, { force: true });
+		const winner = createServer((c) => c.end());
+		await new Promise<void>((r) => winner.listen(sock, r));
+		writeFileSync(join(dir, "broker.lock"), JSON.stringify({ pid: process.pid, bootTime: 0 }));
+		const gone = async () => {
+			for (let i = 0; i < 50; i++) {
+				try { process.kill(oldPid, 0); } catch { return; }
+				await new Promise((r) => setTimeout(r, 100));
+			}
+			throw new Error("the old broker did not stop");
+		};
+		await gone();
+		await new Promise<void>((resolve, reject) => connect(sock).on("connect", resolve).on("error", reject));
+		winner.close();
+		assert.equal(socketPath(treeId), sock);
+	} finally {
+		process.env.PI_ACTORS_HOME = saved.h;
+		process.env.PI_ACTORS_SOCKET_DIR = saved.s;
+		rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+	}
+});
+
+test("a broker that lost its lock writes nothing more to the log, not even before its next lock check", async () => {
+	const { ensureBroker } = await import("../src/client/launcher.ts");
+	const { treeDir } = await import("../src/runtime.ts");
+	const { Client } = await import("../src/client/connection.ts");
+	const { readFileSync } = await import("node:fs");
+	const home = mkdtempSync("/tmp/pia-lock-");
+	const saved = { h: process.env.PI_ACTORS_HOME, s: process.env.PI_ACTORS_SOCKET_DIR };
+	process.env.PI_ACTORS_HOME = join(home, "h");
+	process.env.PI_ACTORS_SOCKET_DIR = join(home, "s");
+	const treeId = "lostlock02";
+	let root: InstanceType<typeof Client> | undefined;
+	try {
+		const socket = await ensureBroker({ treeId, rootCwd: home });
+		root = new Client({ socket, id: "root", inc: 1, pid: process.pid, sessionId: "S" }, 2000);
+		await root.start();
+		const dir = treeDir(treeId);
+		const oldPid = JSON.parse(readFileSync(join(dir, "broker.lock"), "utf8")).pid as number;
+		writeFileSync(join(dir, "broker.lock"), JSON.stringify({ pid: process.pid, bootTime: 0 }));
+		void root.op("send", { to: "human", kind: "mail", body: "after the takeover" }).catch(() => {});
+		await new Promise((r) => setTimeout(r, 300));
+		assert.doesNotMatch(readFileSync(join(dir, "events.log"), "utf8"), /after the takeover/);
+		try {
+			process.kill(oldPid, "SIGKILL");
+		} catch {}
+	} finally {
+		root?.close();
+		process.env.PI_ACTORS_HOME = saved.h;
+		process.env.PI_ACTORS_SOCKET_DIR = saved.s;
+		rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+	}
+});

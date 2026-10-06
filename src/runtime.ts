@@ -144,7 +144,8 @@ export function acquireLock(dir: string): boolean {
 	const tmp = `${path}.${process.pid}.${Date.now()}`;
 	writeFileSync(tmp, mine, { mode: 0o600 });
 	try {
-		if (tryLink(tmp, path)) return true;
+		// A lock that vanished between the two calls was just released: try once more.
+		if (tryLink(tmp, path) || (!existsSync(path) && tryLink(tmp, path))) return true;
 		if (!isStale(path)) return false;
 		testPause(); // tests widen the judged-stale-then-replace window here
 		// Only the holder of the takeover lock may replace a stale lock.
@@ -187,8 +188,8 @@ function isStale(path: string): boolean {
 	try {
 		info = JSON.parse(readFileSync(path, "utf8"));
 	} catch (e) {
-		// Gone: not stale, just retry later. Unreadable or empty: an old broker's lock (pre-0.1
-		// wrote it non-atomically); stale once it is old.
+		// Gone: not stale, just retry later. Unreadable or empty: its contents never reached the
+		// disk before a machine crash (the lock is not fsynced); stale once it is old.
 		return (e as NodeJS.ErrnoException).code !== "ENOENT" && oldFile(path, 10_000);
 	}
 	return !info || Math.abs(info.bootTime - bootTime()) > 5 || !pidAlive(info.pid);
