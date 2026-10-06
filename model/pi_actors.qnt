@@ -1,4 +1,4 @@
-// pi-actors protocol model (design v3, D15).
+// pi-actors protocol model (design v4, D15).
 //
 // Scope: agent lifecycle and DOWN notices, links, limits, sender sequence numbers with
 // retransmit, leased fetch with client-side dedupe and deferred ack, client reloads, process
