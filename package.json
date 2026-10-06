@@ -1,6 +1,6 @@
 {
   "name": "pi-actors",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Subagents for pi, built like Erlang processes: spawn fresh or forked children on any model, message them, and get their reports pushed back. Survives reloads and crashes.",
   "keywords": [
     "pi-package",
