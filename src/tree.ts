@@ -445,11 +445,20 @@ function send(st: TreeState, sender: Agent, ev: Extract<Event, { type: "send" }>
 	return { ok: true, type: "accepted", msgId };
 }
 
+/**
+ * A call ends (any outcome, or its caller ended). A question to the human leaves the human's
+ * list with it: the list shows exactly what can still be answered (pi_actors_calls.qnt).
+ */
+function endCall(st: TreeState, ref: string) {
+	if (st.calls[ref]?.target === HUMAN) st.mailbox[HUMAN] = (st.mailbox[HUMAN] ?? []).filter((m) => m.ref !== ref);
+	delete st.calls[ref];
+}
+
 /** A reply (or a broker-made error reply) consumes the caller's held reserve slot. */
 function deliverReply(st: TreeState, ref: string, m: Message, fx: Effect[]) {
 	const call = st.calls[ref];
 	if (!call) return;
-	delete st.calls[ref];
+	endCall(st, ref);
 	const caller = st.agents[call.caller];
 	if (!caller || caller.status === "down") {
 		if (caller) caller.reserve = Math.max(0, caller.reserve - 1);
@@ -464,8 +473,6 @@ function answer(st: TreeState, sender: Agent, ev: Extract<Event, { type: "answer
 	if (!call || call.target !== HUMAN) return fail("stale_ref");
 	if (sender.id !== ROOT && sender.id !== call.caller) return fail("not_authorized");
 	const msgId = `${sender.id}:${sender.inc}:${ev.seq}`;
-	// The human's question is consumed with its answer.
-	st.mailbox[HUMAN] = (st.mailbox[HUMAN] ?? []).filter((m) => m.ref !== ev.ref);
 	deliverReply(st, ev.ref, { id: msgId, from: HUMAN, to: call.caller, kind: "reply", body: ev.body, ref: ev.ref }, fx);
 	return { ok: true, type: "accepted", msgId };
 }
@@ -571,7 +578,7 @@ function goDown(st: TreeState, a: Agent, now: number, reason: string, fx: Effect
 		if (c.target === a.id) deliverReply(st, ref, { id: brokerId(st), from: "broker", to: c.caller, kind: "reply", body: JSON.stringify({ error: `target_down:${reason}` }), ref }, fx);
 	}
 	// Calls this agent made: nobody will read the reply.
-	for (const [ref, c] of Object.entries(st.calls)) if (c.caller === a.id) delete st.calls[ref];
+	for (const [ref, c] of Object.entries(st.calls)) if (c.caller === a.id) endCall(st, ref);
 	// Calls the dead root made to the human, and human calls once the root is gone.
 	if (a.id === ROOT) {
 		for (const [ref, c] of Object.entries(st.calls)) {

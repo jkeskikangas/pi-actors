@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Inject known protocol bugs into the model; every one must be caught by all_invariants.
+"""Inject known protocol bugs into the models; every one must be caught by all_invariants.
 
 A mutant that survives means the invariants (and therefore Tree's property tests) are too weak.
 """
@@ -33,24 +33,49 @@ MUTANTS = [
      "val hidden = st.persisted.get(id).contains(m.uid)", "val hidden = false"),
 ]
 
-src = open(os.path.join(os.path.dirname(__file__), "pi_actors.qnt")).read()
-samples = os.environ.get("SAMPLES", "20000")
+# model/pi_actors_calls.qnt: calls, answers, identity.
+CALLS_MUTANTS = [
+    # What src/tree.ts did before this model existed: only an answer removed the question.
+    ("question stays listed after a timeout or after its asker ended",
+     [("    humanQ: st.humanQ.exclude(Set(c.ref)),\n", ""),
+      ("      humanQ: st2.humanQ.exclude(mine.map(c => c.ref)),\n", "")], None),
+    ("any agent may reply to a call",
+     "if (c.target == id) s' = { ...resolve(s, c, \"answer\")", "if (true) s' = { ...resolve(s, c, \"answer\")"),
+    ("any agent may answer for the human",
+     "if (id == ROOT or id == c.caller) s' = { ...resolve(s, c, \"answer\")", "if (true) s' = { ...resolve(s, c, \"answer\")"),
+    ("no session rebind on a same-process switch: --continue locked out (N4)",
+     "rootSession: if (a == ROOT and reloadOrFirst) p.session else s.rootSession,", "rootSession: s.rootSession,"),
+    ("root takeover while the recorded process still lives",
+     "val takeover = s.rootSession == p.session and not(isAlive(s, recorded))", "val takeover = s.rootSession == p.session"),
+    ("root takeover from any session (a fork takes the tree)",
+     "val takeover = s.rootSession == p.session and not(isAlive(s, recorded))", "val takeover = not(isAlive(s, recorded))"),
+    ("a process with inherited flags takes a child's identity",
+     "(p.inc == s.inc.get(a) and p.owns)", "(p.inc == s.inc.get(a))"),
+]
+
+here = os.path.dirname(__file__) or "."
 survivors = 0
-for name, old, new in MUTANTS:
-    edits = old if isinstance(old, list) else [(old, new)]
-    mutated = src
-    for a, b in edits:
-        assert mutated.count(a) == 1, f"mutation anchor not unique/missing: {name}: {a}"
-        mutated = mutated.replace(a, b)
-    with tempfile.NamedTemporaryFile("w", suffix=".qnt", dir=os.path.dirname(__file__) or ".", delete=False) as f:
-        f.write(mutated); path = f.name
-    try:
-        t = subprocess.run(["npx", "quint", "test", path], capture_output=True, text=True)
-        r = subprocess.run(["npx", "quint", "run", path, "--invariant=all_invariants",
-                            f"--max-samples={samples}", "--max-steps=40"], capture_output=True, text=True)
-        caught = t.returncode != 0 or (r.returncode != 0 and "violation" in (r.stdout + r.stderr).lower())
-        print(("caught   " if caught else "SURVIVED ") + name)
-        survivors += not caught
-    finally:
-        os.unlink(path)
+for model, mutants, samples in [
+    ("pi_actors.qnt", MUTANTS, os.environ.get("SAMPLES", "20000")),
+    ("pi_actors_calls.qnt", CALLS_MUTANTS, os.environ.get("CALLS_SAMPLES", "5000")),
+]:
+    src = open(os.path.join(here, model)).read()
+    for name, old, new in mutants:
+        edits = old if isinstance(old, list) else [(old, new)]
+        mutated = src
+        for a, b in edits:
+            assert mutated.count(a) == 1, f"mutation anchor not unique/missing: {name}: {a}"
+            mutated = mutated.replace(a, b)
+        with tempfile.NamedTemporaryFile("w", suffix=".qnt", dir=here, delete=False) as f:
+            f.write(mutated); path = f.name
+        try:
+            caught = subprocess.run(["npx", "quint", "test", path], capture_output=True, text=True).returncode != 0
+            if not caught:
+                r = subprocess.run(["npx", "quint", "run", path, "--invariant=all_invariants",
+                                    f"--max-samples={samples}", "--max-steps=40"], capture_output=True, text=True)
+                caught = r.returncode != 0 and "violation" in (r.stdout + r.stderr).lower()
+            print(("caught   " if caught else "SURVIVED ") + f"{model}: {name}")
+            survivors += not caught
+        finally:
+            os.unlink(path)
 sys.exit(1 if survivors else 0)

@@ -198,6 +198,37 @@ test("human: only the root or the asker may answer; root down fails pending huma
 	assert.equal(answer(ROOT).ok, false, "first answer wins");
 });
 
+// Found by model/pi_actors_calls.qnt (humanListIsLive): the human's list shows exactly the
+// questions that can still be answered.
+test("human: a question leaves the human's list on every outcome, not only on an answer", () => {
+	const ask = (d: ReturnType<typeof withChild>, timeoutS?: number) =>
+		(d.respond(d.run({ type: "send", now: 0, from: "a", seq: d.nextSeq("a"), to: HUMAN, kind: "call", body: "ok?", timeoutS })).response as { msgId: string }).msgId;
+	const listed = (d: ReturnType<typeof withChild>) => (d.st.mailbox[HUMAN] ?? []).map((m) => m.ref);
+
+	const timedOut = withChild();
+	const r1 = ask(timedOut, 5);
+	assert.deepEqual(listed(timedOut), [r1]);
+	timedOut.advance(6000);
+	timedOut.tick();
+	assert.match(timedOut.fetch("a", { ref: r1 })!.body, /timeout/);
+	assert.deepEqual(listed(timedOut), [], "a timed-out question is withdrawn");
+
+	const askerEnded = withChild();
+	ask(askerEnded);
+	askerEnded.run({ type: "procExit", now: 0, id: "a", inc: 1, code: 1, signal: null });
+	assert.deepEqual(listed(askerEnded), [], "the asker ended: its question is withdrawn");
+
+	const rootEnded = withChild();
+	ask(rootEnded);
+	rootEnded.run({ type: "disconnect", now: 0, id: ROOT, conn: rootEnded.st.agents[ROOT].conn });
+	rootEnded.advance(TIMING.rootGraceMs + 1000);
+	rootEnded.tick(); // killing
+	rootEnded.advance(16_000);
+	rootEnded.tick();
+	assert.equal(rootEnded.st.agents[ROOT].status, "down");
+	assert.deepEqual(listed(rootEnded), [], "the root ended: nobody can answer");
+});
+
 // ---- limits, mailbox ------------------------------------------------------------------
 
 test("limits: depth and the spawn count apply at every ancestor; a subtree can only tighten them", () => {

@@ -15,7 +15,7 @@ Running agents in the background goes wrong in predictable ways: messages get lo
 - **No polling.** Results and messages are pushed into the agent's conversation when they arrive. An agent waiting for children simply ends its turn and is woken up.
 - **Three tools, small and hard to misuse.** `spawn`, `send` and `stop` add about 700 tokens to the context. There are no multi-purpose tools with dozens of options for the model to get wrong.
 - **Questions come to you, answered with a few keystrokes.** An agent that needs a decision asks with options. You see who is asking and why, pick an answer with the arrow keys, and it goes straight back to that agent.
-- **Checked, not just tested.** The coordination protocol is written as a formal model in [Quint](https://quint-lang.org), a specification language built on TLA+'s logic. Tools explore thousands of interleavings of crashes, reloads and retries against its guarantees. Deliberately injected bugs are caught every time, and the implementation is tested against the same guarantees.
+- **Checked, not just tested.** The coordination protocol is written as formal models in [Quint](https://quint-lang.org), a specification language built on TLA+'s logic: message delivery, questions and their answers, and which process may act as which agent. Tools explore thousands of interleavings of crashes, reloads, retries and restarts against their guarantees. Deliberately injected bugs are caught every time, and the implementation is tested against the same guarantees.
 
 ## The three tools
 
@@ -97,5 +97,5 @@ Under [pi-verified-goal](https://github.com/jkeskikangas/pi-verified-goal)'s `/g
 npm install
 npm test            # unit, property, broker and extension tests (no model calls)
 npm run test:live   # real pi with a scripted model: round trip, fork, a tmux pane, and a herdr pane (inside herdr only)
-npm run model       # the Quint model: scenarios, simulation, and the injected-bug suite
+npm run model       # the Quint models: scenarios, simulation, and the injected-bug suite
 ```
