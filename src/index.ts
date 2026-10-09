@@ -11,12 +11,13 @@ import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { matchesKey, Text } from "@earendil-works/pi-tui";
+import { type Component, matchesKey, type OverlayHandle } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { Client } from "./client/connection.ts";
 import { DEFAULT_KEEP_FINISHED_DAYS, ensureBroker, pruneFinishedTrees } from "./client/launcher.ts";
-import { dedupeContext, ENTRY_TYPE, endNotice, formatDelivery, Mailroom, summarizeDelivery } from "./client/mailroom.ts";
-import { agentLine, endedRoots, initialState, items, type PanelAction, type PanelKey, type PanelState, press, readTranscript, summary, view, withSnapshot } from "./client/panel.ts";
+import { dedupeContext, ENTRY_TYPE, endNotice, formatDelivery, Mailroom } from "./client/mailroom.ts";
+import { type AgentItem, agentLine, endedRoots, initialState, items, type Line, type PanelAction, type PanelKey, type PanelState, press, summary, view, withSnapshot } from "./client/panel.ts";
+import { captureRunner, readSession, renderDelivery, Transcript } from "./client/transcript.ts";
 import type { Snapshot } from "./client/connection.ts";
 import { closeOwnPaneOnExit, detectMux, paneAgentName, stateRoot } from "./runtime.ts";
 import { type Limits, type Message, TIMING } from "./protocol.ts";
@@ -33,6 +34,7 @@ function isInertCopy(argv: string[] = process.argv): boolean {
 
 export default function piActors(pi: ExtensionAPI) {
 	if (isInertCopy()) return;
+	captureRunner();
 	for (const name of ["runtime", "socket", "tree", "id", "inc", "pane"]) pi.registerFlag(`actors-${name}`, { type: "string", description: `pi-actors internal (${name})` });
 
 	let client: Client | undefined;
@@ -341,69 +343,117 @@ export default function piActors(pi: ExtensionAPI) {
 
 	const KEYS: [string, PanelKey][] = [
 		["up", "up"], ["down", "down"], ["pageUp", "pageUp"], ["pageDown", "pageDown"], ["home", "home"], ["end", "end"],
-		["enter", "enter"], ["escape", "escape"], ["f", "focus"], ["x", "clear"], ["e", "expand"],
+		["enter", "enter"], ["escape", "escape"], ["f", "focus"], ["x", "clear"], ["e", "expand"], ["ctrl+o", "expand"],
 	];
 
+	/** The transcript follows the user's pi settings, as the main session does. */
+	function transcriptOptions() {
+		let s: { outputPad?: number; hideThinkingBlock?: boolean } = {};
+		try {
+			s = pi.getSettings() as typeof s;
+		} catch {
+			// defaults
+		}
+		return { outputPad: typeof s.outputPad === "number" ? s.outputPad : 1, hideThinkingBlock: s.hideThinkingBlock ?? false };
+	}
+
 	/**
-	 * The panel overlay. Clearing and pane focus happen while it stays open; it closes on esc.
-	 * Keys go through matchesKey: with the kitty keyboard protocol a plain "f" is an escape sequence.
+	 * The panel takes the editor's place, like pi's own selectors; an agent's transcript opens full
+	 * screen above everything and esc returns to the list. Clearing and pane focus happen while the
+	 * panel stays open; it closes on esc. Keys go through matchesKey: with the kitty keyboard
+	 * protocol a plain "f" is an escape sequence.
 	 */
 	function showPanel(ctx: ExtensionContext, snap: Snapshot): Promise<void> {
 		let state: PanelState = initialState(snap);
 		let busy = false;
-		return ctx.ui.custom<void>(
-			(tui, theme, _kb, done) => {
-				const refresh = async () => {
-					const next = await client?.inspect();
-					if (next) {
-						lastSnap = next;
-						state = withSnapshot(state, next);
-						tui.requestRender();
-					}
-				};
-				// Transcripts and statuses move while the panel is open.
-				const timer = setInterval(() => void refresh(), 2000);
-				timer.unref();
-				const close = () => {
-					clearInterval(timer);
-					done();
-				};
-				// Only a clear holds further keys: the rows it removes must not be acted on meanwhile.
-				const perform = async (action: PanelAction) => {
-					if (action.type !== "forget") return act(ctx, action);
-					busy = true;
-					try {
-						await act(ctx, action);
-						await refresh();
-					} finally {
-						busy = false;
-					}
-				};
-				return {
-					render(width: number) {
-						const height = Math.max(5, Math.floor(tui.terminal.rows * 0.7) - 2);
-						const v = view(state, width, height, (it) => readTranscript(it.sessionFile));
-						state = { ...state, scroll: v.scroll, seen: v.seen };
-						const rule = theme.fg("borderMuted", "─".repeat(Math.max(0, width)));
-						return [rule, ...v.lines.map((l) => theme.fg(l.tone, l.text)), rule];
-					},
-					handleInput(data: string) {
-						const key = KEYS.find(([id]) => matchesKey(data, id as Parameters<typeof matchesKey>[1]))?.[1];
-						if (!key || (busy && key !== "escape")) return;
-						const r = press(state, key);
-						state = r.state;
-						if (r.action.type === "close") return close();
-						if (r.action.type !== "none")
-							void perform(r.action)
-								.catch((err) => ctx.ui.notify(`pi-actors: ${(err as Error).message}`, "warning"))
-								.then(() => tui.requestRender());
-						tui.requestRender();
-					},
-					invalidate() {},
-				};
-			},
-			{ overlay: true, overlayOptions: { width: "100%", maxHeight: "70%", anchor: "center" } },
-		);
+		return ctx.ui.custom<void>((tui, theme, _kb, done) => {
+			const opts = transcriptOptions();
+			const transcripts = new Map<string, Transcript>();
+			const transcriptOf = (it: AgentItem, width: number) => {
+				const key = `${it.id}\0${it.sessionFile ?? ""}`;
+				let t = transcripts.get(key);
+				if (!t) transcripts.set(key, (t = new Transcript(tui, ctx.cwd, opts)));
+				t.sync(readSession(it.sessionFile));
+				t.setExpanded(state.expanded);
+				return t.render(width);
+			};
+			// Panel lines start in pi's output column; transcript lines carry their own padding.
+			const pad = " ".repeat(opts.outputPad);
+			const style = (l: Line) => (l.tone === "none" ? l.text : pad + theme.fg(l.tone, l.text));
+			const rule = (width: number) => theme.fg("borderMuted", "─".repeat(Math.max(0, width)));
+			const rows = () => Math.max(8, tui.terminal.rows);
+			let overlay: OverlayHandle | undefined;
+			const screen: Component = {
+				render(width: number) {
+					// head, rule, body, rule, foot: exactly the terminal's height.
+					const v = view(state, width - pad.length, rows() - 4, (it) => transcriptOf(it, width));
+					state = { ...state, scroll: v.scroll, seen: v.seen };
+					return [style(v.head), rule(width), ...v.body.map(style), rule(width), style(v.foot)];
+				},
+				handleInput: (data: string) => onInput(data),
+				invalidate() {
+					for (const t of transcripts.values()) t.invalidate();
+				},
+			};
+			const syncScreen = () => {
+				if (state.viewing && !overlay) overlay = tui.showOverlay?.(screen, { anchor: "top-left", width: "100%", maxHeight: "100%" });
+				else if (!state.viewing && overlay) {
+					overlay.hide();
+					overlay = undefined;
+				}
+			};
+			const refresh = async () => {
+				const next = await client?.inspect();
+				if (next) {
+					lastSnap = next;
+					state = withSnapshot(state, next);
+					syncScreen();
+					tui.requestRender();
+				}
+			};
+			// Transcripts and statuses move while the panel is open.
+			const timer = setInterval(() => void refresh(), 2000);
+			timer.unref();
+			const close = () => {
+				clearInterval(timer);
+				overlay?.hide();
+				overlay = undefined;
+				done();
+			};
+			// Only a clear holds further keys: the rows it removes must not be acted on meanwhile.
+			const perform = async (action: PanelAction) => {
+				if (action.type !== "forget") return act(ctx, action);
+				busy = true;
+				try {
+					await act(ctx, action);
+					await refresh();
+				} finally {
+					busy = false;
+				}
+			};
+			const onInput = (data: string) => {
+				const key = KEYS.find(([id]) => matchesKey(data, id as Parameters<typeof matchesKey>[1]))?.[1];
+				if (!key || (busy && key !== "escape")) return;
+				const r = press(state, key);
+				state = r.state;
+				if (r.action.type === "close") return close();
+				syncScreen();
+				if (r.action.type !== "none")
+					void perform(r.action)
+						.catch((err) => ctx.ui.notify(`pi-actors: ${(err as Error).message}`, "warning"))
+						.then(() => tui.requestRender());
+				tui.requestRender();
+			};
+			// The list: as tall as its rows, at most half the terminal.
+			return {
+				render(width: number) {
+					const v = view({ ...state, viewing: undefined }, width - pad.length, Math.max(3, Math.floor(rows() / 2) - 4), transcriptOf);
+					return [rule(width), style(v.head), ...v.body.map(style), style(v.foot), rule(width)];
+				},
+				handleInput: onInput,
+				invalidate() {},
+			};
+		});
 	}
 
 	async function act(ctx: ExtensionContext, action: PanelAction) {
@@ -457,13 +507,7 @@ export default function piActors(pi: ExtensionAPI) {
 		}
 	}
 
-	/** The collapsed chat line for a delivery; expanding it shows what the model read. */
-	pi.registerMessageRenderer<{ actors?: { messages?: Message[] } }>(ENTRY_TYPE, (message, options, theme) => {
-		const body = typeof message.content === "string" ? message.content : "";
-		const msgs = message.details?.actors?.messages;
-		const head = theme.fg("dim", `⇢ ${Array.isArray(msgs) && msgs.length ? summarizeDelivery(msgs) : body.split("\n")[0]}`);
-		return new Text(options.expanded ? `${head}\n${theme.fg("muted", body)}` : head, options.outputPad, 0);
-	});
+	pi.registerMessageRenderer<{ actors?: { messages?: Message[] } }>(ENTRY_TYPE, renderDelivery);
 
 	// ------------------------------------------------------------ lifecycle
 
