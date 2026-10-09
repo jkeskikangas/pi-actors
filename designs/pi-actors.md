@@ -237,11 +237,11 @@ Why: the parent briefed the child and usually holds the answer; the user hears o
 
 **Forget (v5)**
 
-- `forget{target}` is sequenced and logged like any op. The sender must be a strict ancestor of the target, and the target and every descendant must be `down` (`bad_request: still running` otherwise).
+- `forget{target}` is sequenced and logged like any op. The sender must be a strict ancestor of the target, and the target and every descendant must be `down` (`bad_request: still running` otherwise). While the target's parent runs, only that parent may forget it, since it may still resume the child or read its notice (`bad_request: its parent still runs`). The Quint model allows the wider rule, so this guard only narrows it.
 - It removes the target and its subtree from agents, mailboxes, leases and sender-seq tracking, and appends their ids to `forgotten`. A forgotten id is never reused by `spawn` (a kill that was `unconfirmed` may leave a process alive), a `hello` claiming it is rejected (`unknown`), and a `send` to it fails with `unknown_target`.
 - Unread mail queued for a forgotten agent is dropped with it; DOWN notices already queued for the parent stay. The model's at-least-once invariant exempts the forgotten agent.
 - A snapshot written before v5 has no `forgotten` field; `apply` normalizes it to `[]`.
-- The panel's `x` and `/actors clear` call it on the tops of the ended subtrees.
+- The panel's `x` and `/actors clear` call it on the tops of the ended subtrees in the agent's own subtree. An ended child of another running agent stays listed under that agent and is not offered for clearing.
 
 **Reload, quit, crash (operator N3)**
 

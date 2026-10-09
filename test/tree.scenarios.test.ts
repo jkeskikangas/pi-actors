@@ -195,6 +195,15 @@ test("forget: only a whole ended subtree, only by an ancestor; it leaves no trac
 	assert.equal(finished(d.st), false);
 });
 
+test("forget: an ended child of a running parent is that parent's to clear (it may resume it)", () => {
+	const d = withChild();
+	d.spawn("a", { name: "k" });
+	d.start("a.k", 300);
+	d.run({ type: "procExit", now: 0, id: "a.k", inc: 1, code: 0, signal: null });
+	assert.deepEqual(forget(d, ROOT, "a.k"), { ok: false, error: "bad_request", detail: "its parent still runs" });
+	assert.deepEqual(forget(d, "a", "a.k"), { ok: true, type: "done" });
+});
+
 test("forget is replayable and survives a snapshot written before it existed", () => {
 	const d = withChild();
 	d.run({ type: "procExit", now: 0, id: "a", inc: 1, code: 0, signal: null });

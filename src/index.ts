@@ -245,10 +245,10 @@ export default function piActors(pi: ExtensionAPI) {
 	function selfInflicted(m: Message): boolean {
 		const d = endNotice(m);
 		const base = d.reason.replace(/:unconfirmed$/, "");
-		if (base === "killed:tree_stopped") return true;
-		if (base !== "killed" || !stoppedByMe.has(d.id)) return false;
-		stoppedByMe.delete(d.id);
-		return true;
+		// Any end settles a stop: a stop that came too late (the child was already finishing) must
+		// not hide a later incarnation's end.
+		const mine = stoppedByMe.delete(d.id);
+		return base === "killed:tree_stopped" || (base === "killed" && mine);
 	}
 
 	const safeId = (body: string) => {
@@ -357,7 +357,7 @@ export default function piActors(pi: ExtensionAPI) {
 					render(width: number) {
 						const height = Math.max(5, Math.floor(tui.terminal.rows * 0.7) - 2);
 						const v = view(state, width, height, (it) => readTranscript(it.sessionFile));
-						state = { ...state, scroll: v.scroll };
+						state = { ...state, scroll: v.scroll, seen: v.seen };
 						const rule = theme.fg("borderMuted", "─".repeat(Math.max(0, width)));
 						return [rule, ...v.lines.map((l) => theme.fg(l.tone, l.text)), rule];
 					},
@@ -367,7 +367,10 @@ export default function piActors(pi: ExtensionAPI) {
 						const r = press(state, key);
 						state = r.state;
 						if (r.action.type === "close") return close();
-						if (r.action.type !== "none") void perform(r.action).then(() => tui.requestRender());
+						if (r.action.type !== "none")
+							void perform(r.action)
+								.catch((err) => ctx.ui.notify(`pi-actors: ${(err as Error).message}`, "warning"))
+								.then(() => tui.requestRender());
 						tui.requestRender();
 					},
 					invalidate() {},
@@ -400,11 +403,16 @@ export default function piActors(pi: ExtensionAPI) {
 		);
 	}
 
-	/** Remove ended agents from the tree; returns what could not be removed, with why. */
-	async function forget(ctx: ExtensionContext, ids: string[]): Promise<string[]> {
+	/**
+	 * Remove ended agents from the tree; returns what could not be removed, with why. Uses the
+	 * current connection only: reconnecting here could start a new tree the ids are not in.
+	 */
+	async function forget(_ctx: ExtensionContext, ids: string[]): Promise<string[]> {
+		const c = client;
+		if (!c || c.isClosed) return ids.map((id) => `${id}: the agent tree is gone`);
 		const failed: string[] = [];
 		for (const id of ids) {
-			const r = await op(ctx, "forget", { target: id });
+			const r = await c.op("forget", { target: id });
 			if (!r.ok) failed.push(`${id}: ${failText(r as { ok: false; error: string; detail?: string })}`);
 		}
 		return failed;
@@ -545,6 +553,7 @@ export default function piActors(pi: ExtensionAPI) {
 			}, signal);
 			if (!r.ok) throw new Error(r.error === "limit_depth" ? "limit_depth: do this work yourself; this agent may not spawn deeper." : failText(r));
 			const id = (r as { id: string }).id;
+			stoppedByMe.delete(id); // a resumed child is a new incarnation
 			myChildren.add(id);
 			awaitingReport.add(id);
 			updateWaiting();

@@ -487,8 +487,9 @@ function descendants(st: TreeState, id: string): Agent[] {
 }
 
 /**
- * Only a whole ended subtree is forgotten: nothing in it can still send, owe a DOWN or be
- * resumed. Its ids are retired, never reused (a process the kill did not confirm gone may live).
+ * Only a whole ended subtree is forgotten, by its parent or once its parent has ended too:
+ * nothing in it can still send, owe a DOWN or be resumed. Its ids are retired, never reused (a
+ * process the kill did not confirm gone may live).
  */
 function forget(st: TreeState, sender: Agent, ev: Extract<Event, { type: "forget" }>): Response {
 	const t = st.agents[ev.target];
@@ -496,6 +497,9 @@ function forget(st: TreeState, sender: Agent, ev: Extract<Event, { type: "forget
 	if (!ancestors(st, t).slice(1).some((x) => x.id === sender.id)) return fail("not_authorized");
 	const gone = [t, ...descendants(st, t.id)];
 	if (gone.some((a) => a.status !== "down")) return fail("bad_request", "still running");
+	// A running parent may still resume or read about its child: only it may clear that child.
+	const parent = t.parent ? st.agents[t.parent] : undefined;
+	if (parent && parent.id !== sender.id && parent.status !== "down") return fail("bad_request", "its parent still runs");
 	for (const a of gone) {
 		delete st.agents[a.id];
 		delete st.mailbox[a.id];

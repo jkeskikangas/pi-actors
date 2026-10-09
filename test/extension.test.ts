@@ -3,7 +3,7 @@
 
 import assert from "node:assert/strict";
 import { execSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { after, before, test } from "node:test";
 import { fileURLToPath } from "node:url";
@@ -160,6 +160,15 @@ test("/new stops the whole tree; the new session starts a fresh one", async () =
 	await b.tool("spawn", { task: "echo", name: "next" });
 	assert.notEqual(treeOf(b), oldTree);
 	assert.doesNotMatch(await children(b), /old/);
+	// The old tree really stopped, rather than waiting out the root's 5-minute grace.
+	const status = join(home, "h", "trees", oldTree, "status.json");
+	for (let i = 0; ; i++) {
+		try {
+			if (JSON.parse(readFileSync(status, "utf8")).finished === true) break;
+		} catch {}
+		assert.ok(i < 100, "the old tree did not finish");
+		await new Promise((r) => setTimeout(r, 100));
+	}
 });
 
 test("stopping a child is silent; an end the agent did not cause is pushed", async () => {

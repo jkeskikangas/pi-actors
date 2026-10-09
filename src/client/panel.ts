@@ -20,6 +20,8 @@ export type AgentItem = {
 	sessionFile?: string;
 	depth: number;
 	ended: boolean;
+	/** In the ended section: a whole ended subtree whose parent is this agent or has ended too. */
+	clearable: boolean;
 };
 
 export type PanelItem = AgentItem | { kind: "ended"; count: number; expanded: boolean };
@@ -44,6 +46,8 @@ export interface PanelState {
 	scroll: number;
 	/** Show tool output and whole deliveries in the transcript. */
 	expanded: boolean;
+	/** Transcript length at the last render: a scrolled-up view stays put while output grows. */
+	seen?: number;
 }
 
 const ACTIVE = new Set(["starting", "live", "disconnected", "exiting", "killing"]);
@@ -66,8 +70,9 @@ export function withSnapshot(st: PanelState, snap: Snapshot): PanelState {
 const sameRow = (a: PanelItem, b: PanelItem) => (a.kind === "ended" ? b.kind === "ended" : b.kind === "agent" && b.id === a.id);
 
 /**
- * Running agents first, in tree order (an ended agent stays there while a descendant runs);
- * then one "ended" row that expands to the ended subtrees. The root is not listed.
+ * This agent's subtree. Running agents first, in tree order; an ended agent stays there while a
+ * descendant runs, or while its parent (another agent) runs and may still resume it. Then one
+ * "ended" row that expands to the ended subtrees, every one of which can be cleared.
  */
 export function items(st: Pick<PanelState, "snap" | "showEnded">): PanelItem[] {
 	const { running, ended } = sections(st.snap);
@@ -84,25 +89,27 @@ function sections(snap: Snapshot): { running: AgentItem[]; ended: AgentItem[] } 
 		if (!live.has(a.id)) live.set(a.id, isActive(a.status) || (byParent.get(a.id) ?? []).some(runs));
 		return live.get(a.id)!;
 	};
+	const status = new Map(snap.agents.map((a) => [a.id, a.status]));
+	const parentRuns = (a: SnapAgent) => a.parent !== snap.self && isActive(status.get(a.parent ?? "") ?? "down");
 	const running: AgentItem[] = [];
 	const ended: AgentItem[] = [];
-	const walk = (parent: string, depth: number, endedDepth: number) => {
+	const walk = (parent: string, depth: number, endedDepth: number, inEnded: boolean) => {
 		for (const a of byParent.get(parent) ?? []) {
-			if (runs(a)) {
-				running.push(item(a, depth));
-				walk(a.id, depth + 1, 0);
+			if (!inEnded && (runs(a) || parentRuns(a))) {
+				running.push(item(a, depth, false));
+				walk(a.id, depth + 1, 0, false);
 			} else {
-				ended.push(item(a, endedDepth));
-				walk(a.id, depth + 1, endedDepth + 1);
+				ended.push(item(a, endedDepth, true));
+				walk(a.id, depth + 1, endedDepth + 1, true);
 			}
 		}
 	};
-	walk("root", 0, 0);
+	walk(snap.self, 0, 0, false);
 	return { running, ended };
 }
 
-const item = (a: SnapAgent, depth: number): AgentItem => ({
-	kind: "agent", id: a.id, status: a.status, reason: a.reason, model: a.model, placement: a.placement, mailbox: a.mailbox, sessionFile: a.sessionFile, depth, ended: !isActive(a.status),
+const item = (a: SnapAgent, depth: number, clearable: boolean): AgentItem => ({
+	kind: "agent", id: a.id, status: a.status, reason: a.reason, model: a.model, placement: a.placement, mailbox: a.mailbox, sessionFile: a.sessionFile, depth, ended: !isActive(a.status), clearable,
 });
 
 /** The tops of the ended subtrees: forgetting these clears every ended row. */
@@ -159,7 +166,7 @@ function focus(it: PanelItem | undefined): PanelAction {
 
 function clear(st: PanelState, it: PanelItem | undefined): PanelAction {
 	if (it?.kind === "ended") return { type: "forget", ids: endedRoots(st) };
-	if (it?.kind === "agent" && it.ended) return { type: "forget", ids: [it.id] };
+	if (it?.kind === "agent" && it.clearable) return { type: "forget", ids: [it.id] };
 	return { type: "none" };
 }
 
@@ -172,7 +179,7 @@ export function press(st: PanelState, key: PanelKey): { state: PanelState; actio
 		switch (key) {
 			case "escape":
 			case "enter":
-				return none({ ...st, viewing: undefined, scroll: 0 });
+				return none({ ...st, viewing: undefined, scroll: 0, seen: undefined });
 			case "up":
 				return none({ ...st, scroll: st.scroll + 1 });
 			case "down":
@@ -216,7 +223,7 @@ export function press(st: PanelState, key: PanelKey): { state: PanelState; actio
 		case "enter":
 			if (!it) return { state: st, action: { type: "close" } };
 			if (it.kind === "ended") return none({ ...st, showEnded: !st.showEnded });
-			return none({ ...st, viewing: it.id, scroll: 0 });
+			return none({ ...st, viewing: it.id, scroll: 0, seen: undefined });
 		default:
 			return none();
 	}
@@ -236,19 +243,20 @@ export interface Line {
  * The panel as toned lines that fit `width` x `height` (styling is index.ts's). Also returns the
  * scroll offset clamped to the transcript, so the caller keeps a reachable value.
  */
-export function view(st: PanelState, width: number, height: number, transcript: (it: AgentItem) => Entry[]): { lines: Line[]; scroll: number } {
+export function view(st: PanelState, width: number, height: number, transcript: (it: AgentItem) => Entry[]): { lines: Line[]; scroll: number; seen?: number } {
 	const fit = (text: string, tone: Tone): Line => ({ text: truncateToWidth(text, width, "…"), tone });
 	const room = Math.max(1, height - 1);
 	if (st.viewing) {
 		const it = viewed(st);
-		const keys = ["↑↓ PgUp/PgDn scroll", `e ${st.expanded ? "collapse" : "expand"}`, ...(focusable(it) ? ["f focus pane"] : []), ...(it?.ended ? ["x clear"] : []), "esc back"];
+		const keys = ["↑↓ PgUp/PgDn scroll", `e ${st.expanded ? "collapse" : "expand"}`, ...(focusable(it) ? ["f focus pane"] : []), ...(it?.clearable ? ["x clear"] : []), "esc back"];
 		const head = fit(`${it ? agentLine(it) : `${st.viewing} (gone)`}   ${keys.join(" · ")}`, "accent");
 		const body = it ? transcriptLines(transcript(it), width, st.expanded) : [];
-		const scroll = Math.min(st.scroll, Math.max(0, body.length - room));
+		const grown = st.scroll > 0 && st.seen !== undefined ? Math.max(0, body.length - st.seen) : 0;
+		const scroll = Math.min(st.scroll + grown, Math.max(0, body.length - room));
 		const end = body.length - scroll;
 		const shown = body.slice(Math.max(0, end - room), end);
 		if (scroll > 0) shown[shown.length - 1] = { text: `… ${scroll} more line${scroll === 1 ? "" : "s"} below (End to follow)`, tone: "dim" };
-		return { lines: [head, ...(shown.length ? shown : [{ text: "(nothing yet)", tone: "dim" as Tone }])], scroll };
+		return { lines: [head, ...(shown.length ? shown : [{ text: "(nothing yet)", tone: "dim" as Tone }])], scroll, seen: body.length };
 	}
 	const rows = items(st);
 	if (rows.length === 0) return { lines: [fit("pi-actors: no agents  (esc close)", "accent")], scroll: 0 };
@@ -256,7 +264,7 @@ export function view(st: PanelState, width: number, height: number, transcript: 
 	const keys = ["↑↓ move", sel?.kind === "ended" ? `enter ${st.showEnded ? "collapse" : "expand"}` : "enter transcript"];
 	if (focusable(sel)) keys.push("f focus pane");
 	if (sel?.kind === "ended") keys.push("x clear all ended");
-	else if (sel?.kind === "agent" && sel.ended) keys.push("x clear");
+	else if (sel?.kind === "agent" && sel.clearable) keys.push("x clear");
 	keys.push("esc close");
 	const lines: Line[] = rows.map((it, i) => {
 		const cursor = i === st.selected ? "❯ " : "  ";
@@ -374,24 +382,27 @@ export function entriesOf(line: string): Entry[] {
 }
 
 /** Session files only grow: read just the bytes appended since the last look. */
-const cache = new Map<string, { size: number; rest: Buffer; entries: Entry[] }>();
+const cache = new Map<string, { ino: number; size: number; rest: Buffer; entries: Entry[] }>();
 
 export function readTranscript(sessionFile: string | undefined): Entry[] {
 	if (!sessionFile) return [];
 	let size: number;
+	let ino: number;
 	try {
-		size = statSync(sessionFile).size;
+		({ size, ino } = statSync(sessionFile));
 	} catch {
 		return [];
 	}
 	let c = cache.get(sessionFile);
-	if (!c || size < c.size) c = { size: 0, rest: Buffer.alloc(0), entries: [] };
+	// A replaced or truncated file is read again from the start.
+	if (!c || c.ino !== ino || size < c.size) c = { ino, size: 0, rest: Buffer.alloc(0), entries: [] };
 	if (size > c.size) {
 		const chunk = Buffer.alloc(size - c.size);
+		let n: number;
 		try {
 			const fd = openSync(sessionFile, "r");
 			try {
-				readSync(fd, chunk, 0, chunk.length, c.size);
+				n = readSync(fd, chunk, 0, chunk.length, c.size);
 			} finally {
 				closeSync(fd);
 			}
@@ -399,10 +410,10 @@ export function readTranscript(sessionFile: string | undefined): Entry[] {
 			return c.entries;
 		}
 		// Split on bytes, so a multi-byte character cut at the end of a read stays whole.
-		const all = Buffer.concat([c.rest, chunk]);
+		const all = Buffer.concat([c.rest, chunk.subarray(0, n)]);
 		const cut = all.lastIndexOf(0x0a) + 1;
 		const lines = all.subarray(0, cut).toString("utf8").split("\n").filter(Boolean);
-		c = { size, rest: all.subarray(cut), entries: [...c.entries, ...lines.flatMap(entriesOf)] };
+		c = { ino, size: c.size + n, rest: all.subarray(cut), entries: [...c.entries, ...lines.flatMap(entriesOf)] };
 	}
 	cache.set(sessionFile, c);
 	return c.entries;

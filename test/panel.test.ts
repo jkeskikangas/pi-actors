@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { appendFileSync, mkdtempSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdtempSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import type { Snapshot } from "../src/client/connection.ts";
@@ -22,9 +22,16 @@ const keys = (st: PanelState, ...ks: PanelKey[]) => ks.reduce((acc, k) => press(
 
 test("running agents first in tree order; ended subtrees collapse into one row that expands", () => {
 	const st = initialState(snap());
-	assert.deepEqual(rows(st), ["fe@0", "be@0", "▸4"]);
-	assert.deepEqual(rows({ ...st, showEnded: true }), ["fe@0", "be@0", "▾4", "fe.rev@0", "old@0", "old.kid@1", "gone@0"]);
-	assert.deepEqual(endedRoots(st), ["fe.rev", "old", "gone"]);
+	assert.deepEqual(rows(st), ["fe@0", "fe.rev@1", "be@0", "▸3"], "fe may still resume fe.rev: it stays under fe");
+	assert.deepEqual(rows({ ...st, showEnded: true }), ["fe@0", "fe.rev@1", "be@0", "▾3", "old@0", "old.kid@1", "gone@0"]);
+	assert.deepEqual(endedRoots(st), ["old", "gone"]);
+	assert.deepEqual(keys(st, "down", "clear").action, { type: "none" }, "fe.rev is not clearable");
+});
+
+test("a pane child's panel shows and clears only its own subtree", () => {
+	const s = { ...snap([agent("root", null as never), agent("x", "root", "down"), agent("me", "root"), agent("me.k", "me", "down", { reason: "normal" })]), self: "me" };
+	assert.deepEqual(rows({ ...initialState(s), showEnded: true }), ["▾1", "me.k@0"]);
+	assert.deepEqual(endedRoots({ snap: s }), ["me.k"]);
 });
 
 test("an ended agent with a running descendant stays in the running section and is not cleared", () => {
@@ -53,7 +60,7 @@ test("summary counts running agents only", () => {
 
 test("enter toggles the ended row and opens a transcript; esc backs out, then closes", () => {
 	const st = initialState(snap());
-	assert.equal(keys(st, "down", "down", "enter").state.showEnded, true);
+	assert.equal(keys(st, "down", "down", "down", "enter").state.showEnded, true);
 	const opened = keys(st, "enter").state;
 	assert.equal(opened.viewing, "fe");
 	assert.equal(keys(opened, "escape").state.viewing, undefined);
@@ -63,7 +70,7 @@ test("enter toggles the ended row and opens a transcript; esc backs out, then cl
 test("x clears an ended agent or every ended subtree; it does nothing on a running agent", () => {
 	const st = initialState(snap());
 	assert.deepEqual(keys(st, "clear").action, { type: "none" });
-	assert.deepEqual(keys(st, "down", "down", "clear").action, { type: "forget", ids: ["fe.rev", "old", "gone"] });
+	assert.deepEqual(keys(st, "down", "down", "down", "clear").action, { type: "forget", ids: ["old", "gone"] });
 	const open = { ...st, showEnded: true };
 	assert.deepEqual(keys(open, "down", "down", "down", "down", "clear").action, { type: "forget", ids: ["old"] });
 	const viewing = keys(open, "down", "down", "down", "down", "enter").state;
@@ -74,13 +81,13 @@ test("x clears an ended agent or every ended subtree; it does nothing on a runni
 
 test("f focuses a running pane agent and explains otherwise", () => {
 	const st = initialState(snap());
-	assert.deepEqual(keys(st, "down", "focus").action, { type: "focusPane", id: "be" });
+	assert.deepEqual(keys(st, "down", "down", "focus").action, { type: "focusPane", id: "be" });
 	assert.deepEqual(keys(st, "focus").action, { type: "notice", text: "fe runs headless; there is no pane to focus." });
 	assert.deepEqual(keys({ ...st, showEnded: true }, "end", "focus").action, { type: "notice", text: "gone has ended; its pane is closed." });
 });
 
 test("a new snapshot keeps the cursor on the same agent; a cleared viewed agent closes its transcript", () => {
-	const st = keys(initialState(snap()), "down").state; // on be
+	const st = keys(initialState(snap()), "down", "down").state; // on be
 	const moved = withSnapshot(st, snap([agent("root", null as never), agent("new", "root"), agent("fe", "root"), agent("be", "root", "live", { placement: "pane" })]));
 	assert.equal(rows(moved)[moved.selected], "be@0");
 	assert.equal(withSnapshot({ ...st, viewing: "old" }, snap([agent("root", null as never), agent("fe", "root")])).viewing, undefined);
@@ -117,4 +124,15 @@ test("the transcript wraps, shows tool calls with their key argument, scrolls an
 	assert.ok(up.scroll > 0 && up.scroll < 1_000, "scroll is clamped to the transcript");
 	assert.match(up.lines.at(-1)!.text, /more lines? below/);
 	assert.deepEqual(readTranscript(undefined), []);
+
+	// Scrolled up, the view stays on the same lines while output grows.
+	const at = view({ ...st, scroll: 2 }, 40, 5, () => all);
+	const more = [...all, { kind: "assistant" as const, text: "NEWER" }];
+	const after = view({ ...st, scroll: at.scroll, seen: at.seen }, 40, 5, () => more);
+	assert.deepEqual(after.lines.slice(1, -1), at.lines.slice(1, -1));
+
+	// A file replaced by a shorter one is read again from the start.
+	writeFileSync(`${f}.new`, `${JSON.stringify({ type: "message", message: { role: "user", content: "fresh" } })}\n`);
+	renameSync(`${f}.new`, f);
+	assert.deepEqual(readTranscript(f), [{ kind: "user", text: "fresh" }]);
 });
