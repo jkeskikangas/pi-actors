@@ -51,6 +51,12 @@ module pi_actors {
     ackedUnpersisted: bool,
     fifoViolated: bool,
     forgotLive: bool,
+    // Forgotten while its parent still ran, by someone other than that parent.
+    forgotUnderRunningParent: bool,
+    // Ended while its parent was still running (so only that parent could clear it then).
+    endedBeforeParent: Set[str],
+    // Who forgot each id (observation for the witness).
+    forgottenBy: str -> str,
     redeliveries: int,
     faults: int,
   }
@@ -96,6 +102,9 @@ module pi_actors {
     ackedUnpersisted: false,
     fifoViolated: false,
     forgotLive: false,
+    forgotUnderRunningParent: false,
+    endedBeforeParent: Set(),
+    forgottenBy: AGENTS.mapBy(_ => ""),
     redeliveries: 0,
     faults: 0,
   }
@@ -122,6 +131,7 @@ module pi_actors {
       mailbox: if (p == "") st1.mailbox else st1.mailbox.setBy(p, l => l.append(notice)),
       connected: st1.connected.set(id, false),
       leases: st1.leases.set(id, Set()),
+      endedBeforeParent: if (p != "" and status(st1, p) != Down and status(st1, p) != Gone) st1.endedBeforeParent.union(Set(id)) else st1.endedBeforeParent,
     }
     killChildren(st2, id)
   }
@@ -351,12 +361,19 @@ module pi_actors {
 
   // forget{target}: a strict ancestor removes an ended agent and its ended subtree. Their
   // mailboxes, leases and sequence tracking go; DOWN notices already queued elsewhere stay.
-  pure def canForget(st: State, p: str, t: str): bool = all {
-    canAct(st, p),
+  // While the target's parent runs, only that parent may forget it: it may still resume the child.
+  pure def parentLets(st: State, p: str, t: str): bool = {
+    val par = PARENT.get(t)
+    par == p or status(st, par) == Down or status(st, par) == Gone
+  }
+  // Everything but the sender being able to act right now.
+  pure def mayForget(st: State, p: str, t: str): bool = all {
     isAncestor(p, t),
     status(st, t) == Down,
     AGENTS.filter(x => isAncestor(t, x)).forall(x => status(st, x) == Down or status(st, x) == Unborn or status(st, x) == Gone),
+    parentLets(st, p, t),
   }
+  pure def canForget(st: State, p: str, t: str): bool = canAct(st, p) and mayForget(st, p, t)
 
   action forget(p: str, t: str): bool = all {
     canForget(s, p, t),
@@ -368,6 +385,9 @@ module pi_actors {
       lastSeq: s.lastSeq.keys().mapBy(x => if (gone.contains(x)) 0 else s.lastSeq.get(x)),
       forgotten: s.forgotten.union(gone),
       forgotLive: s.forgotLive or gone.exists(x => status(s, x) != Down),
+      forgotUnderRunningParent: s.forgotUnderRunningParent
+        or (PARENT.get(t) != p and status(s, PARENT.get(t)) != Down and status(s, PARENT.get(t)) != Gone),
+      forgottenBy: s.forgottenBy.keys().mapBy(x => if (gone.contains(x)) p else s.forgottenBy.get(x)),
     },
   }
 
@@ -487,9 +507,24 @@ module pi_actors {
   val forgottenHoldsNothing = s.forgotten.forall(id =>
     s.mailbox.get(id).length() == 0 and s.leases.get(id).size() == 0 and not(s.connected.get(id)))
 
+  // A running parent's ended child is that parent's to forget (it may resume it).
+  val noForgetUnderRunningParent = not(s.forgotUnderRunningParent)
+  // Never stuck: an ended, settled agent whose parent has ended or still runs can be forgotten
+  // by some active ancestor, unless no ancestor is active any more (the tree is winding down).
+  val endedIsClearable = AGENTS.forall(id => {
+    val par = PARENT.get(id)
+    val settled = status(s, id) == Down
+      and AGENTS.filter(x => isAncestor(id, x)).forall(x => status(s, x) == Down or status(s, x) == Unborn or status(s, x) == Gone)
+    val parentSettledOrRunning = par != "" and (status(s, par) == Down or isActive(status(s, par)))
+    val activeAncestors = AGENTS.filter(p => isAncestor(p, id) and isActive(status(s, p)))
+    (settled and parentSettledOrRunning)
+      implies (activeAncestors.size() == 0 or activeAncestors.exists(p => mayForget(s, p, id)))
+  })
+
   val all_invariants = downOnce and downNotified and consumedOnce and noLossOnAck and atLeastOnce
     and fifo and noOrphans and limits and leasesNeedConnection
     and forgetsOnlyDown and forgottenStaysGone and forgottenHoldsNothing
+    and noForgetUnderRunningParent and endedIsClearable
 
   // ---------------- reachability witnesses (each MUST be violated by simulation) ----------------
   val witnessConsumed = AGENTS.forall(id => s.persisted.get(id).size() == 0)
@@ -500,6 +535,8 @@ module pi_actors {
   val witnessChildDown = AGENTS.forall(id => id == "r" or status(s, id) != Down)
   val witnessGrandchildKilledByLink = not(status(s, "a") == Down and status(s, "c") == Down)
   val witnessForgotten = s.forgotten.size() == 0
+  // c ended while a ran; a was killed or lost later; the root then cleared c.
+  val witnessClearedAfterParentKilled = not(s.forgottenBy.get("c") == "r" and s.endedBeforeParent.contains("c"))
 
   // ---------------- deterministic scenario tests (quint test; mirrored as Tree unit tests) ----------------
   run redeliveryAfterReloadTest =
@@ -568,4 +605,15 @@ module pi_actors {
       .then(killingExpire("c")).then(forget("r", "a"))
       .then(all { assert(s.forgotten == Set("a", "c") and s.mailbox.get("r").length() == 1 and all_invariants), s' = s })
       .then(all { assert(not(canSpawn(s, "r", "a")) and not(canHello(s, "a"))), s' = s })
+
+  // Parent-only clear: c ended while a runs, so the root may not forget it, a may; once a is
+  // killed, the root may.
+  run parentOnlyClearTest =
+    init.then(spawn("r", "a")).then(hello("a")).then(spawn("a", "c")).then(hello("c"))
+      .then(exit("c")).then(processEnds("c")).then(procExitReported("c"))
+      .then(all { assert(status(s, "c") == Down and status(s, "a") == Live), s' = s })
+      .then(all { assert(not(canForget(s, "r", "c")) and canForget(s, "a", "c") and all_invariants), s' = s })
+      .then(kill("r", "a")).then(processEnds("a")).then(procExitReported("a"))
+      .then(forget("r", "c"))
+      .then(all { assert(s.forgotten == Set("c") and s.forgottenBy.get("c") == "r" and all_invariants), s' = s })
 }

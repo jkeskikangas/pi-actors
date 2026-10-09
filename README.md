@@ -60,18 +60,20 @@ Outside both, `pane: true` fails immediately with a clear message.
 - **`/actors clear`** removes every ended agent from the tree.
 - **`/new`** stops the whole tree: a new session starts with no agents. `/resume`, `/fork` and reloads keep the tree running.
 
-## Limits
+## Settings
 
-There are two limits, set in `~/.pi/agent/pi-actors.json`:
+Set in `~/.pi/agent/pi-actors.json`:
 
 ```json
-{ "maxDepth": 2, "maxSpawns": 40 }
+{ "maxDepth": 2, "maxSpawns": 40, "keepFinishedDays": 7 }
 ```
 
 - **`maxDepth`:** how many levels of children below you are allowed.
 - **`maxSpawns`:** how many agents can be started in total, including restarts.
 
 An agent can set lower limits for the children it starts, but never higher ones. When a limit is reached, the agent is told to do the work itself.
+
+- **`keepFinishedDays`:** how long a finished tree keeps its files: the event log and every child's session, which hold their transcripts. After that, they're deleted the next time a session uses pi-actors. A finished tree is one that was stopped, or whose root never came back.
 
 ## How it works
 

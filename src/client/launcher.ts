@@ -1,11 +1,11 @@
 // Launcher: the root agent starts (or attaches to) its tree's broker (design D1, D12, D13).
 
 import { spawn } from "node:child_process";
-import { existsSync, openSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, openSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { connect } from "node:net";
 import { dirname, join } from "node:path";
 import { DEFAULT_LIMITS, type Limits } from "../protocol.ts";
-import { type Config, ensureDir, ensurePrivateDir, ensureSnapshot, nodeBinary, piCommandFromProcess, socketPath, treeDir } from "../runtime.ts";
+import { type Config, ensureDir, ensurePrivateDir, ensureSnapshot, nodeBinary, pidAlive, piCommandFromProcess, socketPath, stateRoot, treeDir } from "../runtime.ts";
 
 export interface LaunchOptions {
 	treeId: string;
@@ -22,6 +22,49 @@ export interface LaunchOptions {
 function treeFinished(dir: string): boolean {
 	try {
 		return JSON.parse(readFileSync(join(dir, "status.json"), "utf8")).finished === true;
+	} catch {
+		return false;
+	}
+}
+
+export const DEFAULT_KEEP_FINISHED_DAYS = 7;
+
+/**
+ * Finished trees keep their event log and every child's session (the transcripts) for `keepMs`
+ * after they finished, then lose all of it but a small `status.json`: that marker keeps a session
+ * that recorded the tree id from restarting it as an empty tree (F7). Returns the pruned ids.
+ */
+export function pruneFinishedTrees(keepMs: number, now = Date.now()): string[] {
+	const root = join(stateRoot(), "trees");
+	let ids: string[];
+	try {
+		ids = readdirSync(root);
+	} catch {
+		return [];
+	}
+	const pruned: string[] = [];
+	for (const id of ids) {
+		const dir = join(root, id);
+		const status = join(dir, "status.json");
+		try {
+			const st = JSON.parse(readFileSync(status, "utf8")) as { finished?: boolean; pruned?: string };
+			if (st.finished !== true || st.pruned) continue;
+			if (now - statSync(status).mtimeMs < keepMs) continue;
+			if (lockHeld(dir)) continue; // a broker still shutting down
+			for (const entry of readdirSync(dir)) if (entry !== "status.json") rmSync(join(dir, entry), { recursive: true, force: true });
+			writeFileSync(status, JSON.stringify({ finished: true, pruned: new Date(now).toISOString() }), { mode: 0o600 });
+			pruned.push(id);
+		} catch {
+			// unreadable or vanished: leave it
+		}
+	}
+	return pruned;
+}
+
+function lockHeld(dir: string): boolean {
+	try {
+		const pid = (JSON.parse(readFileSync(join(dir, "broker.lock"), "utf8")) as { pid?: number }).pid;
+		return typeof pid === "number" && pidAlive(pid);
 	} catch {
 		return false;
 	}
