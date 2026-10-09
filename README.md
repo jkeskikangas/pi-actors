@@ -1,6 +1,6 @@
 # pi-actors
 
-Subagents for [pi](https://pi.dev). An agent can start child agents, each with a fresh context or a copy of its own conversation, on any model. It can message them and stop them. Their results, messages and questions arrive in the conversation by themselves.
+Subagents for [pi](https://pi.dev). An agent can start child agents, each with a fresh context or a copy of its own conversation, on any model. It can message them and stop them. Their results and messages arrive in the conversation by themselves.
 
 ```
 pi install npm:pi-actors
@@ -14,54 +14,51 @@ Running agents in the background goes wrong in predictable ways: messages get lo
 - **No orphaned agents.** If an agent goes away and doesn't come back within a short grace period, its children are stopped, and so are theirs. Nothing keeps running and spending tokens unseen.
 - **No polling.** Results and messages are pushed into the agent's conversation when they arrive. An agent waiting for children simply ends its turn and is woken up.
 - **Three tools, small and hard to misuse.** `spawn`, `send` and `stop` add about 700 tokens to the context. There are no multi-purpose tools with dozens of options for the model to get wrong.
-- **Questions come to you, answered with a few keystrokes.** An agent that needs a decision asks with options. You see who is asking and why, pick an answer with the arrow keys, and it goes straight back to that agent.
-- **Checked, not just tested.** The coordination protocol is written as formal models in [Quint](https://quint-lang.org), a specification language built on TLA+'s logic: message delivery, questions and their answers, and which process may act as which agent. Tools explore thousands of interleavings of crashes, reloads, retries and restarts against their guarantees. Deliberately injected bugs are caught every time, and the implementation is tested against the same guarantees.
+- **One voice talks to you.** Agents only talk to each other. A child that needs a decision asks its parent, which answers from its own context when it can and otherwise asks further up. Only your session's agent asks you, in its own words and its own way.
+- **Checked, not just tested.** The coordination protocol is written as formal models in [Quint](https://quint-lang.org), a specification language built on TLA+'s logic: message delivery, the agent lifecycle (clearing ended agents included), and which process may act as which agent. Tools explore thousands of interleavings of crashes, reloads, retries and restarts against their guarantees. Deliberately injected bugs are caught every time, and the implementation is tested against the same guarantees.
 
 ## The three tools
 
 | Tool | What it does |
 |---|---|
 | `spawn{task, name?, model?, thinking?, fork?, cwd?, pane?, timeout_minutes?, resume?}` | Starts a child and returns its id immediately. `fork: true` gives the child a copy of this conversation. `model` can be any provider's model, and `cwd` can point to, say, a git worktree. `pane: true` runs the child in a visible pane when pi runs inside [herdr](https://herdr.dev) or tmux. |
-| `send{to, text, reply_to?, choices?, multi?, urgent?}` | Sends a message to a child (by id), to `"parent"`, or to `"human"`. It never blocks. `reply_to` answers a message. For a question to the human, `choices` offers options and `multi` allows picking several. |
+| `send{to, text, reply_to?, urgent?}` | Sends a message to a child (by id) or to `"parent"`. It never blocks. `reply_to` answers a message. |
 | `stop{id}` | Stops a child, together with its own children. |
 
 What arrives by itself:
 
 - **Reports:** each time a child finishes a piece of work, its final answer is delivered to its parent. The child then waits; another `send` continues it.
-- **Messages and answers:** from other agents and from you. Answers say which message they reply to.
-- **End notices:** if a child crashes, is stopped or loses its parent, the parent hears about it once, with the reason.
+- **Messages and answers:** from other agents. Answers say which message they reply to.
+- **End notices:** if a child crashes, times out or is lost, the parent hears about it once, with the reason. A child the parent stopped itself ends quietly.
+
+In the chat, each delivery shows as one dim line, such as `⇢ report from backend`, and expands to the full text the agent read.
 
 A typical pattern: start a few children, end the turn, and act on their reports as they arrive.
 
-## Answering questions
+## The agents panel
 
-While agents are working or waiting on you, a line under the editor says so: `pi-actors · 2 agents · 1 question for you — ↓ to open`. Press **↓ on an empty editor** to open the panel.
+While children run, a line under the editor says so: `pi-actors · 2 running — ↓ to open`. Press **↓ on an empty editor**, or run `/actors`, to open the panel.
 
-- **Questions come first.** Each shows who is asking and the question. Press Enter to open it:
-  - You see what the agent is working on, the question, and the options with their descriptions.
-  - ↑↓ and Enter pick an option. For multi-select, Space toggles options and Enter confirms.
-  - "Type something…" lets you answer in your own words.
-  - `t` shows the agent's recent work, and `d` declines, telling the agent to use its own judgment.
-  - Your answer goes back to exactly that agent and question.
-- **Agents come next**, showing each one's status, model and placement. Enter shows an agent's recent transcript: its task, the tools it ran and what it said. For an agent in a pane, `f` jumps to it.
-
-`/inbox` opens the same panel. Without a TUI (RPC or print mode), `/inbox` lists the questions and `/answer <#> <text>` or `/answer <#> 1,3` replies.
+- **Running agents come first**, in tree order, with their status, model and placement.
+- **Ended agents fold into one row**, `▸ 5 ended`. Enter unfolds it. Their transcripts stay readable until you clear them.
+- **Enter** shows an agent's transcript: its task, what it said, and the tools it ran with their main argument (`⚙ bash  git diff --stat`). ↑↓, PgUp/PgDn and Home/End scroll it; it follows new output while you're at the end. `e` expands tool output and full messages.
+- **`x`** clears an ended agent together with its ended children, or, on the `ended` row, every ended agent. The panel stays open.
+- **`f`** jumps to an agent's pane, when it runs in one.
 
 ## Panes in herdr or tmux (optional)
 
 Everything works in a plain terminal. If pi runs inside [herdr](https://herdr.dev) or tmux, you also get:
 
-- **Visible children:** `pane: true` puts a child in its own pane next to yours, where you can watch it and talk to it. Its questions appear right there. If tmux runs inside herdr, the panes open in tmux, the multiplexer you're actually looking at.
-- **Notifications:**
-  - **In herdr,** the pane where a question should be answered is marked as waiting for you, which is the asking child's own pane or the root's pane for everything else. The mark clears once the question is answered.
-  - **In tmux,** the pane rings the terminal bell, so tmux flags the window, and a short message names who is asking.
+- **Visible children:** `pane: true` puts a child in its own pane next to yours, where you can watch it and talk to it. If tmux runs inside herdr, the panes open in tmux, the multiplexer you're actually looking at.
 
 Outside both, `pane: true` fails immediately with a clear message.
 
 ## Commands
 
-- **`/actors`** prints the agent tree. **`/actors stop <id>`** stops one agent, and **`/actors stop`** stops all of them.
-- **`/inbox`** opens the panel. **`/answer`** answers without a TUI.
+- **`/actors`** opens the panel (without a TUI, it prints the tree).
+- **`/actors stop <id>`** stops one agent, and **`/actors stop`** stops all of them.
+- **`/actors clear`** removes every ended agent from the tree.
+- **`/new`** stops the whole tree: a new session starts with no agents. `/resume`, `/fork` and reloads keep the tree running.
 
 ## Limits
 
@@ -84,7 +81,7 @@ The design (`designs/pi-actors.md`), the spec (`specs/pi-actors.md`) and the for
 
 ## With pi-verified-goal
 
-Under [pi-verified-goal](https://github.com/jkeskikangas/pi-verified-goal)'s `/goal`, an agent that is waiting on its children, or on an answer from you, is neither pushed to continue nor paused. Their reports wake it up.
+Under [pi-verified-goal](https://github.com/jkeskikangas/pi-verified-goal)'s `/goal`, an agent that is waiting on its children is neither pushed to continue nor paused. Their reports wake it up.
 
 ## Requirements
 

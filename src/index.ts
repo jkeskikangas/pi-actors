@@ -1,4 +1,6 @@
 // pi-actors extension: three tools (spawn, send, stop), push delivery, reports on settle.
+// Agents talk only to each other: a question for the human goes up the tree to the root, whose
+// model decides how to ask. The panel shows the tree and transcripts.
 // Identity: children get --actors-* flags (never inherited by subprocesses); the root connects
 // lazily on its first spawn and records its tree in its session so it can reattach.
 
@@ -9,15 +11,15 @@ import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { matchesKey, truncateToWidth } from "@earendil-works/pi-tui";
+import { matchesKey, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { Client } from "./client/connection.ts";
 import { ensureBroker } from "./client/launcher.ts";
-import { dedupeContext, ENTRY_TYPE, formatDelivery, Mailroom } from "./client/mailroom.ts";
-import { encodeQuestion, formatAnswer, itemsFrom, openCard, type PanelAction, type PanelKey, type PanelState, parseQuestion, press, readTranscript, render, summary } from "./client/panel.ts";
+import { dedupeContext, ENTRY_TYPE, endNotice, formatDelivery, Mailroom, summarizeDelivery } from "./client/mailroom.ts";
+import { agentLine, endedRoots, initialState, items, type PanelAction, type PanelKey, type PanelState, press, readTranscript, summary, view, withSnapshot } from "./client/panel.ts";
 import type { Snapshot } from "./client/connection.ts";
 import { detectMux, paneAgentName, stateRoot } from "./runtime.ts";
-import { type Limits, TIMING } from "./protocol.ts";
+import { type Limits, type Message, TIMING } from "./protocol.ts";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT_ENTRY = "pi-actors-root";
@@ -42,19 +44,14 @@ export default function piActors(pi: ExtensionAPI) {
 	let lastAssistantText = "";
 	let lastRunInteractive = false;
 	let usage = { input: 0, output: 0, cacheWrite: 0, cost: 0 };
-	/** Children that owe a report, and questions to the human awaiting an answer. */
+	/** Children that owe a report. */
 	const awaitingReport = new Set<string>();
-	const awaitingHuman = new Set<string>();
 	const myChildren = new Set<string>();
-	/** Question ids in the order the last /inbox listing showed them. */
-	let lastListing: string[] = [];
-	let herdrBlocked = false;
-	let herdrLabel = "";
+	/** Agents this one stopped: their end notice tells it nothing new. */
+	const stoppedByMe = new Set<string>();
 	let lastSnap: Snapshot | undefined;
 	let panelOpen = false;
 	let uiTimer: NodeJS.Timeout | undefined;
-	/** Dialogs open in this pane for our own questions, dismissed when the answer arrives elsewhere. */
-	const openDialogs = new Map<string, AbortController>();
 	let wasWaiting = false;
 
 	const isChild = () => !!pi.getFlag("actors-id");
@@ -108,7 +105,8 @@ export default function piActors(pi: ExtensionAPI) {
 				carryTreeId(treeId);
 				return c;
 			} catch (err) {
-				if (attempt >= candidates.length - 1 || !/rejected: down|finished/.test(String(err))) throw err;
+				// A tree run by an older pi-actors speaks another protocol: leave it to its grace period.
+				if (attempt >= candidates.length - 1 || !/rejected: (down|protocol)|finished/.test(String(err))) throw err;
 			}
 		}
 	}
@@ -229,22 +227,28 @@ export default function piActors(pi: ExtensionAPI) {
 		if (!c || !room) return;
 		const batch = await room.drain(c);
 		if (batch.length === 0) return;
+		const shown: Message[] = [];
 		for (const m of batch) {
 			if (m.kind === "down" || m.tag === "report") awaitingReport.delete(m.kind === "down" ? safeId(m.body) : m.from);
-			// Any reply to our question clears it: the human's answer, or the broker's timeout/root_down (F12).
-			if (m.ref && awaitingHuman.has(m.ref)) {
-				awaitingHuman.delete(m.ref);
-				openDialogs.get(m.ref)?.abort();
-				openDialogs.delete(m.ref);
-			}
+			if (m.kind === "down" && selfInflicted(m)) room.discard(m, c);
+			else shown.push(m);
 		}
 		updateWaiting();
-		signalHerdr();
-		const content = formatDelivery(self, batch);
+		if (shown.length === 0) return;
 		// Always ask for a turn: pi queues it while a run is active and starts one when idle. Our own idle
 		// flag lags pi's at settle time, which lost wake-ups (F9).
-		const options = { triggerTurn: true, deliverAs: (urgent || batch.some((m) => m.urgent) ? "steer" : "followUp") as "steer" | "followUp" };
-		pi.sendMessage({ customType: ENTRY_TYPE, content, display: true, details: { actors: room.stamp(batch) } }, options);
+		const options = { triggerTurn: true, deliverAs: (urgent || shown.some((m) => m.urgent) ? "steer" : "followUp") as "steer" | "followUp" };
+		pi.sendMessage({ customType: ENTRY_TYPE, content: formatDelivery(shown), display: true, details: { actors: room.stamp(shown) } }, options);
+	}
+
+	/** The end of an agent this one stopped (directly, or the whole tree): nothing to act on. */
+	function selfInflicted(m: Message): boolean {
+		const d = endNotice(m);
+		const base = d.reason.replace(/:unconfirmed$/, "");
+		// Any end settles a stop: a stop that came too late (the child was already finishing) must
+		// not hide a later incarnation's end.
+		const mine = stoppedByMe.delete(d.id);
+		return base === "killed:tree_stopped" || (base === "killed" && mine);
 	}
 
 	const safeId = (body: string) => {
@@ -259,39 +263,13 @@ export default function piActors(pi: ExtensionAPI) {
 		if (client && mailroom) mailroom.settle(ctx.sessionManager.getEntries(), client);
 	}
 
-	// ------------------------------------------------------------ waiting signal (pi-verified-goal) and herdr
+	// ------------------------------------------------------------ waiting signal (pi-verified-goal)
 
 	function updateWaiting() {
-		const waiting = awaitingReport.size > 0 || awaitingHuman.size > 0;
+		const waiting = awaitingReport.size > 0;
 		if (waiting === wasWaiting) return;
 		wasWaiting = waiting;
-		pi.events.emit("actors:waiting", { waiting, children: [...awaitingReport], human: awaitingHuman.size });
-	}
-
-	/**
-	 * herdr: block the pane where the human would answer. A pane child blocks its own pane for its
-	 * own questions; the root blocks for questions from headless agents (and itself), whose
-	 * answers go through its panel. Edge-triggered and paired, so the integration's count is exact.
-	 */
-	function signalHerdr() {
-		const where = detectMux();
-		if (!where || ctxRef?.mode !== "tui") return;
-		let askers: string[] = [];
-		if (self === "root") askers = (lastSnap?.human ?? []).filter((q) => !q.fromPane).map((q) => q.from);
-		else if (awaitingHuman.size > 0 && client?.connected) askers = [self];
-		const want = askers.length > 0;
-		const label = want ? `pi-actors: ${askers.length} question${askers.length === 1 ? "" : "s"} (${[...new Set(askers)].join(", ")})`.slice(0, 120) : "";
-		if (want === herdrBlocked && label === herdrLabel) return;
-		if (where.mux === "herdr") {
-			if (herdrBlocked) pi.events.emit("herdr:blocked", { active: false });
-			if (want) pi.events.emit("herdr:blocked", { active: true, label });
-		} else if (want && !herdrBlocked) {
-			// tmux has no "waiting for you" state: ring the bell (tmux flags the window) and say why.
-			process.stdout.write("\x07");
-			execFile("tmux", ["display-message", "-t", where.pane, "-d", "8000", label], () => {});
-		}
-		herdrBlocked = want;
-		herdrLabel = label;
+		pi.events.emit("actors:waiting", { waiting, children: [...awaitingReport] });
 	}
 
 	// ------------------------------------------------------------ panel and widget (TUI)
@@ -303,13 +281,11 @@ export default function piActors(pi: ExtensionAPI) {
 			// No tree (stopped) or no broker: nothing current to show, and nobody to answer (N6).
 			lastSnap = undefined;
 			ctx.ui.setWidget("pi-actors", undefined, { placement: "belowEditor" });
-			signalHerdr();
 			return;
 		}
 		lastSnap = await client.inspect();
 		const line = summary(lastSnap);
 		ctx.ui.setWidget("pi-actors", line ? [line] : undefined, { placement: "belowEditor" });
-		signalHerdr();
 	}
 
 	/** Every agent, any mode: catch pushes pi dropped while the agent sits idle (F4). */
@@ -331,51 +307,71 @@ export default function piActors(pi: ExtensionAPI) {
 		uiTimer.unref();
 		ctx.ui.onTerminalInput((data) => {
 			if (panelOpen || !matchesKey(data, "down") || ctx.ui.getEditorText() !== "") return undefined;
-			if (!lastSnap || itemsFrom(lastSnap).length === 0) return undefined;
+			if (!lastSnap || items({ snap: lastSnap, showEnded: false }).length === 0) return undefined;
 			void openPanel(ctx);
 			return { consume: true };
 		});
 	}
 
-	/** Show the panel overlay from `initial`; resolves with the action that closed it. */
-	function showPanel(ctx: ExtensionContext, initial: PanelState, signal?: AbortSignal): Promise<PanelAction> {
-		let state = initial;
-		return ctx.ui.custom<PanelAction>(
+	const KEYS: [string, PanelKey][] = [
+		["up", "up"], ["down", "down"], ["pageUp", "pageUp"], ["pageDown", "pageDown"], ["home", "home"], ["end", "end"],
+		["enter", "enter"], ["escape", "escape"], ["f", "focus"], ["x", "clear"], ["e", "expand"],
+	];
+
+	/**
+	 * The panel overlay. Clearing and pane focus happen while it stays open; it closes on esc.
+	 * Keys go through matchesKey: with the kitty keyboard protocol a plain "f" is an escape sequence.
+	 */
+	function showPanel(ctx: ExtensionContext, snap: Snapshot): Promise<void> {
+		let state: PanelState = initialState(snap);
+		let busy = false;
+		return ctx.ui.custom<void>(
 			(tui, theme, _kb, done) => {
-				// Answered elsewhere (root panel vs the asker's pane): close this one.
-				signal?.addEventListener("abort", () => done({ type: "close" }), { once: true });
+				const refresh = async () => {
+					const next = await client?.inspect();
+					if (next) {
+						lastSnap = next;
+						state = withSnapshot(state, next);
+						tui.requestRender();
+					}
+				};
+				// Transcripts and statuses move while the panel is open.
+				const timer = setInterval(() => void refresh(), 2000);
+				timer.unref();
+				const close = () => {
+					clearInterval(timer);
+					done();
+				};
+				// Only a clear holds further keys: the rows it removes must not be acted on meanwhile.
+				const perform = async (action: PanelAction) => {
+					if (action.type !== "forget") return act(ctx, action);
+					busy = true;
+					try {
+						await act(ctx, action);
+						await refresh();
+					} finally {
+						busy = false;
+					}
+				};
 				return {
 					render(width: number) {
+						const height = Math.max(5, Math.floor(tui.terminal.rows * 0.7) - 2);
+						const v = view(state, width, height, (it) => readTranscript(it.sessionFile));
+						state = { ...state, scroll: v.scroll, seen: v.seen };
 						const rule = theme.fg("borderMuted", "─".repeat(Math.max(0, width)));
-						const body = render(state, (it) => readTranscript(it.sessionFile)).map((l, i) =>
-							// Padded to the full width so the overlay covers what is underneath.
-							truncateToWidth(i === 0 ? theme.fg("accent", l) : l.startsWith("❯") ? theme.fg("text", l) : theme.fg("muted", l), width, "…", true),
-						);
-						return [rule, ...body, rule];
+						return [rule, ...v.lines.map((l) => theme.fg(l.tone, l.text)), rule];
 					},
 					handleInput(data: string) {
-						const key: PanelKey | undefined = matchesKey(data, "up")
-							? "up"
-							: matchesKey(data, "down")
-								? "down"
-								: matchesKey(data, "enter")
-									? "enter"
-									: matchesKey(data, "escape")
-										? "escape"
-										: data === " "
-											? "space"
-											: data === "f"
-												? "focus"
-												: data === "d"
-													? "decline"
-													: data === "t"
-														? "transcript"
-														: undefined;
-						if (!key) return;
+						const key = KEYS.find(([id]) => matchesKey(data, id as Parameters<typeof matchesKey>[1]))?.[1];
+						if (!key || (busy && key !== "escape")) return;
 						const r = press(state, key);
 						state = r.state;
-						if (r.action.type !== "none") done(r.action);
-						else tui.requestRender();
+						if (r.action.type === "close") return close();
+						if (r.action.type !== "none")
+							void perform(r.action)
+								.catch((err) => ctx.ui.notify(`pi-actors: ${(err as Error).message}`, "warning"))
+								.then(() => tui.requestRender());
+						tui.requestRender();
 					},
 					invalidate() {},
 				};
@@ -384,24 +380,42 @@ export default function piActors(pi: ExtensionAPI) {
 		);
 	}
 
-	/** Carry out what the panel decided: the answer goes to exactly the agent and question selected. */
 	async function act(ctx: ExtensionContext, action: PanelAction) {
-		const c = client;
-		if (!c) return;
-		let body: string | undefined;
-		if (action.type === "answer") body = action.body;
-		else if (action.type === "freeText") {
-			const typed = await ctx.ui.input(`Answer ${action.from}: ${action.q.text.slice(0, 200)}`, action.picked.length ? `with ${action.picked.join(", ")}` : "your answer");
-			if (typed?.trim()) body = formatAnswer(action.q, action.picked, typed);
-		} else if (action.type === "focusPane" && lastSnap) {
-			const where = detectMux();
-			const pane = lastSnap.agents.find((a) => a.id === action.id)?.paneId;
-			if (where?.mux === "herdr") execFile("herdr", ["agent", "focus", paneAgentName(lastSnap.treeId, action.id)], () => {});
-			else if (where?.mux === "tmux" && pane) execFile("tmux", ["select-window", "-t", pane, ";", "select-pane", "-t", pane], () => {});
+		if (action.type === "notice") return ctx.ui.notify(action.text, "info");
+		if (action.type === "forget") {
+			const failed = await forget(ctx, action.ids);
+			if (failed.length) ctx.ui.notify(`Not cleared: ${failed.join("; ")}`, "warning");
+			return;
 		}
-		if (body === undefined || (action.type !== "answer" && action.type !== "freeText")) return;
-		const r = await c.op("answer", { ref: action.ref, body });
-		ctx.ui.notify(r.ok ? `Answered ${action.from}.` : `Not delivered: ${failText(r as { ok: false; error: string })}`, r.ok ? "info" : "warning");
+		if (action.type !== "focusPane" || !lastSnap) return;
+		const where = detectMux();
+		const pane = lastSnap.agents.find((a) => a.id === action.id)?.paneId;
+		const [cmd, args] =
+			where?.mux === "herdr" ? ["herdr", ["agent", "focus", paneAgentName(lastSnap.treeId, action.id)]]
+			: where?.mux === "tmux" && pane ? ["tmux", ["select-window", "-t", pane, ";", "select-pane", "-t", pane]]
+			: [undefined, []];
+		if (!cmd) return ctx.ui.notify(`Cannot focus ${action.id}: no herdr or tmux pane known.`, "warning");
+		await new Promise<void>((done) =>
+			execFile(cmd, args as string[], (err, _out, stderr) => {
+				if (err) ctx.ui.notify(`Focus ${action.id} failed: ${(stderr || err.message).trim()}`, "warning");
+				done();
+			}),
+		);
+	}
+
+	/**
+	 * Remove ended agents from the tree; returns what could not be removed, with why. Uses the
+	 * current connection only: reconnecting here could start a new tree the ids are not in.
+	 */
+	async function forget(_ctx: ExtensionContext, ids: string[]): Promise<string[]> {
+		const c = client;
+		if (!c || c.isClosed) return ids.map((id) => `${id}: the agent tree is gone`);
+		const failed: string[] = [];
+		for (const id of ids) {
+			const r = await c.op("forget", { target: id });
+			if (!r.ok) failed.push(`${id}: ${failText(r as { ok: false; error: string; detail?: string })}`);
+		}
+		return failed;
 	}
 
 	async function openPanel(ctx: ExtensionContext) {
@@ -410,12 +424,20 @@ export default function piActors(pi: ExtensionAPI) {
 		try {
 			lastSnap = (await client.inspect()) ?? lastSnap;
 			if (!lastSnap) return ctx.ui.notify("pi-actors: broker not reachable.", "warning");
-			await act(ctx, await showPanel(ctx, { items: itemsFrom(lastSnap), selected: 0 }));
+			await showPanel(ctx, lastSnap);
 		} finally {
 			panelOpen = false;
 			void refreshUi();
 		}
 	}
+
+	/** The collapsed chat line for a delivery; expanding it shows what the model read. */
+	pi.registerMessageRenderer<{ actors?: { messages?: Message[] } }>(ENTRY_TYPE, (message, options, theme) => {
+		const body = typeof message.content === "string" ? message.content : "";
+		const msgs = message.details?.actors?.messages;
+		const head = theme.fg("dim", `⇢ ${Array.isArray(msgs) && msgs.length ? summarizeDelivery(msgs) : body.split("\n")[0]}`);
+		return new Text(options.expanded ? `${head}\n${theme.fg("muted", body)}` : head, options.outputPad, 0);
+	});
 
 	// ------------------------------------------------------------ lifecycle
 
@@ -432,9 +454,6 @@ export default function piActors(pi: ExtensionAPI) {
 	});
 
 	pi.on("session_shutdown", async (event) => {
-		if (herdrBlocked) pi.events.emit("herdr:blocked", { active: false });
-		herdrBlocked = false;
-		herdrLabel = "";
 		clearInterval(uiTimer);
 		uiTimer = undefined;
 		clearInterval(reclaimTimer);
@@ -444,9 +463,11 @@ export default function piActors(pi: ExtensionAPI) {
 		if (!c) return;
 		const switching = event.reason === "new" || event.reason === "resume" || event.reason === "fork";
 		if (isChild() && switching) await c.op("exit", { result: "session switched", error: true });
-		// A root keeps its tree across reloads and session switches (the next runtime reattaches);
-		// on quit the tree runs on for the root's grace period, then stops.
-		if (!isChild() && event.reason === "quit") rmSync(carryPath(), { force: true });
+		// /new starts over: the tree stops and the next spawn starts a new one. A root keeps its
+		// tree across reloads, /resume and /fork (the next runtime reattaches); on quit the tree runs
+		// on for the root's grace period, then stops.
+		if (!isChild() && event.reason === "new") c.stopTree();
+		if (!isChild() && (event.reason === "quit" || event.reason === "new")) rmSync(carryPath(), { force: true });
 		c.close(event.reason === "quit" && isChild() ? "quit" : "reload");
 	});
 
@@ -484,16 +505,6 @@ export default function piActors(pi: ExtensionAPI) {
 		lastRunInteractive = false;
 		void deliver(); // anything that arrived while busy
 	});
-
-	/** A pane child's question is answered in its own pane; the dialog closes if answered elsewhere. */
-	function askInThisPane(ctx: ExtensionContext, ref: string, body: string) {
-		const ac = new AbortController();
-		openDialogs.set(ref, ac);
-		const item = { kind: "question" as const, ref, from: self, body };
-		void showPanel(ctx, { items: [item], selected: 0, card: openCard(item) }, ac.signal)
-			.then((action) => act(ctx, action))
-			.finally(() => openDialogs.delete(ref));
-	}
 
 	// ------------------------------------------------------------ tools
 
@@ -542,6 +553,7 @@ export default function piActors(pi: ExtensionAPI) {
 			}, signal);
 			if (!r.ok) throw new Error(r.error === "limit_depth" ? "limit_depth: do this work yourself; this agent may not spawn deeper." : failText(r));
 			const id = (r as { id: string }).id;
+			stoppedByMe.delete(id); // a resumed child is a new incarnation
 			myChildren.add(id);
 			awaitingReport.add(id);
 			updateWaiting();
@@ -553,46 +565,35 @@ export default function piActors(pi: ExtensionAPI) {
 		name: "send",
 		label: "Send message",
 		description:
-			"Send a message to another agent (its id), to your parent (\"parent\"), or to the human (\"human\", for decisions only a human can make). Never blocks: answers arrive by themselves. Use reply_to to answer a message you received.",
-		promptSnippet: "send: message a child, your parent or the human (answers are pushed to you)",
+			"Send a message to another agent (its id) or to your parent (\"parent\"). Never blocks: answers, reports and end notices arrive by themselves. Use reply_to to answer a message you received.",
+		promptSnippet: "send: message a child or your parent (answers are pushed to you)",
+		promptGuidelines: [
+			"Messages from other agents arrive by themselves; answer one with send{to, text, reply_to: <its msg id>} when it needs an answer.",
+			"A decision you cannot make from your own context goes to your parent with send{to: \"parent\"}. When a child asks you something, answer from your own context if you can; otherwise ask your own parent (quote the question and name the asking agent) or, with no parent, ask the user yourself. Then send the answer back with reply_to.",
+		],
 		parameters: Type.Object({
-			to: Type.String({ description: "Agent id, \"parent\" or \"human\"." }),
+			to: Type.String({ description: "Agent id or \"parent\"." }),
 			text: Type.String(),
 			reply_to: Type.Optional(Type.String({ description: "The msg id you are answering." })),
-			choices: Type.Optional(
-				Type.Array(Type.Object({ label: Type.String(), description: Type.Optional(Type.String()) }), {
-					description: "For a question: the options to pick from (the human can always type something else).",
-				}),
-			),
-			multi: Type.Optional(Type.Boolean({ description: "With choices: allow picking several." })),
 			urgent: Type.Optional(Type.Boolean({ description: "Deliver mid-turn instead of after the recipient's current run." })),
 		}),
 		async execute(_id, p, signal, _onUpdate, ctx) {
 			ctxRef = ctx;
 			await connect(ctx, signal);
 			const to = p.to === "parent" ? parent : p.to;
-			if (!to) throw new Error("this agent has no parent");
-			const kind = to === "human" ? "call" : "mail";
-			const choices = p.choices ?? [];
-			// The human gets a structured question (a card); an agent gets the options as text.
-			const body = to === "human" ? encodeQuestion(p.text, choices, !!p.multi) : choices.length ? `${p.text}\nOptions${p.multi ? " (pick any)" : ""}: ${choices.map((c) => c.label).join(" / ")}` : p.text;
-			const r = await op(ctx, "send", { to, kind, body, ref: p.reply_to, urgent: !!p.urgent, timeoutS: to === "human" ? 24 * 3600 : undefined }, signal);
+			if (!to) throw new Error("this agent has no parent; ask the user directly");
+			const r = await op(ctx, "send", { to, kind: "mail", body: p.text, ref: p.reply_to, urgent: !!p.urgent }, signal);
 			if (!r.ok) throw new Error(failText(r));
-			const msgId = (r as { msgId: string }).msgId;
-			if (to === "human") {
-				awaitingHuman.add(msgId);
-				signalHerdr();
-				if (isChild() && ctx.mode === "tui") askInThisPane(ctx, msgId, body);
-			} else if (myChildren.has(to)) awaitingReport.add(to); // only a direct child owes us a report (F12)
+			if (myChildren.has(to)) awaitingReport.add(to); // only a direct child owes us a report (F12)
 			updateWaiting();
-			return text(`Sent (msg ${msgId}).${to === "human" ? " The human's answer will arrive by itself." : ""}`);
+			return text(`Sent (msg ${(r as { msgId: string }).msgId}).`);
 		},
 	});
 
 	pi.registerTool({
 		name: "stop",
 		label: "Stop agent",
-		description: "Stop a descendant agent (and its own children). Its end notice arrives by itself.",
+		description: "Stop a descendant agent (and its own children).",
 		promptSnippet: "stop: end a child agent you no longer need",
 		parameters: Type.Object({ id: Type.String() }),
 		async execute(_id, p, signal, _onUpdate, ctx) {
@@ -600,15 +601,16 @@ export default function piActors(pi: ExtensionAPI) {
 			const r = await op(ctx, "kill", { target: p.id }, signal);
 			if (!r.ok) throw new Error(failText(r));
 			awaitingReport.delete(p.id);
+			stoppedByMe.add(p.id);
 			updateWaiting();
-			return text(`Stopping ${p.id}; its end notice will arrive by itself.`);
+			return text(`Stopping ${p.id}.`);
 		},
 	});
 
 	// ------------------------------------------------------------ commands
 
 	pi.registerCommand("actors", {
-		description: "Show the agent tree; /actors stop [id] stops an agent or the whole tree",
+		description: "Open the agents panel; /actors stop [id] stops an agent or the whole tree; /actors clear removes ended agents",
 		handler: async (args, ctx) => {
 			ctxRef = ctx;
 			const [sub, target] = args.trim().split(/\s+/);
@@ -617,6 +619,7 @@ export default function piActors(pi: ExtensionAPI) {
 			if (sub === "stop") {
 				if (target) {
 					const r = await c.op("kill", { target });
+					if (r.ok) stoppedByMe.add(target);
 					return ctx.ui.notify(r.ok ? `Stopping ${target}.` : failText(r as { ok: false; error: string }), r.ok ? "info" : "warning");
 				}
 				if (self !== "root") return ctx.ui.notify("Only the root can stop the whole tree.", "warning");
@@ -630,49 +633,16 @@ export default function piActors(pi: ExtensionAPI) {
 			}
 			const snap = await c.inspect();
 			if (!snap) return ctx.ui.notify("Broker not reachable.", "warning");
-			const lines = snap.agents
-				.map((a) => `${"  ".repeat(a.id === "root" ? 0 : a.id.split(".").length)}${a.id} · ${a.status}${a.reason ? ` (${a.reason})` : ""}${a.model ? ` · ${a.model}` : ""}${a.placement === "pane" ? " · pane" : ""}${a.mailbox ? ` · ${a.mailbox} queued` : ""}`);
-			if (snap.human.length) lines.push(`${snap.human.length} question(s) for the human: /inbox`);
-			ctx.ui.notify(lines.join("\n"), "info");
-		},
-	});
-
-	pi.registerCommand("inbox", {
-		description: "Open the agents panel (questions for you and the agent tree); same as ↓ on an empty editor",
-		handler: async (_args, ctx) => {
-			ctxRef = ctx;
-			if (!client) return ctx.ui.notify("No agent tree.", "info");
+			if (sub === "clear") {
+				const ids = endedRoots({ snap });
+				if (ids.length === 0) return ctx.ui.notify("No ended agents to clear.", "info");
+				const failed = await forget(ctx, ids);
+				return ctx.ui.notify(failed.length ? `Not cleared: ${failed.join("; ")}` : `Cleared ${ids.length} ended subtree${ids.length === 1 ? "" : "s"}.`, failed.length ? "warning" : "info");
+			}
 			if (ctx.mode === "tui") return openPanel(ctx);
-			const qs = (await client.inspect())?.human ?? [];
-			if (qs.length === 0) return ctx.ui.notify("No pending questions.", "info");
-			const show = (body: string) => {
-				const q = parseQuestion(body);
-				return q.choices.length ? `${q.text}\n${q.choices.map((c, i) => `  ${i + 1}. ${c.label}${c.description ? ` — ${c.description}` : ""}`).join("\n")}${q.multi ? "\n  (pick any)" : ""}` : q.text;
-			};
-			lastListing = qs.map((q) => q.ref ?? "");
-			ctx.ui.notify(qs.map((q, i) => `#${i + 1} [${q.ref}] from ${q.from}:\n${show(q.body)}`).join("\n\n") + "\n\nAnswer with /answer <#|id> <text>, or pick options: /answer <#|id> 1,3", "info");
+			const rows = items({ snap, showEnded: true });
+			ctx.ui.notify(rows.length ? rows.map((it) => (it.kind === "ended" ? `${it.count} ended:` : `${"  ".repeat(it.depth)}${agentLine(it)}`)).join("\n") : "No agents.", "info");
 		},
 	});
 
-	pi.registerCommand("answer", {
-		description: "Answer a question from an agent: /answer <#|id> <text>, or /answer <#|id> 1,3 to pick options",
-		handler: async (args, ctx) => {
-			ctxRef = ctx;
-			if (!client) return ctx.ui.notify("No agent tree.", "info");
-			const m = /^\s*#?(\S+)\s+([\s\S]+)$/.exec(args);
-			if (!m) return ctx.ui.notify("Usage: /answer <#|id> <text>", "warning");
-			const qs = (await client.inspect())?.human ?? [];
-			// Address the question itself, never a list position that may have shifted (N5).
-			const ref = /^\d+$/.test(m[1]) ? lastListing[Number(m[1]) - 1] : m[1];
-			const q = ref ? qs.find((x) => x.ref === ref) : undefined;
-			if (!q?.ref) return ctx.ui.notify(/^\d+$/.test(m[1]) && !lastListing.length ? "Run /inbox first, or answer by question id." : `Question ${m[1]} is no longer open (answered elsewhere?). Run /inbox again.`, "warning");
-			// "1,3" picks options of a question with choices; anything else is free text.
-			const question = parseQuestion(q.body);
-			const nums = /^\d+(\s*,\s*\d+)*$/.test(m[2].trim()) ? m[2].split(",").map((x) => Number(x.trim()) - 1) : undefined;
-			const picked = nums && question.choices.length && nums.every((n) => question.choices[n]) ? nums.map((n) => question.choices[n].label) : undefined;
-			const body = picked ? formatAnswer(question, question.multi ? picked : picked.slice(0, 1)) : formatAnswer(question, [], m[2]);
-			const r = await client.op("answer", { ref: q.ref, body });
-			ctx.ui.notify(r.ok ? `Answered #${m[1]} (${q.from}).` : failText(r as { ok: false; error: string }), r.ok ? "info" : "warning");
-		},
-	});
 }

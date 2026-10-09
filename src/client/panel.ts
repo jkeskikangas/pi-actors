@@ -1,269 +1,420 @@
-// The agents panel: questions for the human and the agent tree, opened with ↓ on an empty editor.
+// The agents panel: the agent tree and each agent's transcript, opened with ↓ on an empty editor.
 // The state machine is pure (unit-tested); index.ts wraps it in a pi-tui component.
 
-import { readFileSync } from "node:fs";
+import { closeSync, openSync, readSync, statSync } from "node:fs";
+import { truncateToWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
+import type { Message } from "../protocol.ts";
 import type { Snapshot } from "./connection.ts";
+import { summarizeDelivery } from "./mailroom.ts";
 
-export type PanelItem =
-	| { kind: "question"; ref: string; from: string; body: string }
-	| { kind: "agent"; id: string; status: string; reason?: string; model?: string; placement?: string; mailbox: number; sessionFile?: string; task?: string; depth: number };
+type SnapAgent = Snapshot["agents"][number];
 
-export type PanelKey = "up" | "down" | "enter" | "escape" | "focus" | "space" | "decline" | "transcript";
+export type AgentItem = {
+	kind: "agent";
+	id: string;
+	status: string;
+	reason?: string;
+	model?: string;
+	placement?: string;
+	mailbox: number;
+	sessionFile?: string;
+	depth: number;
+	ended: boolean;
+	/** In the ended section: a whole ended subtree whose parent is this agent or has ended too. */
+	clearable: boolean;
+};
 
-// ---------------------------------------------------------------- rich questions
+export type PanelItem = AgentItem | { kind: "ended"; count: number; expanded: boolean };
 
-export interface Choice {
-	label: string;
-	description?: string;
+export type PanelKey = "up" | "down" | "pageUp" | "pageDown" | "home" | "end" | "enter" | "escape" | "focus" | "clear" | "expand";
+
+export type PanelAction =
+	| { type: "none" }
+	| { type: "close" }
+	| { type: "focusPane"; id: string }
+	/** Ended subtrees to remove from the tree; the panel stays open. */
+	| { type: "forget"; ids: string[] }
+	| { type: "notice"; text: string };
+
+export interface PanelState {
+	snap: Snapshot;
+	selected: number;
+	showEnded: boolean;
+	/** Agent whose transcript is shown, if any. */
+	viewing?: string;
+	/** Transcript lines scrolled up from the end; 0 follows new output. */
+	scroll: number;
+	/** Show tool output and whole deliveries in the transcript. */
+	expanded: boolean;
+	/** Transcript length at the last render: a scrolled-up view stays put while output grows. */
+	seen?: number;
 }
 
-export interface Question {
-	text: string;
-	choices: Choice[];
-	multi: boolean;
+const ACTIVE = new Set(["starting", "live", "disconnected", "exiting", "killing"]);
+export const isActive = (status: string) => ACTIVE.has(status);
+
+export function initialState(snap: Snapshot): PanelState {
+	return { snap, selected: 0, showEnded: false, scroll: 0, expanded: false };
 }
 
-const QUESTION_TAG = "pi_actors_question";
-export const OTHER = "Type something…";
+/** A new snapshot keeps the cursor on the same row where it can. */
+export function withSnapshot(st: PanelState, snap: Snapshot): PanelState {
+	const before = items(st)[st.selected];
+	const next = { ...st, snap };
+	const rows = items(next);
+	const at = before ? rows.findIndex((x) => sameRow(x, before)) : -1;
+	const viewing = st.viewing && snap.agents.some((a) => a.id === st.viewing) ? st.viewing : undefined;
+	return { ...next, viewing, scroll: viewing ? st.scroll : 0, selected: at >= 0 ? at : Math.min(st.selected, Math.max(0, rows.length - 1)) };
+}
+
+const sameRow = (a: PanelItem, b: PanelItem) => (a.kind === "ended" ? b.kind === "ended" : b.kind === "agent" && b.id === a.id);
 
 /**
- * A question to the human travels as the message body, always encoded: plain text that merely
- * looks like an encoded question can then never be mistaken for one (N7).
+ * This agent's subtree. Running agents first, in tree order; an ended agent stays there while a
+ * descendant runs, or while its parent (another agent) runs and may still resume it. Then one
+ * "ended" row that expands to the ended subtrees, every one of which can be cleared.
  */
-export function encodeQuestion(text: string, choices: (string | Choice)[] = [], multi = false): string {
-	const norm = choices.map((c) => (typeof c === "string" ? { label: c } : c));
-	return JSON.stringify({ [QUESTION_TAG]: 1, text, choices: norm, multi });
+export function items(st: Pick<PanelState, "snap" | "showEnded">): PanelItem[] {
+	const { running, ended } = sections(st.snap);
+	if (ended.length === 0) return running;
+	return [...running, { kind: "ended", count: ended.length, expanded: st.showEnded }, ...(st.showEnded ? ended : [])];
 }
 
-export function parseQuestion(body: string): Question {
-	try {
-		const q = JSON.parse(body);
-		if (q?.[QUESTION_TAG] === 1) {
-			// Only well-formed choices: an object with a string label (N7).
-			const choices = (Array.isArray(q.choices) ? q.choices : [])
-				.filter((c: unknown): c is Choice => !!c && typeof c === "object" && typeof (c as Choice).label === "string")
-				.map((c: Choice) => (typeof c.description === "string" ? { label: clean(c.label), description: clean(c.description) } : { label: clean(c.label) }));
-			return { text: clean(String(q.text ?? "")), choices, multi: !!q.multi };
+/** Ended rows are indented within their own ended subtree. */
+function sections(snap: Snapshot): { running: AgentItem[]; ended: AgentItem[] } {
+	const byParent = new Map<string | null, SnapAgent[]>();
+	for (const a of snap.agents) byParent.set(a.parent, [...(byParent.get(a.parent) ?? []), a]);
+	const live = new Map<string, boolean>();
+	const runs = (a: SnapAgent): boolean => {
+		if (!live.has(a.id)) live.set(a.id, isActive(a.status) || (byParent.get(a.id) ?? []).some(runs));
+		return live.get(a.id)!;
+	};
+	const status = new Map(snap.agents.map((a) => [a.id, a.status]));
+	const parentRuns = (a: SnapAgent) => a.parent !== snap.self && isActive(status.get(a.parent ?? "") ?? "down");
+	const running: AgentItem[] = [];
+	const ended: AgentItem[] = [];
+	const walk = (parent: string, depth: number, endedDepth: number, inEnded: boolean) => {
+		for (const a of byParent.get(parent) ?? []) {
+			if (!inEnded && (runs(a) || parentRuns(a))) {
+				running.push(item(a, depth, false));
+				walk(a.id, depth + 1, 0, false);
+			} else {
+				ended.push(item(a, endedDepth, true));
+				walk(a.id, depth + 1, endedDepth + 1, true);
+			}
 		}
-	} catch {
-		// plain text
-	}
-	return { text: clean(body), choices: [], multi: false };
+	};
+	walk(snap.self, 0, 0, false);
+	return { running, ended };
 }
+
+const item = (a: SnapAgent, depth: number, clearable: boolean): AgentItem => ({
+	kind: "agent", id: a.id, status: a.status, reason: a.reason, model: a.model, placement: a.placement, mailbox: a.mailbox, sessionFile: a.sessionFile, depth, ended: !isActive(a.status), clearable,
+});
+
+/** The tops of the ended subtrees: forgetting these clears every ended row. */
+export function endedRoots(st: Pick<PanelState, "snap">): string[] {
+	return sections(st.snap).ended.filter((x) => x.depth === 0).map((x) => x.id);
+}
+
+export function summary(snap: Snapshot | undefined): string | undefined {
+	if (!snap) return undefined;
+	const running = snap.agents.filter((a) => a.id !== "root" && isActive(a.status)).length;
+	if (running === 0) return undefined;
+	return `pi-actors · ${running} running — ↓ to open`;
+}
+
+// ---------------------------------------------------------------- labels
+
+const LABELS: Record<string, string> = {
+	starting: "starting", live: "running", disconnected: "reconnecting", exiting: "finishing", killing: "stopping",
+	normal: "finished", error: "failed", killed: "stopped", "killed:parent_down": "stopped with its parent", "killed:tree_stopped": "stopped with the tree",
+	timeout: "timed out", lost: "lost", stopped: "stopped", "error:start_failed": "failed to start", "error:start_timeout": "start timed out",
+};
+
+export function statusLabel(status: string, reason?: string): string {
+	if (status !== "down") return LABELS[status] ?? status;
+	const r = reason ?? "";
+	if (r.endsWith(":unconfirmed")) return `${statusLabel("down", r.slice(0, -":unconfirmed".length))}, exit unconfirmed`;
+	const crashed = /^error:crashed\((.*)\)$/.exec(r);
+	if (crashed) return `crashed (${crashed[1]})`;
+	return LABELS[r] ?? (r || "ended");
+}
+
+/** "claude-sdk/claude-opus-5-5" -> "opus-5-5". */
+export const shortModel = (m?: string) => (m ? m.slice(m.lastIndexOf("/") + 1).replace(/^claude-/, "") : undefined);
+
+export function agentLine(it: AgentItem): string {
+	const parts = [statusLabel(it.status, it.reason)];
+	const model = shortModel(it.model);
+	if (model) parts.push(model);
+	if (it.placement === "pane" && !it.ended) parts.push("pane");
+	if (it.mailbox && !it.ended) parts.push(`${it.mailbox} queued`);
+	return `${it.ended ? "○" : "●"} ${it.id}  ${parts.join(" · ")}`;
+}
+
+// ---------------------------------------------------------------- keys
+
+const focusable = (it: PanelItem | undefined): boolean => it?.kind === "agent" && !it.ended && it.placement === "pane";
+
+function focus(it: PanelItem | undefined): PanelAction {
+	if (it?.kind !== "agent") return { type: "none" };
+	if (focusable(it)) return { type: "focusPane", id: it.id };
+	if (it.placement === "pane") return { type: "notice", text: `${it.id} has ended; its pane is closed.` };
+	return { type: "notice", text: `${it.id} runs headless; there is no pane to focus.` };
+}
+
+function clear(st: PanelState, it: PanelItem | undefined): PanelAction {
+	if (it?.kind === "ended") return { type: "forget", ids: endedRoots(st) };
+	if (it?.kind === "agent" && it.clearable) return { type: "forget", ids: [it.id] };
+	return { type: "none" };
+}
+
+const PAGE = 10;
+
+export function press(st: PanelState, key: PanelKey): { state: PanelState; action: PanelAction } {
+	const none = (state: PanelState = st) => ({ state, action: { type: "none" } as PanelAction });
+	if (st.viewing) {
+		const it = viewed(st);
+		switch (key) {
+			case "escape":
+			case "enter":
+				return none({ ...st, viewing: undefined, scroll: 0, seen: undefined });
+			case "up":
+				return none({ ...st, scroll: st.scroll + 1 });
+			case "down":
+				return none({ ...st, scroll: Math.max(0, st.scroll - 1) });
+			case "pageUp":
+				return none({ ...st, scroll: st.scroll + PAGE });
+			case "pageDown":
+				return none({ ...st, scroll: Math.max(0, st.scroll - PAGE) });
+			case "home":
+				return none({ ...st, scroll: Number.MAX_SAFE_INTEGER });
+			case "end":
+				return none({ ...st, scroll: 0 });
+			case "expand":
+				return none({ ...st, expanded: !st.expanded });
+			case "focus":
+				return { state: st, action: focus(it) };
+			case "clear": {
+				const action = clear(st, it);
+				return action.type === "forget" ? { state: { ...st, viewing: undefined, scroll: 0 }, action } : { state: st, action };
+			}
+		}
+	}
+	const rows = items(st);
+	const n = rows.length;
+	const it = rows[st.selected];
+	switch (key) {
+		case "up":
+			return none({ ...st, selected: n ? (st.selected - 1 + n) % n : 0 });
+		case "down":
+			return none({ ...st, selected: n ? (st.selected + 1) % n : 0 });
+		case "home":
+			return none({ ...st, selected: 0 });
+		case "end":
+			return none({ ...st, selected: Math.max(0, n - 1) });
+		case "escape":
+			return { state: st, action: { type: "close" } };
+		case "focus":
+			return { state: st, action: focus(it) };
+		case "clear":
+			return { state: st, action: clear(st, it) };
+		case "enter":
+			if (!it) return { state: st, action: { type: "close" } };
+			if (it.kind === "ended") return none({ ...st, showEnded: !st.showEnded });
+			return none({ ...st, viewing: it.id, scroll: 0, seen: undefined });
+		default:
+			return none();
+	}
+}
+
+const viewed = (st: PanelState) => items({ snap: st.snap, showEnded: true }).find((x): x is AgentItem => x.kind === "agent" && x.id === st.viewing);
+
+// ---------------------------------------------------------------- rendering
+
+export type Tone = "accent" | "text" | "muted" | "dim";
+export interface Line {
+	text: string;
+	tone: Tone;
+}
+
+/**
+ * The panel as toned lines that fit `width` x `height` (styling is index.ts's). Also returns the
+ * scroll offset clamped to the transcript, so the caller keeps a reachable value.
+ */
+export function view(st: PanelState, width: number, height: number, transcript: (it: AgentItem) => Entry[]): { lines: Line[]; scroll: number; seen?: number } {
+	const fit = (text: string, tone: Tone): Line => ({ text: truncateToWidth(text, width, "…"), tone });
+	const room = Math.max(1, height - 1);
+	if (st.viewing) {
+		const it = viewed(st);
+		const keys = ["↑↓ PgUp/PgDn scroll", `e ${st.expanded ? "collapse" : "expand"}`, ...(focusable(it) ? ["f focus pane"] : []), ...(it?.clearable ? ["x clear"] : []), "esc back"];
+		const head = fit(`${it ? agentLine(it) : `${st.viewing} (gone)`}   ${keys.join(" · ")}`, "accent");
+		const body = it ? transcriptLines(transcript(it), width, st.expanded) : [];
+		const grown = st.scroll > 0 && st.seen !== undefined ? Math.max(0, body.length - st.seen) : 0;
+		const scroll = Math.min(st.scroll + grown, Math.max(0, body.length - room));
+		const end = body.length - scroll;
+		const shown = body.slice(Math.max(0, end - room), end);
+		if (scroll > 0) shown[shown.length - 1] = { text: `… ${scroll} more line${scroll === 1 ? "" : "s"} below (End to follow)`, tone: "dim" };
+		return { lines: [head, ...(shown.length ? shown : [{ text: "(nothing yet)", tone: "dim" as Tone }])], scroll, seen: body.length };
+	}
+	const rows = items(st);
+	if (rows.length === 0) return { lines: [fit("pi-actors: no agents  (esc close)", "accent")], scroll: 0 };
+	const sel = rows[st.selected];
+	const keys = ["↑↓ move", sel?.kind === "ended" ? `enter ${st.showEnded ? "collapse" : "expand"}` : "enter transcript"];
+	if (focusable(sel)) keys.push("f focus pane");
+	if (sel?.kind === "ended") keys.push("x clear all ended");
+	else if (sel?.kind === "agent" && sel.clearable) keys.push("x clear");
+	keys.push("esc close");
+	const lines: Line[] = rows.map((it, i) => {
+		const cursor = i === st.selected ? "❯ " : "  ";
+		if (it.kind === "ended") return fit(`${cursor}${it.expanded ? "▾" : "▸"} ${it.count} ended`, i === st.selected ? "text" : "dim");
+		return fit(`${cursor}${"  ".repeat(it.depth)}${agentLine(it)}`, i === st.selected ? "text" : it.ended ? "dim" : "muted");
+	});
+	// Keep the cursor visible in a short pane.
+	const start = Math.min(Math.max(0, st.selected - room + 1), Math.max(0, lines.length - room));
+	return { lines: [fit(`pi-actors  (${keys.join(" · ")})`, "accent"), ...lines.slice(start, start + room)], scroll: 0 };
+}
+
+// ---------------------------------------------------------------- transcripts
+
+export type Entry =
+	| { kind: "user"; text: string }
+	| { kind: "assistant"; text: string }
+	| { kind: "delivery"; summary: string; text: string }
+	| { kind: "tool"; name: string; arg: string }
+	| { kind: "result"; name: string; text: string; error: boolean };
 
 /** Agent-supplied text is shown in the terminal: strip control characters except newline and tab. */
 export function clean(s: string): string {
 	return s.replace(/[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/g, "");
 }
 
-/** The answer as the agent reads it: unambiguous plain text. */
-export function formatAnswer(q: Question, picked: string[], text?: string): string {
-	const lines: string[] = [];
-	if (picked.length) lines.push(`${q.multi ? "Selected" : "Chose"}: ${picked.join(", ")}`);
-	if (text?.trim()) lines.push(picked.length ? `Note: ${text.trim()}` : text.trim());
-	return lines.join("\n") || "(no answer)";
+function wrap(text: string, width: number, prefix: string, tone: Tone): Line[] {
+	const out: Line[] = [];
+	const inner = Math.max(10, width - prefix.length);
+	for (const para of clean(text).replace(/\t/g, "  ").split("\n")) {
+		for (const l of para ? wrapTextWithAnsi(para, inner) : [""]) out.push({ text: `${out.length ? " ".repeat(prefix.length) : prefix}${l}`, tone });
+	}
+	return out;
 }
 
-export const DECLINED = "The human declined to answer this; use your own judgment and say what you decided.";
+const RESULT_LINES = 12;
 
-export interface Card {
-	ref: string;
-	from: string;
-	task?: string;
-	q: Question;
-	/** Index into choices; choices.length is the "Type something…" row. */
-	cursor: number;
-	picked: number[];
-}
-
-export function openCard(item: Extract<PanelItem, { kind: "question" }>, task?: string): Card {
-	return { ref: item.ref, from: item.from, task, q: parseQuestion(item.body), cursor: 0, picked: [] };
-}
-
-export type PanelAction =
-	| { type: "none" }
-	| { type: "close" }
-	| { type: "answer"; ref: string; from: string; body: string }
-	/** Free text still needed: the caller asks for it, then sends formatAnswer(q, picked, text). */
-	| { type: "freeText"; ref: string; from: string; q: Question; picked: string[] }
-	| { type: "focusPane"; id: string };
-
-export interface PanelState {
-	items: PanelItem[];
-	selected: number;
-	/** Agent whose transcript is shown, if any. */
-	viewing?: string;
-	/** The question being answered, if any. */
-	card?: Card;
-}
-
-function pressCard(st: PanelState, card: Card, key: PanelKey): { state: PanelState; action: PanelAction } {
-	const rows = card.q.choices.length + 1; // + "Type something…"
-	const onOther = card.cursor === card.q.choices.length;
-	const labels = () => card.picked.map((i) => card.q.choices[i].label);
-	const keep = (c: Card) => ({ state: { ...st, card: c }, action: { type: "none" } as PanelAction });
-	switch (key) {
-		case "up":
-			return keep({ ...card, cursor: (card.cursor - 1 + rows) % rows });
-		case "down":
-			return keep({ ...card, cursor: (card.cursor + 1) % rows });
-		case "space":
-			if (!card.q.multi || onOther) return keep(card);
-			return keep({ ...card, picked: card.picked.includes(card.cursor) ? card.picked.filter((i) => i !== card.cursor) : [...card.picked, card.cursor].sort((a, b) => a - b) });
-		case "escape":
-			return { state: { ...st, card: undefined }, action: { type: "none" } };
-		case "decline":
-			return { state: st, action: { type: "answer", ref: card.ref, from: card.from, body: DECLINED } };
-		case "transcript":
-			return { state: { ...st, viewing: card.from }, action: { type: "none" } };
-		case "enter": {
-			if (onOther) return { state: st, action: { type: "freeText", ref: card.ref, from: card.from, q: card.q, picked: card.q.multi ? labels() : [] } };
-			if (card.q.multi) {
-				const picked = card.picked.length ? labels() : [card.q.choices[card.cursor].label];
-				return { state: st, action: { type: "answer", ref: card.ref, from: card.from, body: formatAnswer(card.q, picked) } };
+/** Collapsed: what was asked, said and done; expanded adds tool output and whole deliveries. */
+export function transcriptLines(entries: readonly Entry[], width: number, expanded: boolean): Line[] {
+	const out: Line[] = [];
+	const gap = () => out.length && out.push({ text: "", tone: "dim" });
+	for (const e of entries) {
+		switch (e.kind) {
+			case "user":
+				gap();
+				out.push(...wrap(e.text, width, "› ", "text"));
+				break;
+			case "assistant":
+				gap();
+				out.push(...wrap(e.text, width, "", "text"));
+				break;
+			case "delivery":
+				gap();
+				out.push(...wrap(expanded ? e.text : e.summary, width, "⇢ ", "muted"));
+				break;
+			case "tool":
+				out.push({ text: truncateToWidth(`  ⚙ ${e.name}${e.arg ? `  ${clean(e.arg).replace(/\s+/g, " ")}` : ""}`, width, "…"), tone: "muted" });
+				break;
+			case "result": {
+				const lines = clean(e.text).replace(/\n+$/, "").split("\n");
+				const count = `${lines.length} line${lines.length === 1 ? "" : "s"}`;
+				if (!expanded) {
+					const one = lines.length === 1 ? lines[0] : count;
+					out.push({ text: truncateToWidth(`    ↳ ${e.error ? "error: " : ""}${one || "(empty)"}`, width, "…"), tone: "dim" });
+					break;
+				}
+				out.push({ text: `    ↳ ${e.error ? "error · " : ""}${count}`, tone: "dim" });
+				for (const l of lines.slice(0, RESULT_LINES)) out.push({ text: truncateToWidth(`      ${l.replace(/\t/g, "  ")}`, width, "…"), tone: "dim" });
+				if (lines.length > RESULT_LINES) out.push({ text: `      … ${lines.length - RESULT_LINES} more`, tone: "dim" });
+				break;
 			}
-			return { state: st, action: { type: "answer", ref: card.ref, from: card.from, body: formatAnswer(card.q, [card.q.choices[card.cursor].label]) } };
-		}
-		default:
-			return keep(card);
-	}
-}
-
-export function renderCard(card: Card): string[] {
-	// Keys first: in a short pane the bottom of an overlay can be cut off.
-	const lines = [
-		`${card.from} asks${card.task ? ` (working on: ${card.task.replace(/\s+/g, " ").slice(0, 80)})` : ""}  (↑↓ move${card.q.multi ? " · space toggle · enter confirm" : " · enter choose"} · t transcript · d decline · esc back)`,
-		"",
-	];
-	for (const l of card.q.text.split("\n")) lines.push(`  ${l}`);
-	lines.push("");
-	const rows = [...card.q.choices.map((c) => ({ ...c })), { label: OTHER }];
-	rows.forEach((c, i) => {
-		const cursor = i === card.cursor ? "❯ " : "  ";
-		const box = card.q.multi && i < card.q.choices.length ? (card.picked.includes(i) ? "[x] " : "[ ] ") : "";
-		lines.push(`${cursor}${box}${c.label}${"description" in c && c.description ? ` — ${c.description}` : ""}`);
-	});
-	return lines;
-}
-
-const ACTIVE = new Set(["starting", "live", "disconnected", "exiting", "killing"]);
-
-/** Questions first (they need you), then the tree in parent order, root excluded. */
-export function itemsFrom(snap: Snapshot): PanelItem[] {
-	const questions: PanelItem[] = snap.human.filter((q) => q.ref).map((q) => ({ kind: "question", ref: q.ref!, from: q.from, body: q.body }));
-	const byParent = new Map<string | null, Snapshot["agents"]>();
-	for (const a of snap.agents) byParent.set(a.parent, [...(byParent.get(a.parent) ?? []), a]);
-	const agents: PanelItem[] = [];
-	const walk = (parent: string, depth: number) => {
-		for (const a of byParent.get(parent) ?? []) {
-			agents.push({ kind: "agent", id: a.id, status: a.status, reason: a.reason, model: a.model, placement: a.placement, mailbox: a.mailbox, sessionFile: a.sessionFile, task: a.task, depth });
-			walk(a.id, depth + 1);
-		}
-	};
-	walk("root", 0);
-	return [...questions, ...agents];
-}
-
-export function summary(snap: Snapshot | undefined): string | undefined {
-	if (!snap) return undefined;
-	// Agents that have not ended; an idle child that already reported still counts (it can be continued).
-	const agents = snap.agents.filter((a) => a.id !== "root" && ACTIVE.has(a.status)).length;
-	const questions = snap.human.length;
-	if (agents === 0 && questions === 0) return undefined;
-	const parts = [`pi-actors · ${agents} agent${agents === 1 ? "" : "s"}`];
-	if (questions) parts.push(`${questions} question${questions === 1 ? "" : "s"} for you`);
-	return `${parts.join(" · ")} — ↓ to open`;
-}
-
-export function press(st: PanelState, key: PanelKey): { state: PanelState; action: PanelAction } {
-	if (st.card && !st.viewing) return pressCard(st, st.card, key);
-	if (st.viewing) {
-		if (key === "escape" || key === "enter") return { state: { ...st, viewing: undefined }, action: { type: "none" } };
-		if (key === "focus") return { state: st, action: { type: "focusPane", id: st.viewing } };
-		return { state: st, action: { type: "none" } };
-	}
-	const n = st.items.length;
-	switch (key) {
-		case "up":
-			return { state: { ...st, selected: n ? (st.selected - 1 + n) % n : 0 }, action: { type: "none" } };
-		case "down":
-			return { state: { ...st, selected: n ? (st.selected + 1) % n : 0 }, action: { type: "none" } };
-		case "escape":
-			return { state: st, action: { type: "close" } };
-		case "focus": {
-			const it = st.items[st.selected];
-			return { state: st, action: it?.kind === "agent" && it.placement === "pane" ? { type: "focusPane", id: it.id } : { type: "none" } };
-		}
-		case "enter": {
-			const it = st.items[st.selected];
-			if (!it) return { state: st, action: { type: "close" } };
-			if (it.kind === "question") {
-				const asker = st.items.find((x) => x.kind === "agent" && x.id === it.from);
-				return { state: { ...st, card: openCard(it, asker?.kind === "agent" ? asker.task : undefined) }, action: { type: "none" } };
-			}
-			return { state: { ...st, viewing: it.id }, action: { type: "none" } };
-		}
-		default:
-			return { state: st, action: { type: "none" } };
-	}
-}
-
-/** Plain-text lines (no styling): index.ts colours them. Width-limited by the caller. */
-export function render(st: PanelState, transcript: (item: Extract<PanelItem, { kind: "agent" }>) => string[]): string[] {
-	if (st.card && !st.viewing) return renderCard(st.card);
-	if (st.viewing) {
-		const it = st.items.find((x): x is Extract<PanelItem, { kind: "agent" }> => x.kind === "agent" && x.id === st.viewing);
-		const head = `── ${st.viewing} · ${it?.status ?? "?"}${it?.model ? ` · ${it.model}` : ""} ──  (esc back${it?.placement === "pane" ? " · f focus pane" : ""})`;
-		return [head, ...(it ? transcript(it) : ["(gone)"])];
-	}
-	if (st.items.length === 0) return ["pi-actors: nothing to show  (esc close)"];
-	const panes = st.items.some((it) => it.kind === "agent" && it.placement === "pane");
-	const lines = [`pi-actors  (↑↓ move · enter open/answer${panes ? " · f focus pane" : ""} · esc close)`];
-	st.items.forEach((it, i) => {
-		const cursor = i === st.selected ? "❯ " : "  ";
-		if (it.kind === "question") lines.push(`${cursor}? ${it.from} asks: ${oneLine(parseQuestion(it.body).text)}`);
-		else lines.push(`${cursor}${"  ".repeat(it.depth)}${it.id} · ${it.status}${it.reason ? ` (${it.reason})` : ""}${it.model ? ` · ${it.model}` : ""}${it.placement === "pane" ? " · pane" : ""}${it.mailbox ? ` · ${it.mailbox} queued` : ""}`);
-	});
-	return lines;
-}
-
-const oneLine = (s: string) => clean(s).replace(/\s+/g, " ").slice(0, 160);
-
-/** Last messages of an agent's session file: what it was asked, what it did, what it said. */
-export function readTranscript(sessionFile: string | undefined, max = 30): string[] {
-	if (!sessionFile) return ["(no session file yet)"];
-	let raw: string;
-	try {
-		raw = readFileSync(sessionFile, "utf8");
-	} catch {
-		return ["(session file not readable yet)"];
-	}
-	const out: string[] = [];
-	for (const line of raw.split("\n")) {
-		if (!line) continue;
-		let e: { type?: string; customType?: string; content?: unknown; message?: { role?: string; content?: unknown; toolName?: string } };
-		try {
-			e = JSON.parse(line);
-		} catch {
-			continue;
-		}
-		if (e.type === "custom_message" && e.customType === "pi-actors") out.push(`⇢ ${oneLine(text(e.content))}`);
-		else if (e.type === "message" && e.message) {
-			const m = e.message;
-			if (m.role === "user") out.push(`user: ${oneLine(text(m.content))}`);
-			else if (m.role === "assistant") {
-				const parts = Array.isArray(m.content) ? m.content : [];
-				const said = text(m.content);
-				for (const b of parts as { type?: string; name?: string }[]) if (b?.type === "toolCall") out.push(`  ⚙ ${b.name}`);
-				if (said.trim()) out.push(`assistant: ${oneLine(said)}`);
-			} else if (m.role === "toolResult") out.push(`  ↳ ${m.toolName ?? "tool"}: ${oneLine(text(m.content)).slice(0, 100)}`);
 		}
 	}
-	return out.length ? out.slice(-max) : ["(nothing yet)"];
+	return out;
+}
+
+/** The argument that says what a tool call did: a command, a path, a recipient. */
+export function keyArg(args: unknown): string {
+	if (!args || typeof args !== "object") return "";
+	const a = args as Record<string, unknown>;
+	for (const k of ["command", "path", "file_path", "pattern", "url", "query", "to", "name", "id", "task"]) if (typeof a[k] === "string" && a[k]) return a[k] as string;
+	const first = Object.values(a).find((v): v is string => typeof v === "string");
+	return first ?? "";
 }
 
 function text(c: unknown): string {
 	if (typeof c === "string") return c;
 	if (!Array.isArray(c)) return "";
 	return c.map((b: { type?: string; text?: string }) => (b?.type === "text" ? (b.text ?? "") : "")).join("");
+}
+
+/** Parse one session-file line into transcript entries. */
+export function entriesOf(line: string): Entry[] {
+	let e: { type?: string; customType?: string; content?: unknown; details?: { actors?: { messages?: Message[] } }; message?: { role?: string; content?: unknown; toolName?: string; isError?: boolean } };
+	try {
+		e = JSON.parse(line);
+	} catch {
+		return [];
+	}
+	if (e.type === "custom_message" && e.customType === "pi-actors") {
+		const body = text(e.content);
+		const msgs = e.details?.actors?.messages;
+		return [{ kind: "delivery", summary: Array.isArray(msgs) && msgs.length ? summarizeDelivery(msgs) : body.split("\n")[0], text: body }];
+	}
+	if (e.type !== "message" || !e.message) return [];
+	const m = e.message;
+	if (m.role === "user") return [{ kind: "user", text: text(m.content) }];
+	if (m.role === "toolResult") return [{ kind: "result", name: m.toolName ?? "tool", text: text(m.content), error: !!m.isError }];
+	if (m.role !== "assistant") return [];
+	const out: Entry[] = [];
+	for (const b of (Array.isArray(m.content) ? m.content : []) as { type?: string; text?: string; name?: string; arguments?: unknown }[]) {
+		if (b?.type === "text" && b.text?.trim()) out.push({ kind: "assistant", text: b.text.trim() });
+		else if (b?.type === "toolCall") out.push({ kind: "tool", name: b.name ?? "tool", arg: keyArg(b.arguments) });
+	}
+	return out;
+}
+
+/** Session files only grow: read just the bytes appended since the last look. */
+const cache = new Map<string, { ino: number; size: number; rest: Buffer; entries: Entry[] }>();
+
+export function readTranscript(sessionFile: string | undefined): Entry[] {
+	if (!sessionFile) return [];
+	let size: number;
+	let ino: number;
+	try {
+		({ size, ino } = statSync(sessionFile));
+	} catch {
+		return [];
+	}
+	let c = cache.get(sessionFile);
+	// A replaced or truncated file is read again from the start.
+	if (!c || c.ino !== ino || size < c.size) c = { ino, size: 0, rest: Buffer.alloc(0), entries: [] };
+	if (size > c.size) {
+		const chunk = Buffer.alloc(size - c.size);
+		let n: number;
+		try {
+			const fd = openSync(sessionFile, "r");
+			try {
+				n = readSync(fd, chunk, 0, chunk.length, c.size);
+			} finally {
+				closeSync(fd);
+			}
+		} catch {
+			return c.entries;
+		}
+		// Split on bytes, so a multi-byte character cut at the end of a read stays whole.
+		const all = Buffer.concat([c.rest, chunk.subarray(0, n)]);
+		const cut = all.lastIndexOf(0x0a) + 1;
+		const lines = all.subarray(0, cut).toString("utf8").split("\n").filter(Boolean);
+		c = { ino, size: c.size + n, rest: all.subarray(cut), entries: [...c.entries, ...lines.flatMap(entriesOf)] };
+	}
+	cache.set(sessionFile, c);
+	return c.entries;
 }

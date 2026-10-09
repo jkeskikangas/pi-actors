@@ -114,6 +114,13 @@ export class Mailroom {
 		this.inFlight.clear();
 	}
 
+	/** Consumed without being shown (an end notice the agent caused itself): ack it now. */
+	discard(m: Message, f: Fetcher): void {
+		this.inFlight.delete(m.id);
+		this.consumed.add(m.id);
+		f.ack(m.id);
+	}
+
 	stamp(messages: readonly Message[]): Stamp {
 		// Only what formatDelivery shows (one char over the limit keeps its "truncated" note):
 		// the session must not store every large body twice. End notices stay whole (JSON).
@@ -155,35 +162,49 @@ export function dedupeContext<T>(self: string, messages: readonly T[]): T[] | un
 		changed = true;
 		if (fresh.length === 0) continue;
 		const keep = stamp.messages.filter((x) => fresh.includes(x.id));
-		out.push({ ...msg, content: formatDelivery(self, keep), details: { actors: { ...stamp, consumed: fresh, messages: keep } } } as T);
+		out.push({ ...msg, content: formatDelivery(keep), details: { actors: { ...stamp, consumed: fresh, messages: keep } } } as T);
 	}
 	return changed ? out : undefined;
 }
 
 const clean = (s: string) => s.replace(/[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/g, "");
 
-/** Human-readable body for one pushed entry. Sender-labelled; never phrased as user input. */
-export function formatDelivery(self: string, messages: readonly Message[]): string {
-	const lines = [`[pi-actors] ${messages.length} update${messages.length === 1 ? "" : "s"} for ${self}:`];
-	for (const m of messages) {
-		// Shown in the TUI too: no terminal control sequences from other agents (N7).
-		const safe = clean(m.body);
-		const body = safe.length > INLINE_LIMIT ? `${safe.slice(0, INLINE_LIMIT)}\n…(truncated; ask the sender for the rest or for a file path)` : safe;
-		if (m.kind === "down") {
-			const d = safeJson(m.body) as { id?: string; reason?: string; result?: string } | undefined;
-			lines.push(`\n■ ${d?.id ?? "?"} has ended: ${d?.reason ?? "?"}${d?.result ? `\nIts result:\n${clean(d.result)}` : ""}`);
-		} else if (m.tag === "task") {
-			lines.push(`\n■ Task from ${m.from} (msg ${m.id}):\n${body}`);
-		} else if (m.tag === "report") {
-			lines.push(`\n■ Report from ${m.from} (it finished a run; send it a message to continue it):\n${body}`);
-		} else if (m.kind === "reply" || m.ref) {
-			lines.push(`\n■ ${m.from === "human" ? "The human" : m.from} answered your message ${m.ref ?? "?"} (msg ${m.id}):\n${body}`);
-		} else {
-			lines.push(`\n■ Message from ${m.from} (msg ${m.id}${m.urgent ? ", urgent" : ""}):\n${body}`);
-		}
+/** One delivery as the model reads it: sender-labelled, never phrased as user input. */
+export function formatDelivery(messages: readonly Message[]): string {
+	return messages.map(formatOne).join("\n\n");
+}
+
+function formatOne(m: Message): string {
+	// Shown in the TUI too: no terminal control sequences from other agents (N7).
+	const safe = clean(m.body);
+	const body = safe.length > INLINE_LIMIT ? `${safe.slice(0, INLINE_LIMIT)}\n…(truncated; ask the sender for the rest or for a file path)` : safe;
+	if (m.kind === "down") {
+		const d = endNotice(m);
+		return `■ ${d.id} ended: ${d.reason}${d.result ? `\nIts result:\n${clean(d.result)}` : ""}`;
 	}
-	lines.push("\nReply with send{to, text, reply_to: <msg>} when an answer is needed.");
-	return lines.join("\n");
+	if (m.tag === "task") return `■ Task from ${m.from} (msg ${m.id}):\n${body}`;
+	if (m.tag === "report") return `■ Report from ${m.from}:\n${body}`;
+	if (m.ref) return `■ ${m.from} answered your msg ${m.ref} (msg ${m.id}):\n${body}`;
+	return `■ Message from ${m.from} (msg ${m.id}${m.urgent ? ", urgent" : ""}):\n${body}`;
+}
+
+/** One line per message for the collapsed chat view. */
+export function summarizeDelivery(messages: readonly Message[]): string {
+	return messages
+		.map((m) => {
+			if (m.kind === "down") {
+				const d = endNotice(m);
+				return `${d.id} ended (${d.reason})`;
+			}
+			const what = m.tag === "task" ? "task" : m.tag === "report" ? "report" : m.ref ? "answer" : "message";
+			return `${what} from ${m.from}`;
+		})
+		.join(" · ");
+}
+
+export function endNotice(m: Message): { id: string; reason: string; result?: string } {
+	const d = safeJson(m.body) as { id?: string; reason?: string; result?: string | null } | undefined;
+	return { id: d?.id ?? "?", reason: d?.reason ?? "?", result: d?.result ?? undefined };
 }
 
 function safeJson(s: string): unknown {

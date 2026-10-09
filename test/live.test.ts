@@ -112,13 +112,13 @@ test("root ⇄ child round trip through real pi with push delivery", { timeout: 
 	const pushed = texts.filter((t) => t.startsWith("custom:pi-actors"));
 	assert.ok(pushed.some((t) => t.includes("Report from kid") && t.includes("hello from kid")), texts.join("\n"));
 	assert.ok(pushed.some((t) => t.includes("ANSWER 4")), texts.join("\n"));
-	assert.ok(pushed.some((t) => t.includes("has ended")), texts.join("\n"));
+	assert.ok(!pushed.some((t) => t.includes("kid ended")), `a stop the root asked for is not pushed back:\n${texts.join("\n")}`);
 });
 
 test("pane placement: an interactive child in a herdr pane reports and is stopped", { timeout: 180_000, skip: process.env.HERDR_ENV !== "1" ? "needs herdr" : false }, async () => {
 	const texts = await runRoot("./fixtures/faux-root-pane.ts", "start", "PANE DONE");
 	assert.ok(texts.some((t) => t.includes("Report from panekid") && t.includes("hello from kid")), texts.join("\n"));
-	assert.ok(texts.some((t) => t.includes("has ended")), texts.join("\n"));
+	assert.ok(!texts.some((t) => t.includes("panekid ended")), texts.join("\n"));
 });
 
 const hasTmux = (() => {

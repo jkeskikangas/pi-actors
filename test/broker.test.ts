@@ -84,11 +84,11 @@ test("spawn → child mail → exit → DOWN normal with result", async () => {
 	root.close();
 });
 
-test("request/reply composes from send{call} + receive{ref}; replies never reach a plain receive", async () => {
+test("a served child answers mail with reply_to; its end carries its result", async () => {
 	const { root } = await tree();
 	const r = (await root.op("spawn", spawnReq("serve"))) as { id: string };
-	const sent = (await root.op("send", { to: r.id, kind: "call", body: "q1", timeoutS: 30 })) as { msgId: string };
-	assert.equal((await receive(root, { ref: sent.msgId })).body, "re:q1");
+	const sent = (await root.op("send", { to: r.id, kind: "mail", body: "q1" })) as { msgId: string };
+	assert.equal((await receive(root, { ref: sent.msgId })).body, "echo:q1");
 	await root.op("send", { to: r.id, kind: "mail", body: "bye" });
 	const down = JSON.parse((await receive(root, { kind: "down" })).body);
 	assert.equal(down.result, "served");
@@ -108,7 +108,7 @@ test("a crashed child produces DOWN error:crashed", async () => {
 test("exit{target} by an ancestor kills a child", async () => {
 	const { root } = await tree();
 	const r = (await root.op("spawn", spawnReq("serve"))) as { id: string };
-	await root.op("send", { to: r.id, kind: "call", body: "ping", timeoutS: 30 }).then((x) => receive(root, { ref: (x as { msgId: string }).msgId }));
+	await root.op("send", { to: r.id, kind: "mail", body: "ping" }).then((x) => receive(root, { ref: (x as { msgId: string }).msgId }));
 	assert.equal((await root.op("kill", { target: r.id })).ok, true);
 	const down = JSON.parse((await receive(root, { kind: "down" })).body);
 	assert.match(down.reason, /^killed/);

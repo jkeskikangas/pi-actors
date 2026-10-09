@@ -21,22 +21,19 @@ export interface FetchFilter {
 	from?: string;
 	tag?: string;
 	ref?: string;
-	human?: boolean;
 }
 
 export interface Snapshot {
 	treeId: string;
 	self: string;
 	agents: { id: string; parent: string | null; status: string; inc: number; reason?: string; connected: boolean; placement?: string; paneId?: string; model?: string; mailbox: number; spawns: number; sessionFile?: string; task?: string }[];
-	human: { ref?: string; from: string; body: string; fromPane?: boolean }[];
-	pendingCalls: string[];
 	liveChildren: number;
 }
 
 type OpFrame = { t: "op"; seq: number; op: string } & Record<string, unknown>;
 
 /**
- * Events: "welcome", "mail" (urgent, humanPending), "terminate" (reason), "superseded",
+ * Events: "welcome", "mail" (urgent), "terminate" (reason), "superseded",
  * "rejected" (reason), "lost" (no broker within the grace period).
  */
 export class Client extends EventEmitter {
@@ -182,7 +179,7 @@ export class Client extends EventEmitter {
 					break;
 				}
 				case "mail":
-					this.emit("mail", !!f.urgent, f.human ?? 0);
+					this.emit("mail", !!f.urgent);
 					break;
 				case "terminate":
 					this.emit("terminate", f.reason);
@@ -206,7 +203,7 @@ export class Client extends EventEmitter {
 		if (this.sock && !this.sock.destroyed) this.sock.write(encode(frame));
 	}
 
-	/** A sequenced operation (spawn, send, answer, exit, kill); idempotent across reconnects. */
+	/** A sequenced operation (spawn, send, exit, kill, forget); idempotent across reconnects. */
 	op(op: string, fields: Record<string, unknown>, signal?: AbortSignal): Promise<Response> {
 		if (this.closed) return Promise.resolve({ ok: false, error: "not_live", detail: "connection closed" });
 		// Size first: an oversized frame must not consume a sequence number (F8).
@@ -235,8 +232,8 @@ export class Client extends EventEmitter {
 		return p;
 	}
 
-	ack(msgId: string, human = false) {
-		this.write({ t: "ack", msgId, human });
+	ack(msgId: string) {
+		this.write({ t: "ack", msgId });
 	}
 
 	release(msgId: string) {

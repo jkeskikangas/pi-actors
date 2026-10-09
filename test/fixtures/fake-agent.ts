@@ -1,7 +1,6 @@
 // A fake child agent: speaks the pi-actors protocol without pi or a model.
 // Behaviour comes from its task: "echo" (reply to the parent, then exit), "serve" (answer
-// requests and echo mail until told "bye"), "crash" (exit 3 without the exit op), "ask <q>"
-// (ask the human, report the answer to the parent).
+// mail with reply_to until told "bye"), "crash" (exit 3 without the exit op).
 import { Client } from "../../src/client/connection.ts";
 import type { Message } from "../../src/protocol.ts";
 
@@ -23,20 +22,6 @@ const task = await next();
 c.ack(task.id);
 const parent = task.from;
 if (task.body === "crash") process.exit(3);
-if (task.body.startsWith("ask")) {
-	// Ask the human, wait for the answer, report it to the parent.
-	const r = (await c.op("send", { to: "human", kind: "call", body: task.body.slice(4) || "Which one?", timeoutS: 300 })) as { msgId: string };
-	for (;;) {
-		const m = await c.fetch({ ref: r.msgId });
-		if (m) {
-			c.ack(m.id);
-			await c.op("send", { to: parent, kind: "mail", body: `got:${m.body}` });
-			break;
-		}
-		await c.waitForMail(200);
-	}
-	await new Promise(() => {});
-}
 if (task.body === "echo") {
 	await c.op("send", { to: parent, kind: "mail", body: `echo:${task.body}` });
 	await c.op("exit", { result: "echoed" });
@@ -50,6 +35,5 @@ for (;;) {
 		await c.op("exit", { result: "served" });
 		await new Promise(() => {});
 	}
-	if (m.kind === "call") await c.op("send", { kind: "reply", ref: m.ref, to: "", body: `re:${m.body}` });
-	else await c.op("send", { to: m.from, kind: "mail", body: `echo:${m.body}` });
+	await c.op("send", { to: m.from, kind: "mail", body: `echo:${m.body}`, ref: m.id });
 }

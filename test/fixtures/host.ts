@@ -20,6 +20,7 @@ export interface HostOptions {
 export function fakeHost(opts: HostOptions) {
 	const tools: Record<string, any> = {};
 	const commands: Record<string, any> = {};
+	const renderers: Record<string, any> = {};
 	const handlers: Record<string, Function[]> = {};
 	const listeners: Record<string, Function[]> = {};
 	const entries: any[] = [];
@@ -36,6 +37,7 @@ export function fakeHost(opts: HostOptions) {
 		getFlag: (name: string) => opts.flags?.[name],
 		registerTool: (t: any) => (tools[t.name] = t),
 		registerCommand: (name: string, c: any) => (commands[name] = c),
+		registerMessageRenderer: (type: string, r: any) => (renderers[type] = r),
 		on: (ev: string, h: Function) => (handlers[ev] ??= []).push(h),
 		appendEntry: (customType: string, data: unknown) => entries.push({ type: "custom", customType, data }),
 		sendMessage: (m: any, options: any) => {
@@ -69,7 +71,7 @@ export function fakeHost(opts: HostOptions) {
 						overlay = undefined;
 						resolve(v);
 					};
-					const component = factory({ requestRender() {} }, { fg: (_c: string, t: string) => t }, {}, done);
+					const component = factory({ requestRender() {}, terminal: { rows: 40 } }, { fg: (_c: string, t: string) => t }, {}, done);
 					overlay = { component, done };
 				}),
 		},
@@ -106,13 +108,14 @@ export function fakeHost(opts: HostOptions) {
 		return messages;
 	};
 	const keys: Record<string, string> = { up: "\x1b[A", down: "\x1b[B", enter: "\r", escape: "\x1b", space: " " };
-	/** Press keys in the open overlay (the panel or a question card). */
+	/** Press keys in the open overlay. */
 	const press = (...ks: string[]) => {
 		for (const k of ks) overlay?.component.handleInput(keys[k] ?? k);
 	};
 	return {
-		pi, ctx, tools, entries, pushed, notes, events, widgets, inputs, fire, tool, command, inbox, waitFor, context, press,
+		pi, ctx, tools, entries, pushed, notes, events, widgets, inputs, renderers, fire, tool, command, inbox, waitFor, context, press,
 		overlayLines: (width = 120) => overlay?.component.render(width) ?? [],
+		overlayOpen: () => !!overlay,
 		setPush: (p: "persist" | "drop" | "keep") => (push = p),
 		/** pi delivers what it kept queued (the next run). */
 		drainQueue: () => entries.push(...queued.splice(0)),

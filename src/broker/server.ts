@@ -9,7 +9,7 @@ import { closeTmuxPane, listTmuxPanes, startTmuxPane, tmuxAvailable, tmuxPanePid
 import { signalGroup, startHeadless } from "../placement/headless.ts";
 import { decode, encode, PROTO, TIMING } from "../protocol.ts";
 import { acquireLock, type Config, ensureDir, ensurePrivateDir, holdsLock, pidAlive, releaseLock } from "../runtime.ts";
-import { apply, type Effect, type Event, finished, HUMAN, initial, nextDeadline, replay, ROOT, type SpawnRequest, type TreeState, UNSYNCED_EVENTS } from "../tree.ts";
+import { apply, type Effect, type Event, finished, initial, nextDeadline, replay, ROOT, type SpawnRequest, type TreeState, UNSYNCED_EVENTS } from "../tree.ts";
 import { EventLog } from "./log.ts";
 
 type Role = "agent" | "keeper";
@@ -122,10 +122,10 @@ export async function startBroker(dir: string, sock: string, config: Config): Pr
 				send(agentConn.get(e.to), { t: "resp", seq: e.seq, response: e.response });
 				break;
 			case "fetched":
-				send(e.to === HUMAN ? agentConn.get(ROOT) : agentConn.get(e.to), { t: "fetched", fetchId: e.fetchId, message: e.message });
+				send(agentConn.get(e.to), { t: "fetched", fetchId: e.fetchId, message: e.message });
 				break;
 			case "notify":
-				send(agentConn.get(e.id), { t: "mail", urgent: e.urgent, human: humanPending() });
+				send(agentConn.get(e.id), { t: "mail", urgent: e.urgent });
 				break;
 			case "terminate":
 				send(agentConn.get(e.id), { t: "terminate", reason: e.reason });
@@ -170,8 +170,6 @@ export async function startBroker(dir: string, sock: string, config: Config): Pr
 		list: () => (config.mux === "tmux" ? listTmuxPanes() : listPanes()),
 		close: (pane: string) => (config.mux === "tmux" ? closeTmuxPane(pane) : closePane(pane)),
 	};
-
-	const humanPending = () => (st.mailbox[HUMAN] ?? []).length;
 
 	// ------------------------------------------------------------ placement
 
@@ -317,17 +315,17 @@ export async function startBroker(dir: string, sock: string, config: Config): Pr
 					const resumeProcGone = old ? await processGone(old) : undefined;
 					run({ type: "spawn", now, from: id, seq, req, resumeProcGone });
 				}
-				else if (op === "send") run({ type: "send", now, from: id, seq, to: String(f.to ?? ""), kind: f.kind as "mail" | "call" | "reply", body: String(f.body ?? ""), tag: f.tag as string | undefined, ref: f.ref as string | undefined, urgent: !!f.urgent, timeoutS: f.timeoutS as number | undefined });
-				else if (op === "answer") run({ type: "answer", now, from: id, seq, ref: String(f.ref), body: String(f.body ?? "") });
+				else if (op === "send") run({ type: "send", now, from: id, seq, to: String(f.to ?? ""), kind: f.kind as "mail", body: String(f.body ?? ""), tag: f.tag as string | undefined, ref: f.ref as string | undefined, urgent: !!f.urgent });
 				else if (op === "exit") run({ type: "exit", now, from: id, seq, result: String(f.result ?? ""), truncated: !!f.truncated, error: !!f.error });
 				else if (op === "kill") run({ type: "kill", now, from: id, seq, target: String(f.target) });
+				else if (op === "forget") run({ type: "forget", now, from: id, seq, target: String(f.target) });
 				return;
 			}
 			case "fetch":
-				run({ type: "fetch", id: f.human && id === ROOT ? HUMAN : id, fetchId: String(f.fetchId), all: !!f.all, kind: f.kind as never, from: f.from as string | undefined, tag: f.tag as string | undefined, ref: f.ref as string | undefined }, c);
+				run({ type: "fetch", id, fetchId: String(f.fetchId), all: !!f.all, kind: f.kind as never, from: f.from as string | undefined, tag: f.tag as string | undefined, ref: f.ref as string | undefined }, c);
 				return;
 			case "ack":
-				run({ type: "ack", id: f.human && id === ROOT ? HUMAN : id, msgId: String(f.msgId) });
+				run({ type: "ack", id, msgId: String(f.msgId) });
 				return;
 			case "release":
 				run({ type: "release", id, msgId: String(f.msgId) });
@@ -356,8 +354,6 @@ export async function startBroker(dir: string, sock: string, config: Config): Pr
 			id: a.id, parent: a.parent, status: a.status, inc: a.inc, reason: a.reason, connected: a.connected,
 			placement: a.spec?.placement, paneId: a.paneId, model: a.spec?.model, mailbox: (st.mailbox[a.id] ?? []).length, spawns: a.spawns, limits: a.limits, sessionFile: a.sessionFile, task: a.spec?.task?.slice(0, 200),
 		})),
-		human: (st.mailbox[HUMAN] ?? []).map((m) => ({ ref: m.ref, from: m.from, body: m.body, fromPane: st.agents[m.from]?.spec?.placement === "pane" })),
-		pendingCalls: Object.entries(st.calls).filter(([, c]) => c.caller === forId).map(([ref]) => ref),
 		liveChildren: Object.values(st.agents).filter((a) => a.parent === forId && a.status !== "down").length,
 	});
 

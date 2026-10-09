@@ -2,13 +2,14 @@
 //
 // Scope: agent lifecycle and DOWN notices, links, limits, sender sequence numbers with
 // retransmit, leased fetch with client-side dedupe and deferred ack, client reloads, process
-// crashes, and broker crash plus effect-free replay with recover(). Not modelled: calls and
-// replies, resume, human routing, clocks (see model/README.md).
+// crashes, broker crash plus effect-free replay with recover(), and forgetting ended agents.
+// Not modelled: resume and identity (pi_actors_identity.qnt), clocks (see model/README.md).
 //
 // Each `action` is one Tree reducer event or one environment fault; src/tree.ts mirrors the
 // reducer events. The invariants at the bottom are re-implemented as Tree property tests.
 module pi_actors {
-  type Status = Unborn | Starting | Live | Disconnected | Exiting | Killing | Down
+  // Gone: forgotten (removed from the tree); the id is never used again.
+  type Status = Unborn | Starting | Live | Disconnected | Exiting | Killing | Down | Gone
   // uid: unique message identity (the design's "<sender>:<inc>:<seq>"); seq: sender order.
   type Msg = { uid: int, src: str, dst: str, seq: int, kind: str }
   type Agent = { status: Status, parent: str, depth: int }
@@ -21,6 +22,7 @@ module pi_actors {
     spawns: int,
     downCount: str -> int,
     rejected: Set[int],
+    forgotten: Set[str],
     // --- broker memory (lost on broker crash) ---
     brokerUp: bool,
     connected: str -> bool,
@@ -48,6 +50,7 @@ module pi_actors {
     dupConsumed: bool,
     ackedUnpersisted: bool,
     fifoViolated: bool,
+    forgotLive: bool,
     redeliveries: int,
     faults: int,
   }
@@ -73,6 +76,7 @@ module pi_actors {
     spawns: 0,
     downCount: emptyMap(0),
     rejected: Set(),
+    forgotten: Set(),
     brokerUp: true,
     connected: AGENTS.mapBy(id => id == "r"),
     leases: emptyMap(Set()),
@@ -91,6 +95,7 @@ module pi_actors {
     dupConsumed: false,
     ackedUnpersisted: false,
     fifoViolated: false,
+    forgotLive: false,
     redeliveries: 0,
     faults: 0,
   }
@@ -99,7 +104,8 @@ module pi_actors {
   pure def setStatus(st: State, id: str, x: Status): State =
     { ...st, agents: st.agents.setBy(id, a => { ...a, status: x }) }
   pure def isActive(x: Status): bool = x == Starting or x == Live or x == Disconnected
-  pure def accepting(x: Status): bool = x != Down and x != Unborn
+  // A forgotten (Gone) target is unknown: mail to it is refused, never queued.
+  pure def accepting(x: Status): bool = x != Down and x != Unborn and x != Gone
 
   // Link rule: active children of `id` start being killed.
   pure def killChildren(st: State, id: str): State =
@@ -147,22 +153,31 @@ module pi_actors {
 
   // ---------------- agent-initiated events ----------------
 
+  // Only an unborn id is spawned: a forgotten (Gone) one never comes back.
+  pure def canSpawn(st: State, p: str, c: str): bool = all {
+    canAct(st, p),
+    st.agents.get(c).parent == p,
+    status(st, c) == Unborn,
+    st.agents.get(c).depth <= MAX_DEPTH,
+    st.spawns < MAX_SPAWNS,
+  }
+
   action spawn(p: str, c: str): bool = all {
-    canAct(s, p),
-    s.agents.get(c).parent == p,
-    status(s, c) == Unborn,
-    s.agents.get(c).depth <= MAX_DEPTH,
-    s.spawns < MAX_SPAWNS,
+    canSpawn(s, p, c),
     val st1 = setStatus(s, c, Starting)
     s' = { ...st1, spawns: s.spawns + 1, procAlive: s.procAlive.set(c, true) },
   }
 
   // Accepted hello. welcome.last_seq resyncs the client's counter when nothing is in flight.
+  pure def canHello(st: State, id: str): bool = all {
+    st.brokerUp,
+    st.procAlive.get(id),
+    not(st.connected.get(id)),
+    isActive(status(st, id)),
+  }
+
   action hello(id: str): bool = all {
-    s.brokerUp,
-    s.procAlive.get(id),
-    not(s.connected.get(id)),
-    isActive(status(s, id)),
+    canHello(s, id),
     val st1 = setStatus(s, id, Live)
     s' = { ...st1,
       connected: s.connected.set(id, true),
@@ -330,6 +345,33 @@ module pi_actors {
     s' = setStatus(s, c, Killing),
   }
 
+  // Strict ancestry (the tree is at most two levels below the root).
+  pure def isAncestor(x: str, y: str): bool =
+    PARENT.get(y) == x or (PARENT.get(y) != "" and PARENT.get(PARENT.get(y)) == x)
+
+  // forget{target}: a strict ancestor removes an ended agent and its ended subtree. Their
+  // mailboxes, leases and sequence tracking go; DOWN notices already queued elsewhere stay.
+  pure def canForget(st: State, p: str, t: str): bool = all {
+    canAct(st, p),
+    isAncestor(p, t),
+    status(st, t) == Down,
+    AGENTS.filter(x => isAncestor(t, x)).forall(x => status(st, x) == Down or status(st, x) == Unborn or status(st, x) == Gone),
+  }
+
+  action forget(p: str, t: str): bool = all {
+    canForget(s, p, t),
+    val gone = Set(t).union(AGENTS.filter(x => isAncestor(t, x) and status(s, x) == Down))
+    s' = { ...s,
+      agents: s.agents.keys().mapBy(x => if (gone.contains(x)) { ...s.agents.get(x), status: Gone } else s.agents.get(x)),
+      mailbox: s.mailbox.keys().mapBy(x => if (gone.contains(x)) List() else s.mailbox.get(x)),
+      leases: s.leases.keys().mapBy(x => if (gone.contains(x)) Set() else s.leases.get(x)),
+      lastSeq: s.lastSeq.keys().mapBy(x => if (gone.contains(x)) 0 else s.lastSeq.get(x)),
+      forgotten: s.forgotten.union(gone),
+      forgotLive: s.forgotLive or gone.exists(x => status(s, x) != Down),
+    },
+  }
+
+
   // ---------------- broker timers and Keeper reports ----------------
 
   action graceExpire(id: str): bool = all {
@@ -408,7 +450,7 @@ module pi_actors {
     nondet b = AGENTS.oneOf()
     any {
       spawn(a, b), hello(a), send(a, b), brokerAccept(a), clientAccepted(a),
-      fetch(a), persist(a), ack(a), piDrops(a), piKeeps(a), piDeliversKept(a), reclaim(a), exit(a), kill(a, b),
+      fetch(a), persist(a), ack(a), piDrops(a), piKeeps(a), piDeliversKept(a), reclaim(a), exit(a), kill(a, b), forget(a, b),
       graceExpire(a), startTimeout(a), processEnds(a), procExitReported(a), killingExpire(a),
       processCrash(a), reload(a), connectionDrop(a), brokerCrash, brokerRestart,
     }
@@ -423,8 +465,10 @@ module pi_actors {
   // accepted is either still in the target's mailbox or consumed by it.
   val consumedOnce = not(s.dupConsumed)
   val noLossOnAck = not(s.ackedUnpersisted)
+  // (A forgotten receiver's unread mail is discarded with it, deliberately.)
   val atLeastOnce = s.acceptedBySender.forall(m =>
-    s.persisted.get(m.dst).contains(m.uid) or s.mailbox.get(m.dst).select(x => x.uid == m.uid).length() > 0)
+    s.persisted.get(m.dst).contains(m.uid) or s.mailbox.get(m.dst).select(x => x.uid == m.uid).length() > 0
+      or s.forgotten.contains(m.dst))
   // INV-4: per-sender FIFO as seen by each receiver.
   val fifo = not(s.fifoViolated)
   // INV-1 (safety part): no active agent under a Down parent.
@@ -436,8 +480,16 @@ module pi_actors {
   // Leases never outlive the connection that took them.
   val leasesNeedConnection = AGENTS.forall(id => s.leases.get(id).size() > 0 implies s.connected.get(id))
 
+  // Forget: only ended agents are forgotten; a forgotten id never comes back and keeps no
+  // mailbox, leases or connection.
+  val forgetsOnlyDown = not(s.forgotLive)
+  val forgottenStaysGone = AGENTS.forall(id => s.forgotten.contains(id) iff status(s, id) == Gone)
+  val forgottenHoldsNothing = s.forgotten.forall(id =>
+    s.mailbox.get(id).length() == 0 and s.leases.get(id).size() == 0 and not(s.connected.get(id)))
+
   val all_invariants = downOnce and downNotified and consumedOnce and noLossOnAck and atLeastOnce
     and fifo and noOrphans and limits and leasesNeedConnection
+    and forgetsOnlyDown and forgottenStaysGone and forgottenHoldsNothing
 
   // ---------------- reachability witnesses (each MUST be violated by simulation) ----------------
   val witnessConsumed = AGENTS.forall(id => s.persisted.get(id).size() == 0)
@@ -447,6 +499,7 @@ module pi_actors {
   val witnessTwoAccepted = s.acceptedBySender.size() < 2
   val witnessChildDown = AGENTS.forall(id => id == "r" or status(s, id) != Down)
   val witnessGrandchildKilledByLink = not(status(s, "a") == Down and status(s, "c") == Down)
+  val witnessForgotten = s.forgotten.size() == 0
 
   // ---------------- deterministic scenario tests (quint test; mirrored as Tree unit tests) ----------------
   run redeliveryAfterReloadTest =
@@ -504,4 +557,15 @@ module pi_actors {
       .then(all { assert(s.held.get("a").length() == 1 and s.fetched.get("a").length() == 1), s' = s })
       .then(piDeliversKept("a")).then(persist("a")).then(ack("a"))
       .then(all { assert(s.persisted.get("a").size() == 1 and s.mailbox.get("a").length() == 0 and all_invariants), s' = s })
+
+  // Forget: refused while a descendant is still ending; then the whole ended subtree goes, the
+  // parent's DOWN notice stays, and the id can be neither spawned nor greeted again.
+  run forgetSubtreeTest =
+    init.then(spawn("r", "a")).then(hello("a")).then(spawn("a", "c")).then(hello("c"))
+      .then(kill("r", "a")).then(processEnds("a")).then(procExitReported("a"))
+      .then(all { assert(status(s, "a") == Down and status(s, "c") == Killing), s' = s })
+      .then(all { assert(not(canForget(s, "r", "a"))), s' = s })
+      .then(killingExpire("c")).then(forget("r", "a"))
+      .then(all { assert(s.forgotten == Set("a", "c") and s.mailbox.get("r").length() == 1 and all_invariants), s' = s })
+      .then(all { assert(not(canSpawn(s, "r", "a")) and not(canHello(s, "a"))), s' = s })
 }

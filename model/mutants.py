@@ -31,18 +31,20 @@ MUTANTS = [
       ("val hidden = st.persisted.get(id).contains(m.uid)", "val hidden = false")], None),
     ("no-context-dedupe: pi keeps an injection that reclaim also redelivered; the model sees it twice (N1)",
      "val hidden = st.persisted.get(id).contains(m.uid)", "val hidden = false"),
+    ("forget while a descendant is still ending: an active agent loses its parent's record",
+     "status(st, x) == Down or status(st, x) == Unborn or status(st, x) == Gone),", "true),"),
+    ("forget an agent that has not ended",
+     "    status(st, t) == Down,\n    AGENTS.filter", "    status(st, t) != Unborn and status(st, t) != Gone,\n    AGENTS.filter"),
+    ("a forgotten id is spawned again",
+     "    status(st, c) == Unborn,\n", "    (status(st, c) == Unborn or status(st, c) == Gone),\n"),
+    ("mail to a forgotten agent is still queued",
+     "x != Down and x != Unborn and x != Gone", "x != Down and x != Unborn"),
+    ("forget keeps the forgotten agent's mailbox",
+     "mailbox: s.mailbox.keys().mapBy(x => if (gone.contains(x)) List() else s.mailbox.get(x)),\n      leases", "leases"),
 ]
 
-# model/pi_actors_calls.qnt: calls, answers, identity.
-CALLS_MUTANTS = [
-    # What src/tree.ts did before this model existed: only an answer removed the question.
-    ("question stays listed after a timeout or after its asker ended",
-     [("    humanQ: st.humanQ.exclude(Set(c.ref)),\n", ""),
-      ("      humanQ: st2.humanQ.exclude(mine.map(c => c.ref)),\n", "")], None),
-    ("any agent may reply to a call",
-     "if (c.target == id) s' = { ...resolve(s, c, \"answer\")", "if (true) s' = { ...resolve(s, c, \"answer\")"),
-    ("any agent may answer for the human",
-     "if (id == ROOT or id == c.caller) s' = { ...resolve(s, c, \"answer\")", "if (true) s' = { ...resolve(s, c, \"answer\")"),
+# model/pi_actors_identity.qnt: which process may act as which agent.
+IDENTITY_MUTANTS = [
     ("no session rebind on a same-process switch: --continue locked out (N4)",
      "rootSession: if (a == ROOT and reloadOrFirst) p.session else s.rootSession,", "rootSession: s.rootSession,"),
     ("root takeover while the recorded process still lives",
@@ -57,7 +59,7 @@ here = os.path.dirname(__file__) or "."
 survivors = 0
 for model, mutants, samples in [
     ("pi_actors.qnt", MUTANTS, os.environ.get("SAMPLES", "20000")),
-    ("pi_actors_calls.qnt", CALLS_MUTANTS, os.environ.get("CALLS_SAMPLES", "5000")),
+    ("pi_actors_identity.qnt", IDENTITY_MUTANTS, os.environ.get("IDENTITY_SAMPLES", "5000")),
 ]:
     src = open(os.path.join(here, model)).read()
     for name, old, new in mutants:

@@ -61,15 +61,9 @@ export interface Agent {
 	pendingReason?: string;
 	exitResult?: { result: string; truncated: boolean; error: boolean };
 	timeoutAt?: number;
-	/** Exempt obligations held for this agent as a receiver (calls it made, children it spawned) plus queued exempt messages. */
+	/** DOWN obligations held for this agent (children it spawned) plus its queued DOWN notices. */
 	reserve: number;
 	reason?: string;
-}
-
-export interface PendingCall {
-	caller: string;
-	target: string;
-	deadline: number;
 }
 
 export interface TreeState {
@@ -80,18 +74,20 @@ export interface TreeState {
 	leases: Record<string, Record<string, string>>;
 	/** Per sender incarnation ("id:inc"): last applied seq and cached responses. */
 	seq: Record<string, { last: number; cache: Record<number, Response> }>;
-	calls: Record<string, PendingCall>;
 	brokerMsgs: number;
+	/** Ids removed by `forget`: never reused, so a lingering process can never claim a new agent's id. */
+	forgotten: string[];
 }
 
 export type Event =
 	| { type: "hello"; now: number; id: string; inc: number; pid: number; sessionId?: string; sessionFile?: string; ownsPid: boolean; recordedPidAlive?: boolean }
 	| { type: "disconnect"; now: number; id: string; conn: number }
 	| { type: "spawn"; now: number; from: string; seq: number; req: SpawnRequest; resumeProcGone?: boolean }
-	| { type: "send"; now: number; from: string; seq: number; to: string; kind: Exclude<MessageKind, "down">; body: string; tag?: string; ref?: string; urgent?: boolean; timeoutS?: number }
-	| { type: "answer"; now: number; from: string; seq: number; ref: string; body: string }
+	| { type: "send"; now: number; from: string; seq: number; to: string; kind: Exclude<MessageKind, "down">; body: string; tag?: string; ref?: string; urgent?: boolean }
 	| { type: "exit"; now: number; from: string; seq: number; result: string; truncated: boolean; error?: boolean }
 	| { type: "kill"; now: number; from: string; seq: number; target: string }
+	/** Remove an ended agent and its ended subtree from the tree (the panel's "clear"). */
+	| { type: "forget"; now: number; from: string; seq: number; target: string }
 	| { type: "fetch"; id: string; fetchId: string; kind?: MessageKind; from?: string; tag?: string; ref?: string; all?: boolean }
 	| { type: "ack"; id: string; msgId: string }
 	| { type: "release"; id: string; msgId: string }
@@ -124,12 +120,11 @@ export interface Result {
 	effects: Effect[];
 }
 
-export const HUMAN = "human";
 export const ROOT = "root";
 
 const ACTIVE: ReadonlySet<Status> = new Set(["starting", "live", "disconnected"]);
 const isActive = (a: Agent | undefined) => !!a && ACTIVE.has(a.status);
-const isExempt = (k: MessageKind) => k === "down" || k === "reply";
+const isExempt = (k: MessageKind) => k === "down";
 
 export function initial(treeId: string, limits: Limits = DEFAULT_LIMITS, now = 0): TreeState {
 	const root: Agent = {
@@ -137,7 +132,7 @@ export function initial(treeId: string, limits: Limits = DEFAULT_LIMITS, now = 0
 		procStarted: true, procGone: false, limits: { ...limits }, spawns: 0, resumes: 0, reserve: 0,
 		deadline: now + TIMING.rootGraceMs,
 	};
-	return { treeId, agents: { [ROOT]: root }, mailbox: { [ROOT]: [] }, leases: { [ROOT]: {} }, seq: {}, calls: {}, brokerMsgs: 0 };
+	return { treeId, agents: { [ROOT]: root }, mailbox: { [ROOT]: [] }, leases: { [ROOT]: {} }, seq: {}, brokerMsgs: 0, forgotten: [] };
 }
 
 /** Structural copy so `apply` never mutates its input (the log replays from the same values). */
@@ -156,6 +151,7 @@ export const UNSYNCED_EVENTS: ReadonlySet<Event["type"]> = new Set(["fetch", "re
 
 export function apply(input: TreeState, ev: Event): Result {
 	const st = clone(input);
+	st.forgotten ??= []; // a snapshot written before `forget` existed
 	const fx: Effect[] = [];
 	switch (ev.type) {
 		case "hello":
@@ -168,9 +164,9 @@ export function apply(input: TreeState, ev: Event): Result {
 		}
 		case "spawn":
 		case "send":
-		case "answer":
 		case "exit":
 		case "kill":
+		case "forget":
 			sequenced(st, ev, fx);
 			break;
 		case "fetch":
@@ -288,7 +284,7 @@ const grace = (a: Agent) => (a.id === ROOT ? TIMING.rootGraceMs : TIMING.childGr
 
 // ---------------------------------------------------------------- sequenced frames (idempotent)
 
-type SeqEvent = Extract<Event, { type: "spawn" | "send" | "answer" | "exit" | "kill" }>;
+type SeqEvent = Extract<Event, { type: "spawn" | "send" | "exit" | "kill" | "forget" }>;
 
 function sequenced(st: TreeState, ev: SeqEvent, fx: Effect[]) {
 	const sender = st.agents[ev.from];
@@ -320,12 +316,12 @@ function handle(st: TreeState, ev: SeqEvent, fx: Effect[]): Response {
 			return spawn(st, sender, ev, fx);
 		case "send":
 			return send(st, sender, ev, fx);
-		case "answer":
-			return answer(st, sender, ev, fx);
 		case "exit":
 			return exit(st, sender, ev, fx);
 		case "kill":
 			return kill(st, sender, ev, fx);
+		case "forget":
+			return forget(st, sender, ev);
 	}
 }
 
@@ -396,8 +392,9 @@ function spawn(st: TreeState, parent: Agent, ev: Extract<Event, { type: "spawn" 
 
 const sanitize = (s: string) => s.replace(/[^A-Za-z0-9_-]/g, "-").slice(0, 32) || "a";
 function uniqueId(st: TreeState, base: string): string {
-	if (!st.agents[base] && base !== HUMAN && base !== ROOT) return base;
-	for (let n = 2; ; n++) if (!st.agents[`${base}-${n}`]) return `${base}-${n}`;
+	const taken = (id: string) => !!st.agents[id] || id === ROOT || st.forgotten.includes(id);
+	if (!taken(base)) return base;
+	for (let n = 2; ; n++) if (!taken(`${base}-${n}`)) return `${base}-${n}`;
 }
 
 // ---------------------------------------------------------------- messages
@@ -416,71 +413,25 @@ function enqueue(st: TreeState, m: Message): void {
 
 function send(st: TreeState, sender: Agent, ev: Extract<Event, { type: "send" }>, fx: Effect[]): Response {
 	if (byteLength(ev.body) > LIMITS.frameBytes) return fail("too_large");
+	if (ev.kind !== "mail") return fail("bad_request", "only mail can be sent");
 	const msgId = `${sender.id}:${sender.inc}:${ev.seq}`;
-	if (ev.kind === "reply") {
-		const call = ev.ref ? st.calls[ev.ref] : undefined;
-		if (!call) return fail("stale_ref");
-		if (call.target !== sender.id) return fail("not_authorized");
-		deliverReply(st, ev.ref!, { id: msgId, from: sender.id, to: call.caller, kind: "reply", body: ev.body, ref: ev.ref }, fx);
-		return { ok: true, type: "accepted", msgId };
-	}
 	if (ev.to === sender.id) return fail("bad_request", "cannot send to self");
 	const target = st.agents[ev.to];
-	const toHuman = ev.to === HUMAN;
-	if (!toHuman && !target) return fail("unknown_target");
-	if (toHuman && ev.kind !== "call") return fail("bad_request", "human accepts call only");
-	if (target && (target.status === "down" || target.status === "killing" || target.status === "exiting")) {
+	if (!target) return fail("unknown_target");
+	if (target.status === "down" || target.status === "killing" || target.status === "exiting") {
 		return fail("target_down", target.reason ?? target.status);
 	}
 	const box = mailCounts(st, ev.to);
 	if (box.count >= LIMITS.mailboxCount || box.bytes + byteLength(ev.body) > LIMITS.mailboxBytes) return fail("mailbox_full");
-	if (ev.kind === "call") {
-		if (sender.reserve >= LIMITS.reserve) return fail("reply_reserve_full");
-		sender.reserve += 1;
-		st.calls[msgId] = { caller: sender.id, target: ev.to, deadline: ev.now + (ev.timeoutS ?? 600) * 1000 };
-	}
-	enqueue(st, { id: msgId, from: sender.id, to: ev.to, kind: ev.kind, body: ev.body, tag: ev.tag, ref: ev.kind === "call" ? msgId : ev.ref, urgent: ev.urgent });
-	if (!toHuman) fx.push({ type: "notify", id: ev.to, urgent: !!ev.urgent });
-	else fx.push({ type: "notify", id: ROOT, urgent: true });
-	return { ok: true, type: "accepted", msgId };
-}
-
-/**
- * A call ends (any outcome, or its caller ended). A question to the human leaves the human's
- * list with it: the list shows exactly what can still be answered (pi_actors_calls.qnt).
- */
-function endCall(st: TreeState, ref: string) {
-	if (st.calls[ref]?.target === HUMAN) st.mailbox[HUMAN] = (st.mailbox[HUMAN] ?? []).filter((m) => m.ref !== ref);
-	delete st.calls[ref];
-}
-
-/** A reply (or a broker-made error reply) consumes the caller's held reserve slot. */
-function deliverReply(st: TreeState, ref: string, m: Message, fx: Effect[]) {
-	const call = st.calls[ref];
-	if (!call) return;
-	endCall(st, ref);
-	const caller = st.agents[call.caller];
-	if (!caller || caller.status === "down") {
-		if (caller) caller.reserve = Math.max(0, caller.reserve - 1);
-		return;
-	}
-	enqueue(st, m); // the reserve slot moves from "obligation" to "queued exempt message"
-	fx.push({ type: "notify", id: caller.id, urgent: false });
-}
-
-function answer(st: TreeState, sender: Agent, ev: Extract<Event, { type: "answer" }>, fx: Effect[]): Response {
-	const call = st.calls[ev.ref];
-	if (!call || call.target !== HUMAN) return fail("stale_ref");
-	if (sender.id !== ROOT && sender.id !== call.caller) return fail("not_authorized");
-	const msgId = `${sender.id}:${sender.inc}:${ev.seq}`;
-	deliverReply(st, ev.ref, { id: msgId, from: HUMAN, to: call.caller, kind: "reply", body: ev.body, ref: ev.ref }, fx);
+	enqueue(st, { id: msgId, from: sender.id, to: ev.to, kind: "mail", body: ev.body, tag: ev.tag, ref: ev.ref, urgent: ev.urgent });
+	fx.push({ type: "notify", id: ev.to, urgent: !!ev.urgent });
 	return { ok: true, type: "accepted", msgId };
 }
 
 function matches(m: Message, f: Extract<Event, { type: "fetch" }>): boolean {
-	if (f.all) return true; // push delivery takes everything, replies included
-	if (f.ref !== undefined) return m.ref === f.ref && m.kind === "reply";
-	if (f.kind !== undefined ? m.kind !== f.kind : m.kind === "reply") return false;
+	if (f.all) return true; // push delivery takes everything
+	if (f.ref !== undefined && m.ref !== f.ref) return false;
+	if (f.kind !== undefined && m.kind !== f.kind) return false;
 	if (f.from !== undefined && m.from !== f.from) return false;
 	if (f.tag !== undefined && m.tag !== f.tag) return false;
 	return true;
@@ -488,12 +439,11 @@ function matches(m: Message, f: Extract<Event, { type: "fetch" }>): boolean {
 
 function fetch(st: TreeState, ev: Extract<Event, { type: "fetch" }>, fx: Effect[]) {
 	const a = st.agents[ev.id];
-	const box = ev.id === HUMAN ? st.mailbox[HUMAN] ?? [] : st.mailbox[ev.id] ?? [];
+	const box = st.mailbox[ev.id] ?? [];
 	const leases = (st.leases[ev.id] ??= {});
-	const reader = ev.id === HUMAN ? st.agents[ROOT] : a;
-	if (!reader?.connected) return fx.push({ type: "fetched", to: ev.id, fetchId: ev.fetchId, message: null });
+	if (!a?.connected) return fx.push({ type: "fetched", to: ev.id, fetchId: ev.fetchId, message: null });
 	const m = box.find((x) => !leases[x.id] && matches(x, ev)) ?? null;
-	if (m && ev.id !== HUMAN) leases[m.id] = ev.fetchId;
+	if (m) leases[m.id] = ev.fetchId;
 	fx.push({ type: "fetched", to: ev.id, fetchId: ev.fetchId, message: m });
 }
 
@@ -530,6 +480,36 @@ function kill(st: TreeState, sender: Agent, ev: Extract<Event, { type: "kill" }>
 	return { ok: true, type: "done" };
 }
 
+function descendants(st: TreeState, id: string): Agent[] {
+	const out: Agent[] = [];
+	for (const a of Object.values(st.agents)) if (a.parent === id) out.push(a, ...descendants(st, a.id));
+	return out;
+}
+
+/**
+ * Only a whole ended subtree is forgotten, by its parent or once its parent has ended too:
+ * nothing in it can still send, owe a DOWN or be resumed. Its ids are retired, never reused (a
+ * process the kill did not confirm gone may live).
+ */
+function forget(st: TreeState, sender: Agent, ev: Extract<Event, { type: "forget" }>): Response {
+	const t = st.agents[ev.target];
+	if (!t) return fail("unknown_target");
+	if (!ancestors(st, t).slice(1).some((x) => x.id === sender.id)) return fail("not_authorized");
+	const gone = [t, ...descendants(st, t.id)];
+	if (gone.some((a) => a.status !== "down")) return fail("bad_request", "still running");
+	// A running parent may still resume or read about its child: only it may clear that child.
+	const parent = t.parent ? st.agents[t.parent] : undefined;
+	if (parent && parent.id !== sender.id && parent.status !== "down") return fail("bad_request", "its parent still runs");
+	for (const a of gone) {
+		delete st.agents[a.id];
+		delete st.mailbox[a.id];
+		delete st.leases[a.id];
+		for (const key of Object.keys(st.seq)) if (key.slice(0, key.lastIndexOf(":")) === a.id) delete st.seq[key];
+		st.forgotten.push(a.id);
+	}
+	return { ok: true, type: "done" };
+}
+
 function beginKill(a: Agent, now: number, reason: string, fx: Effect[]) {
 	if (!isActive(a)) return;
 	a.status = "killing";
@@ -554,7 +534,7 @@ function procExit(st: TreeState, ev: Extract<Event, { type: "procExit" }>, fx: E
 	goDown(st, a, ev.now, reason, fx);
 }
 
-/** Entering `down`: exactly one DOWN, calls resolved, the link rule applied (INV-1, INV-2). */
+/** Entering `down`: exactly one DOWN and the link rule applied (INV-1, INV-2). */
 function goDown(st: TreeState, a: Agent, now: number, reason: string, fx: Effect[]) {
 	if (a.status === "down") return;
 	a.status = "down";
@@ -572,18 +552,6 @@ function goDown(st: TreeState, a: Agent, now: number, reason: string, fx: Effect
 			body: JSON.stringify({ id: a.id, inc: a.inc, reason, result: r?.result ?? null, truncated: r?.truncated ?? false }),
 		});
 		fx.push({ type: "notify", id: parent.id, urgent: false });
-	}
-	// Calls this agent was asked: fail them for their callers.
-	for (const [ref, c] of Object.entries(st.calls)) {
-		if (c.target === a.id) deliverReply(st, ref, { id: brokerId(st), from: "broker", to: c.caller, kind: "reply", body: JSON.stringify({ error: `target_down:${reason}` }), ref }, fx);
-	}
-	// Calls this agent made: nobody will read the reply.
-	for (const [ref, c] of Object.entries(st.calls)) if (c.caller === a.id) endCall(st, ref);
-	// Calls the dead root made to the human, and human calls once the root is gone.
-	if (a.id === ROOT) {
-		for (const [ref, c] of Object.entries(st.calls)) {
-			if (c.target === HUMAN) deliverReply(st, ref, { id: brokerId(st), from: "broker", to: c.caller, kind: "reply", body: JSON.stringify({ error: "target_down:root_down" }), ref }, fx);
-		}
 	}
 	for (const c of Object.values(st.agents)) {
 		if (c.parent === a.id && isActive(c)) beginKill(c, now, "killed:parent_down", fx);
@@ -628,9 +596,6 @@ function tick(st: TreeState, now: number, fx: Effect[]) {
 				break;
 		}
 	}
-	for (const [ref, c] of Object.entries(st.calls)) {
-		if (now >= c.deadline) deliverReply(st, ref, { id: brokerId(st), from: "broker", to: c.caller, kind: "reply", body: JSON.stringify({ error: "timeout" }), ref }, fx);
-	}
 }
 
 /** The machine slept: active-time deadlines move by the slept duration (design "Time and sleep"). */
@@ -641,7 +606,6 @@ function slept(st: TreeState, ms: number) {
 		if (a.timeoutAt !== undefined) a.timeoutAt += ms;
 		if (a.killStart !== undefined) a.killStart += ms;
 	}
-	for (const c of Object.values(st.calls)) c.deadline += ms;
 }
 
 /** Rebuild state from the event log; effects are discarded (design D2: replay never re-executes). */
@@ -665,7 +629,6 @@ export function nextDeadline(st: TreeState): number | undefined {
 			consider(a.killStep === 0 ? a.killStart + TIMING.killTermMs : a.killStep === 1 ? a.killStart + TIMING.killKillMs : undefined);
 		}
 	}
-	for (const c of Object.values(st.calls)) consider(c.deadline);
 	return t;
 }
 
