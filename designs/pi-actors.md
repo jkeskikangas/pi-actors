@@ -400,6 +400,7 @@ Why: the parent briefed the child and usually holds the answer; the user hears o
   - `actors:waiting {waiting, children}` holds the goal loop while direct children owe a report.
 - **herdr:**
   - Placement polls a single `herdr pane list` every 5 s, and treats a pane that vanished as `proc_exit(killed:pane_closed)`.
+  - The broker closes a pane child's pane when the child ends. When the broker itself is gone for good, nobody would: a herdr pane is a shell that outlives pi. So the broker passes the pane id as `--actors-pane=<id>` (never `HERDR_PANE_ID`, which a headless child inherits from the root), and a pane child that loses its tree (`lost`, `rejected`) closes that pane as it exits [2026-10-09]. A superseded child does not, since the new holder may run in the same pane. A tmux child needs nothing: pi is the pane's command.
   - Placement closes the panes it created when their agent goes down.
   - Pane children receive their identity as flags passed after `--` to `herdr agent start`.
   - The panel's `f` runs `herdr agent focus <name>` (or `tmux select-window`/`select-pane`) for a running pane agent and reports a failure; for an ended or headless agent it says why there is nothing to focus. Keys are matched with `matchesKey`, because under the kitty keyboard protocol a plain letter arrives as an escape sequence (v5; `f` did nothing before).

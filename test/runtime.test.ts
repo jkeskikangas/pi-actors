@@ -4,7 +4,7 @@ import { chmodSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync }
 import { join } from "node:path";
 import { after, test } from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { detectMux, ensurePrivateDir } from "../src/runtime.ts";
+import { closeOwnPaneOnExit, detectMux, ensurePrivateDir } from "../src/runtime.ts";
 
 const tmp = mkdtempSync("/tmp/pia-rt-");
 after(() => rmSync(tmp, { recursive: true, force: true }));
@@ -143,4 +143,17 @@ test("a broker that lost its lock writes nothing more to the log, not even befor
 		process.env.PI_ACTORS_SOCKET_DIR = saved.s;
 		rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
 	}
+});
+
+test("a pane child that lost its tree closes exactly its own pane on exit, and only with a pane id", () => {
+	const calls: string[][] = [];
+	const before = process.listeners("exit").length;
+	closeOwnPaneOnExit(undefined, (bin, args) => calls.push([bin, ...args]));
+	closeOwnPaneOnExit("", (bin, args) => calls.push([bin, ...args]));
+	assert.equal(process.listeners("exit").length, before, "a headless child (no pane id) registers nothing");
+	closeOwnPaneOnExit("w1:p9", (bin, args) => calls.push([bin, ...args]));
+	const hook = process.listeners("exit").at(-1) as () => void;
+	process.removeListener("exit", hook);
+	hook();
+	assert.deepEqual(calls, [[process.env.HERDR_BIN ?? "herdr", "pane", "close", "w1:p9"]]);
 });
