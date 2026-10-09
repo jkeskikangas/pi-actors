@@ -1,10 +1,10 @@
 // Scripted Tree scenarios: the Quint `run` tests (model/pi_actors.qnt) plus unit cases for the
-// parts the model does not cover (identity, calls, limits, timers, idempotency).
+// parts the model does not cover (identity, limits, timers, idempotency, forget).
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { DEFAULT_LIMITS, TIMING } from "../src/protocol.ts";
-import { apply, type Effect, type Event, finished, HUMAN, initial, nextDeadline, recover, replay, ROOT, type SpawnRequest, type TreeState } from "../src/tree.ts";
+import { apply, type Effect, type Event, finished, initial, nextDeadline, recover, replay, ROOT, type SpawnRequest, type TreeState } from "../src/tree.ts";
 
 /** A tiny driver: applies events, remembers the log, and hands out sender seq numbers. */
 function driver(limits = DEFAULT_LIMITS) {
@@ -154,79 +154,55 @@ test("identity: a down agent and a stale incarnation are rejected", () => {
 	assert.deepEqual(d.hello("a", 200)[0], { type: "reject", to: "a", reason: "down" });
 });
 
-// ---- calls, human ---------------------------------------------------------------------
+// ---- mail and reply_to ---------------------------------------------------------------
 
-test("call: only the target may reply, a second reply is stale, the reply reaches the caller", () => {
+test("send: only mail; reply_to travels as the message's ref; nothing reaches an ended agent", () => {
 	const d = withChild();
-	d.spawn(ROOT, { name: "b" });
-	d.start("b", 201);
-	const r = d.respond(d.run({ type: "send", now: 0, from: "a", seq: d.nextSeq("a"), to: ROOT, kind: "call", body: "q?" })).response;
-	assert.equal(r.ok, true);
-	const ref = (r as { msgId: string }).msgId;
-	const reply = (from: string) => d.respond(d.run({ type: "send", now: 0, from, seq: d.nextSeq(from), to: "", kind: "reply", body: "ans", ref })).response;
-	assert.deepEqual(reply("b"), { ok: false, error: "not_authorized", detail: undefined });
-	assert.equal(reply(ROOT).ok, true);
-	assert.deepEqual(reply(ROOT), { ok: false, error: "stale_ref", detail: undefined });
+	assert.deepEqual(d.respond(d.run({ type: "send", now: 0, from: "a", seq: d.nextSeq("a"), to: ROOT, kind: "call" as never, body: "q?" })).response, { ok: false, error: "bad_request", detail: "only mail can be sent" });
+	assert.deepEqual(d.send("a", "human"), { ok: false, error: "unknown_target", detail: undefined }, "there is no human route");
+	const q = d.send("a", ROOT, "REST or GraphQL?") as { msgId: string };
+	assert.equal(d.send(ROOT, "a", "REST", { ref: q.msgId }).ok, true);
 	assert.equal(d.fetch("a")?.tag, "task");
-	assert.equal(d.fetch("a", { kind: "mail" }), null, "replies are never returned to an unfiltered or mail receive");
-	assert.equal(d.fetch("a", { ref })?.body, "ans");
+	assert.equal(d.fetch("a")?.ref, q.msgId);
+	d.run({ type: "procExit", now: 0, id: "a", inc: 1, code: 0, signal: null });
+	assert.equal(d.send(ROOT, "a").ok, false);
 });
 
-test("call: target DOWN and deadline both resolve the call with an error reply", () => {
-	const d = withChild();
-	const call = (to: string, timeoutS?: number) => (d.respond(d.run({ type: "send", now: 0, from: ROOT, seq: d.nextSeq(ROOT), to, kind: "call", body: "q", timeoutS })).response as { msgId: string }).msgId;
-	const r1 = call("a");
-	d.run({ type: "procExit", now: 0, id: "a", inc: 1, code: 1, signal: null });
-	assert.match(d.fetch(ROOT, { ref: r1 })!.body, /target_down/);
-	const d2 = withChild();
-	const r2 = (d2.respond(d2.run({ type: "send", now: 0, from: ROOT, seq: d2.nextSeq(ROOT), to: "a", kind: "call", body: "q", timeoutS: 5 })).response as { msgId: string }).msgId;
-	d2.advance(6000);
-	d2.tick();
-	assert.match(d2.fetch(ROOT, { ref: r2 })!.body, /timeout/);
-});
+// ---- forget ---------------------------------------------------------------------------
 
-test("human: only the root or the asker may answer; root down fails pending human calls", () => {
+const forget = (d: ReturnType<typeof driver>, from: string, target: string) => d.respond(d.run({ type: "forget", now: 0, from, seq: d.nextSeq(from), target })).response;
+
+test("forget: only a whole ended subtree, only by an ancestor; it leaves no trace but the retired id", () => {
 	const d = withChild();
+	d.spawn("a", { name: "k" });
+	d.start("a.k", 300);
 	d.spawn(ROOT, { name: "b" });
 	d.start("b", 201);
-	const ref = (d.respond(d.run({ type: "send", now: 0, from: "a", seq: d.nextSeq("a"), to: HUMAN, kind: "call", body: "approve?" })).response as { msgId: string }).msgId;
-	assert.equal(d.fetch(HUMAN)?.ref, ref, "the root lists the human inbox");
-	const answer = (from: string) => d.respond(d.run({ type: "answer", now: 0, from, seq: d.nextSeq(from), ref, body: "yes" })).response;
-	assert.equal(answer("b").ok, false);
-	assert.equal(answer("a").ok, true, "answered in the asker's own pane");
-	assert.equal(d.fetch("a", { ref })?.body, "yes");
-	assert.equal(answer(ROOT).ok, false, "first answer wins");
+	assert.deepEqual(forget(d, ROOT, "a"), { ok: false, error: "bad_request", detail: "still running" });
+	d.run({ type: "procExit", now: 0, id: "a", inc: 1, code: 0, signal: null }); // a.k is killed with it
+	assert.deepEqual(forget(d, ROOT, "a"), { ok: false, error: "bad_request", detail: "still running" }, "a.k is still being stopped");
+	d.run({ type: "procExit", now: 0, id: "a.k", inc: 1, code: null, signal: "SIGTERM" });
+	assert.deepEqual(forget(d, "b", "a"), { ok: false, error: "not_authorized", detail: undefined }, "a sibling may not");
+	assert.deepEqual(forget(d, ROOT, "a"), { ok: true, type: "done" });
+	for (const id of ["a", "a.k"]) {
+		assert.equal(d.st.agents[id], undefined);
+		assert.equal(d.st.mailbox[id], undefined);
+		assert.equal(Object.keys(d.st.seq).some((k) => k.startsWith(`${id}:`)), false);
+	}
+	assert.deepEqual(forget(d, ROOT, "a"), { ok: false, error: "unknown_target", detail: undefined });
+	assert.deepEqual(d.hello("a", 200)[0], { type: "reject", to: "a", reason: "unknown" }, "a lingering process cannot come back");
+	assert.equal((d.spawn(ROOT, { name: "a" }) as { id: string }).id, "a-2", "a retired id is never reused");
+	assert.equal(finished(d.st), false);
 });
 
-// Found by model/pi_actors_calls.qnt (humanListIsLive): the human's list shows exactly the
-// questions that can still be answered.
-test("human: a question leaves the human's list on every outcome, not only on an answer", () => {
-	const ask = (d: ReturnType<typeof withChild>, timeoutS?: number) =>
-		(d.respond(d.run({ type: "send", now: 0, from: "a", seq: d.nextSeq("a"), to: HUMAN, kind: "call", body: "ok?", timeoutS })).response as { msgId: string }).msgId;
-	const listed = (d: ReturnType<typeof withChild>) => (d.st.mailbox[HUMAN] ?? []).map((m) => m.ref);
-
-	const timedOut = withChild();
-	const r1 = ask(timedOut, 5);
-	assert.deepEqual(listed(timedOut), [r1]);
-	timedOut.advance(6000);
-	timedOut.tick();
-	assert.match(timedOut.fetch("a", { ref: r1 })!.body, /timeout/);
-	assert.deepEqual(listed(timedOut), [], "a timed-out question is withdrawn");
-
-	const askerEnded = withChild();
-	ask(askerEnded);
-	askerEnded.run({ type: "procExit", now: 0, id: "a", inc: 1, code: 1, signal: null });
-	assert.deepEqual(listed(askerEnded), [], "the asker ended: its question is withdrawn");
-
-	const rootEnded = withChild();
-	ask(rootEnded);
-	rootEnded.run({ type: "disconnect", now: 0, id: ROOT, conn: rootEnded.st.agents[ROOT].conn });
-	rootEnded.advance(TIMING.rootGraceMs + 1000);
-	rootEnded.tick(); // killing
-	rootEnded.advance(16_000);
-	rootEnded.tick();
-	assert.equal(rootEnded.st.agents[ROOT].status, "down");
-	assert.deepEqual(listed(rootEnded), [], "the root ended: nobody can answer");
+test("forget is replayable and survives a snapshot written before it existed", () => {
+	const d = withChild();
+	d.run({ type: "procExit", now: 0, id: "a", inc: 1, code: 0, signal: null });
+	forget(d, ROOT, "a");
+	assert.deepEqual(replay(initial("t", DEFAULT_LIMITS, 0), d.log), d.st);
+	const old = structuredClone(d.st) as Partial<TreeState>;
+	delete old.forgotten;
+	assert.equal(apply(old as TreeState, { type: "tick", now: 0 }).state.forgotten.length, 0);
 });
 
 // ---- limits, mailbox ------------------------------------------------------------------

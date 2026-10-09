@@ -1,6 +1,6 @@
 // Wire protocol: shared types, limits and NDJSON framing. Pure: imports nothing (conformance rule).
 
-export const PROTO = 1;
+export const PROTO = 2;
 
 export const LIMITS = {
 	/** Largest encoded frame, and the largest message body or exit result. */
@@ -8,7 +8,7 @@ export const LIMITS = {
 	/** Ordinary mail per agent. */
 	mailboxCount: 200,
 	mailboxBytes: 2 * 1024 * 1024,
-	/** Exempt kinds (DOWN, reply) per agent: obligations held plus queued exempt messages. */
+	/** DOWN notices per agent: obligations held (children spawned) plus queued notices. */
 	reserve: 400,
 	/** Responses cached per sender incarnation for idempotent retransmits. */
 	idempotencyWindow: 256,
@@ -35,7 +35,7 @@ export interface Limits {
 	maxSpawns: number;
 }
 
-export type MessageKind = "mail" | "call" | "reply" | "down";
+export type MessageKind = "mail" | "down";
 export type Placement = "headless" | "pane";
 export type Context = "fresh" | "fork";
 
@@ -46,7 +46,7 @@ export interface Message {
 	kind: MessageKind;
 	body: string;
 	tag?: string;
-	/** For `call`: its own id (the ref to answer). For `reply`: the call it answers. */
+	/** The message this one answers (`send{reply_to}`). */
 	ref?: string;
 	urgent?: boolean;
 }
@@ -55,12 +55,10 @@ export type ErrorCode =
 	| "unknown_target"
 	| "target_down"
 	| "mailbox_full"
-	| "reply_reserve_full"
 	| "limit_depth"
 	| "budget_exhausted"
 	| "not_authorized"
 	| "not_live"
-	| "stale_ref"
 	| "seq_gap"
 	| "too_large"
 	| "bad_request";

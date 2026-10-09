@@ -1,10 +1,10 @@
-# pi-actors — Design (v4)
+# pi-actors — Design (v5)
 
-**Spec:** `specs/pi-actors.md` · **Frame:** default 3-layer split (domain / presentation / shell) plus the conventions of `~/work/pi-verified-goal`: TypeScript under `src/` with erasable syntax only, `node --test`, pi and `typebox` as `*` peers, extension tests through a fake pi host. · **Scope note:** one package on one machine (NFR-2). · **Revision:** v3 addresses re-review findings S1–S5 and the round-2 P2/P3 items; v2 addressed R1–R21. The runtime claims were checked by `spike/` against real pi 1.0.3; results are under "Verification".
+**Spec:** `specs/pi-actors.md` · **Frame:** default 3-layer split (domain / presentation / shell) plus the conventions of `~/work/pi-verified-goal`: TypeScript under `src/` with erasable syntax only, `node --test`, pi and `typebox` as `*` peers, extension tests through a fake pi host. · **Scope note:** one package on one machine (NFR-2). · **Revision:** v5 (2026-10-09) removes the human route (questions travel up the tree to the root's model), adds `forget` and the agents panel, quiets deliveries, and makes `/new` stop the tree; v3 addresses re-review findings S1–S5 and the round-2 P2/P3 items; v2 addressed R1–R21. The runtime claims were checked by `spike/` against real pi 1.0.3; results are under "Verification".
 
 ## Context and goals
 
-pi agents spawn fresh or forked children on any model and exchange messages reliably (UC-1..9). The design copies the Erlang/OTP split:
+pi agents spawn fresh or forked children on any model and exchange messages reliably (UC-1..10). The design copies the Erlang/OTP split:
 
 - isolated processes with one mailbox each;
 - one broker per agent tree, owning the registry, mailboxes, links and limits behind one Unix socket;
@@ -17,7 +17,7 @@ The reducer's actions mirror a Quint model (`model/pi_actors.qnt`), and the mode
 ## Non-goals
 
 - **Workflow engine or fan-out helpers.** Agents compose these from the primitives.
-- **Injecting message content mid-turn.** Content reaches the model only as a `receive` or `call` result.
+- **Presenting questions to the user.** The root's model decides how to ask; pi-actors only carries messages between agents.
 - **Retries or model fallback inside agents.** The parent decides from the exit reason.
 - **Cross-machine transport, and non-pi agents.** The protocol is versioned, so either stays a local addition later.
 - **Deduplicating messages the model deliberately sends twice.** Only transport retries are deduplicated (spec INV-3).
@@ -29,22 +29,22 @@ The reducer's actions mirror a Quint model (`model/pi_actors.qnt`), and the mode
 | Component    | Responsibility                                                                                                                                                                                                                                                                                                                              | Layer        | Depends on                | Interface                                                                         | Files                                                |
 | ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------ | ------------------------- | --------------------------------------------------------------------------------- | ---------------------------------------------------- |
 | Protocol     | Frame types, `PROTO`, size limits, hand-written validators (no typebox), NDJSON codec                                                                                                                                                                                                                                                       | Domain       | —                         | `Frame`, `validate`, `encode`, `decode`, `LIMITS`                                 | `src/protocol.ts`                                    |
-| Tree         | Pure reducer: agents, incarnations, mailboxes and leases, sender sequence numbers and the idempotency cache, pending calls, limits, usage, exit reasons                                                                                                                                                                                     | Domain       | Protocol                  | `apply(state, event): {state, effects}`; `initial(treeId)`; `recover(state, now)` | `src/tree.ts`                                        |
+| Tree         | Pure reducer: agents, incarnations, mailboxes and leases, sender sequence numbers and the idempotency cache, limits, usage, exit reasons, forgotten ids                                                                                                                                                                                     | Domain       | Protocol                  | `apply(state, event): {state, effects}`; `initial(treeId)`; `recover(state, now)` | `src/tree.ts`                                        |
 | EventLog     | Append-only log with a versioned header; fsync before responding, except lease events (`fetch`, `release`: `UNSYNCED_EVENTS` in `src/tree.ts`), which `recover` clears anyway; open cuts a torn or holed tail (only possible after the last fsync) back to the last good line; replay drops a cut-off final line; size-triggered compaction | Shell        | Protocol                  | `open`, `append`, `replay`, `compact`                                             | `src/broker/log.ts`                                  |
 | BrokerServer | Socket server: binds connections to `(id, inc)`; heartbeats; time and sleep detection; runs `apply`, then performs effects; single-instance lock; writes `status.json`                                                                                                                                                                      | Shell        | Tree, EventLog, Placement | `node <runtime>/broker/main.ts <treeDir> <sock>`                                  | `src/broker/server.ts`, `src/broker/main.ts`         |
 | Keeper       | Per headless child: spawns pi detached in its own process group with no shell; holds stdin open; drains stdout to a 64 KiB ring and auto-cancels extension dialogs; stderr to a capped file; reports `proc_start` and `proc_exit` (kept until acked); carries out `signal`                                                                  | Shell        | Protocol                  | `node <runtime>/keeper/main.ts <spec.json>`                                       | `src/keeper/main.ts`                                 |
 | Placement    | Starts, signals and watches agents; owns the "is this pid the agent's process" check                                                                                                                                                                                                                                                        | Shell        | Protocol                  | `start(spec)`, `signal(id, sig)`, `watch(cb)`, `ownsPid(id, pid)`                 | `src/placement/headless.ts`, `src/placement/pane.ts` |
 | Launcher     | Agent side: runtime snapshot, paths, node binary, starts or attaches to the broker                                                                                                                                                                                                                                                          | Shell        | Protocol                  | `ensureBroker(treeId)`                                                            | `src/client/launcher.ts`                             |
 | Client       | Agent side: identity, hello, sender sequence numbers and retransmit, consumed-ID set, deferred ack                                                                                                                                                                                                                                          | Shell        | Protocol                  | `connect`, `request`, `on`                                                        | `src/client/connection.ts`                           |
-| Tools        | The 7 model-facing tools                                                                                                                                                                                                                                                                                                                    | Presentation | Client                    | Tool contracts                                                                    | `src/client/tools.ts`                                |
-| HumanInbox   | `/inbox`, `/answer`; the herdr blocked signal in a pane, or counted on the root                                                                                                                                                                                                                                                             | Presentation | Client                    | commands                                                                          | `src/client/human.ts`                                |
-| Lifecycle    | Extension wiring: flags, a guard against loading twice, session events, wake on mail, done-nudge, usage reporting, `/actors`                                                                                                                                                                                                                | Shell        | all client parts          | default export                                                                    | `src/index.ts`                                       |
+| Tools        | The 3 model-facing tools (`spawn`, `send`, `stop`)                                                                                                                                                                                                                                                                                          | Presentation | Client                    | Tool contracts                                                                    | `src/index.ts`                                       |
+| Panel        | Pure state machine for the agents panel: running agents, the collapsible ended row, clearing, pane focus, the scrolling transcript (read incrementally from the session file); the collapsed delivery line                                                                                                                                 | Presentation | Client                    | `items`, `press`, `view`, `readTranscript`                                        | `src/client/panel.ts`, `src/client/mailroom.ts`      |
+| Lifecycle    | Extension wiring: flags, a guard against loading twice, session events, wake on mail, usage reporting, the delivery renderer, `/actors`                                                                                                                                                                                                     | Shell        | all client parts          | default export                                                                    | `src/index.ts`                                       |
 
 ```mermaid
 graph TD
   subgraph agent["pi agent process"]
     Lifecycle --> Tools --> Client
-    Lifecycle --> HumanInbox --> Client
+    Lifecycle --> Panel --> Client
     Lifecycle --> Launcher
   end
   Client -- NDJSON unix socket --> BrokerServer
@@ -102,7 +102,7 @@ graph TD
 | `keeper_hello`                            | keeper→broker | `proto, id, inc, keeper_pid`                             | `welcome`                                                                                                                                                                                                                                                           |
 | `bye`                                     | agent→broker  | `reason: reload\|quit`                                   | —                                                                                                                                                                                                                                                                   |
 | `hb`                                      | both          | `usage?`                                                 | `hb`                                                                                                                                                                                                                                                                |
-| `spawn`, `send`, `answer`, `exit`, `kill` | agent→broker  | all carry `seq`; plus the operation's own fields (below) | the response, idempotent per `(sender, inc, seq)`                                                                                                                                                                                                                   |
+| `spawn`, `send`, `exit`, `kill`, `forget` | agent→broker  | all carry `seq`; plus the operation's own fields (below) | the response, idempotent per `(sender, inc, seq)`                                                                                                                                                                                                                   |
 | `fetch`                                   | agent→broker  | `fetch_id, kind?, from?, tag?, ref?`                     | `message{msg_id, from, kind, body, tag?, ref?}` (now leased) · `none`                                                                                                                                                                                               |
 | `ack`                                     | agent→broker  | `msg_id`                                                 | — (consumes the message)                                                                                                                                                                                                                                            |
 | `release`                                 | agent→broker  | `msg_id`                                                 | — (returns a lease)                                                                                                                                                                                                                                                 |
@@ -116,10 +116,12 @@ graph TD
 **Operation fields:**
 
 - `spawn{name?, task, model?, thinking?, context, cwd?, placement, limits?, timeout_s?, resume?}` → `spawned{id, inc}`
-- `send{to, kind: mail|call|reply, body, tag?, ref?, urgent?}` → `accepted{msg_id}`
-- `answer{ref, body}` → `accepted`
+- `send{to, kind: mail, body, tag?, ref?, urgent?}` → `accepted{msg_id}`; `ref` is the message being answered (`reply_to`)
 - `exit{result, truncated}` → `ok`
 - `kill{id, reason?}` → `ok`
+- `forget{target}` → `ok` (v5; see "Forget")
+
+`PROTO` is 2 since v5: the `call` and `reply` kinds and the `answer` op are gone, so a v1 client is refused with `proto_mismatch`. Message kinds are `mail` and `down`.
 
 **Sequence numbers.** Every frame with a `seq` is logged, including rejected ones; the rejection is its logged outcome. Rules:
 
@@ -129,9 +131,9 @@ graph TD
 
 A reload loses the unaccepted frames held in memory. A tool interrupted by the reload reports `interrupted{seq}` to the model, and the model's own retry is a new message (spec INV-3).
 
-**Errors:** `unknown_target`, `target_down`, `mailbox_full`, `reply_reserve_full`, `limit_depth`, `budget_exhausted`, `not_authorized`, `no_session_file`, `herdr_unavailable`, `stale_ref`, `seq_gap`, `too_large`, `proto_mismatch`.
+**Errors:** `unknown_target`, `target_down`, `mailbox_full`, `limit_depth`, `budget_exhausted`, `not_authorized`, `no_session_file`, `herdr_unavailable`, `seq_gap`, `too_large`, `bad_request`, `proto_mismatch`.
 
-**Message IDs:** `"<sender>:<inc>:<seq>"`. Broker-made messages (timeouts, DOWN) are `"broker:<n>"`.
+**Message IDs:** `"<sender>:<inc>:<seq>"`. Broker-made messages (DOWN) are `"broker:<n>"`.
 
 ### Agent status machine (v3)
 
@@ -154,6 +156,7 @@ A reload loses the unaccepted frames held in memory. A tool interrupted by the r
 | non-down                                                          | `timeout_s` passes (active time)                                 | `killing` → `down(timeout)`                        | —                                                                          |
 | non-down                                                          | parent becomes `down`                                            | `killing` with carried reason `killed:parent_down` | link rule                                                                  |
 | `down`                                                            | `spawn{resume}` by the parent                                    | `starting` with `inc + 1`                          | only once Placement confirms the process is gone; at most 3 resumes        |
+| `down`, with every descendant `down`                              | `forget` by a strict ancestor                                    | removed; the id is retired                         | its mailbox, leases and seq entries go too (v5)                            |
 
 - **Exactly one DOWN.** Entering `down` emits exactly one DOWN, `broker:<n>`, carrying `{id, inc, reason, result ≤ 64 KiB (truncation marked), usage}`.
 - **G** is 60 s for a child and 300 s for the root, counted from detection. The kill sequence takes at most 15 s, which gives the spec's G + 15 s.
@@ -161,30 +164,32 @@ A reload loses the unaccepted frames held in memory. A tool interrupted by the r
 ### Time and sleep (v3, operator N4, tester N7)
 
 - BrokerServer samples both the wall clock and the monotonic clock every second. On macOS the monotonic clock pauses during sleep, so `wall_delta − mono_delta > 5 s` means the machine slept for that difference.
-- After a sleep it applies `slept{duration}`, and Tree shifts every *active-time* deadline (`disconnected.until`, `start_deadline`, `timeout_s`, call deadlines, `killing` and `exiting` deadlines) by exactly that duration. Grace is extended by the sleep, not reset, so an agent that is really dead still goes down within G of real activity (fixes the "reset for everyone" issue).
+- After a sleep it applies `slept{duration}`, and Tree shifts every *active-time* deadline (`disconnected.until`, `start_deadline`, `timeout_s`, `killing` and `exiting` deadlines) by exactly that duration. Grace is extended by the sleep, not reset, so an agent that is really dead still goes down within G of real activity (fixes the "reset for everyone" issue).
 - Apart from `slept`, Tree sees time only through the `now` field logged on each event.
 
-### Tool contracts (v4: three tools, push delivery — per user direction)
+### Tool contracts (v4: three tools, push delivery — per user direction; v5: no human route)
 
 Three single-purpose tools. Everything the model needs to *know* arrives by push; tools exist only for things the model *does*. Replaces v3.2's four pull-based tools (`receive`, `exit`, the `expect_reply` flag), and the blocking `ask` considered in between: an answer is just another pushed message.
 
 | Tool    | Params                                                                                          | Result                                                                                      |
 | ------- | ----------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------- |
 | `spawn` | `task, name?, model?, thinking?, fork?: bool, cwd?, pane?: bool, timeout_minutes?, resume?: id` | `{id}` immediately; never blocks. The child's reports arrive later by push                  |
-| `send`  | `to: id \| "parent" \| "human", text, reply_to?, urgent?`                                       | `{msg_id}` once durably accepted. `reply_to` marks the message as an answer to that message |
+| `send`  | `to: id \| "parent", text, reply_to?, urgent?`                                                  | `{msg_id}` once durably accepted. `reply_to` marks the message as an answer to that message |
 | `stop`  | `id`                                                                                            | Descendants only. Returns once the agent is down                                            |
 
 **Pushed into the conversation** (one coalesced entry per delivery, labelled by sender, never as user input):
 
-- messages and answers from other agents and from the human (`reply_to` shown);
+- messages and answers from other agents (`reply_to` shown);
 - a **report** each time a child finishes a run: its final answer (≤ 16 KiB inline; longer answers say where the full text is);
-- DOWN notices (crash, stop, lost) with the reason.
+- DOWN notices with the reason. Since v5 a DOWN the agent caused itself is acked without being shown: `killed` (or `killed:unconfirmed`) for an id it stopped with `stop` or `/actors stop <id>`, and `killed:tree_stopped`. Unexpected ends (`error`, crashes, `timeout`, `lost`, start failures) are still pushed.
+
+**Formatting (v5).** A delivery is the messages alone, one `■` block each (`Task from …`, `Report from …`, `X answered your msg …`, `X ended: …`); there is no `[pi-actors] N updates` header and no "Reply with send{…}" footer. That guidance lives once in the `send` tool's `promptGuidelines`, with the escalation rule: answer a child from your own context if you can, otherwise forward the question to your parent (quoted, naming the asker), or, with no parent, ask the user, then answer with `reply_to`. In the TUI a delivery renders through `registerMessageRenderer` as one dim line (`⇢ report from X · …`) that expands to the full text the model read.
 
 Delivery: idle agent → `sendMessage(..., {triggerTurn: true})`; busy agent → `deliverAs: "followUp"`, or `"steer"` when `urgent`. **Waiting** is ending the turn; pushes wake the agent. **A child's result** is simply its final answer — no `exit` tool, no done-nudge (D10 is superseded). A finished child is idle but alive; `send` continues it; it ends when stopped, when its parent goes down, or when the tree stops.
 
-**Exactness is kept (D3 revised):** every pushed entry carries `details.actors = {id, consumed: [msg_id…]}`. The client leases the messages it fetches, injects them, and acks them once the entry is persisted (checked at `turn_end` and `agent_settled`); the consumed set is rebuilt from session entries on reload, and IDs still being delivered are skipped (the property-tested in-flight dedupe). Internally the protocol is unchanged: a question to the human is a `call` frame (so the human's answer is routed and authorized as before); agent-to-agent messages are `mail` with an optional `ref`.
+**Exactness is kept (D3 revised):** every pushed entry carries `details.actors = {id, consumed: [msg_id…]}`. The client leases the messages it fetches, injects them, and acks them once the entry is persisted (checked at `turn_end` and `agent_settled`); the consumed set is rebuilt from session entries on reload, and IDs still being delivered are skipped (the property-tested in-flight dedupe). All messages are `mail` with an optional `ref` (v5; before, a question to the human was a `call` frame).
 
-**Goal integration:** the extension emits `actors:waiting {waiting: boolean}` on `pi.events` — true while the agent has a child that has not reported since it was last addressed, or an unanswered question to the human. pi-verified-goal does not continue (and does not count a stall) while waiting; the next push wakes the agent.
+**Goal integration:** the extension emits `actors:waiting {waiting, children}` on `pi.events` — `waiting` is true while the agent has a direct child that has not reported since it was last addressed. pi-verified-goal does not continue (and does not count a stall) while waiting; the next push wakes the agent.
 
 ## Spec traceability
 
@@ -192,23 +197,25 @@ Delivery: idle agent → `sendMessage(..., {triggerTurn: true})`; busy agent →
 | -------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
 | UC-1 fresh spawn     | Tree                                                                                                                                                                         | Limits and identity are bypassed                                                                                                                   |
 | UC-2 fork spawn      | Placement                                                                                                                                                                    | Runs `pi --mode rpc --fork <session_file> -e <snap>/index.ts --actors-… --model … --thinking …` in `cwd`; `no_session_file` if the parent has none |
-| UC-3 send/call/reply | Tree                                                                                                                                                                         | No routing, correlation or authorization                                                                                                           |
+| UC-3 send/reply      | Tree                                                                                                                                                                         | No routing, correlation or authorization                                                                                                           |
 | UC-4 receive + wake  | Client                                                                                                                                                                       | No consumption; idle agents never wake                                                                                                             |
 | UC-5 exit → DOWN     | Tree                                                                                                                                                                         | Results and failures are invisible                                                                                                                 |
-| UC-6 human           | HumanInbox                                                                                                                                                                   | Escalations only reach the parent agent                                                                                                            |
+| UC-6 escalation      | Tools (`send` `promptGuidelines`) + the root's model                                                                                                                         | Questions stop at an agent that cannot decide (v5: there is no `human` address by design)                                                          |
 | UC-7 kill            | Tree + Keeper/Placement                                                                                                                                                      | Runaways need manual killing                                                                                                                       |
 | UC-8 resume          | Tree + Placement (`--session <stored file>` plus the recorded `--model` and `--thinking`, because the session file keeps the original model; a pane resume opens a new pane) | Identity churn                                                                                                                                     |
-| UC-9 inspect         | Lifecycle `/actors` + BrokerServer `status.json`                                                                                                                             | The tree is opaque                                                                                                                                 |
+| UC-9 inspect, clear  | Panel + Lifecycle `/actors` + Tree `forget` + BrokerServer `status.json`                                                                                                     | The tree is opaque, or ended agents pile up                                                                                                        |
+| UC-10 `/new`         | Lifecycle (`session_shutdown{new}` → `stop_tree`, carry file dropped)                                                                                                        | A new session silently inherits the old tree                                                                                                       |
 | INV-1                | Tree (status machine, link rule)                                                                                                                                             | Orphans                                                                                                                                            |
 | INV-2                | Tree (`down` is final; one DOWN per incarnation)                                                                                                                             | Duplicated or missing results                                                                                                                      |
 | INV-3                | Client (deferred ack, consumed IDs) + Tree (seq dedupe, leases) + EventLog (bodies until ack)                                                                                | Duplicates or loss                                                                                                                                 |
 | INV-4                | Tree (seq order)                                                                                                                                                             | Reordering                                                                                                                                         |
 | INV-5                | Tree                                                                                                                                                                         | Unbounded fan-out                                                                                                                                  |
-| INV-6                | Tree                                                                                                                                                                         | Hanging callers                                                                                                                                    |
+| INV-6                | Tree                                                                                                                                                                         | Silent sends to agents that are gone                                                                                                               |
 | INV-7                | Tree (`disconnected`) + Lifecycle (flags)                                                                                                                                    | A reload kills the subtree                                                                                                                         |
-| INV-8                | Tree (mailbox, pending-call cap, exempt reserve) + Protocol (frame limit)                                                                                                    | Floods                                                                                                                                             |
+| INV-8                | Tree (mailbox, DOWN reserve) + Protocol (frame limit)                                                                                                                        | Floods                                                                                                                                             |
 | INV-9                | Placement                                                                                                                                                                    | Divergent semantics                                                                                                                                |
 | INV-10               | Placement `ownsPid` + Tree (root session fence) + Lifecycle (flags)                                                                                                          | Identity theft                                                                                                                                     |
+| INV-11               | Tree (`forget` guard, `forgotten` ids)                                                                                                                                       | A live agent erased, or a lingering process claiming a new agent's id                                                                              |
 
 ## Data flow
 
@@ -220,18 +227,27 @@ Delivery: idle agent → `sendMessage(..., {triggerTurn: true})`; busy agent →
 1. The tool result carries `details.actors = {id, consumed: [msg_id]}`. Client queues the `msg_id` as *pending ack*.
 1. **The ack is sent at `turn_end`, for the entries listed in its `toolResultEntryIds`.** The spike showed tool results are not yet persisted at `tool_result`, `tool_execution_end` or `message_end`, and are persisted (in memory and on disk) from `turn_end` on. Pending acks are kept in memory; a reload before the ack causes a redelivery, which step 3 deduplicates.
 
-**Call and human** — same as v2, with these changes:
+**Questions for the human (v5; replaces "Call and human")**
 
-- A `call` is admitted only if the caller's mailbox has reply reserve left for it (`reply_reserve_full` otherwise); the reserve is held until the reply, a timeout or a `target_down` arrives.
-- Replies are excluded from unfiltered `receive`.
-- `answer` is authorized only from the root's connection, or from the asker's own connection for the asker's own refs.
-- The root keeps a counted `herdr:blocked` signal while any human call is pending, so a question from a headless caller is visible in herdr. A caller in a pane signals its own pane.
+1. A child that needs a decision sends it to `"parent"` as ordinary mail.
+1. The parent answers from its own context if it can. Otherwise it forwards the question to its own parent, quoting it and naming the asking agent, and later relays the answer down with `reply_to`.
+1. The root's model asks the user however it chooses (its own question tool, plain text) and sends the answer back with `reply_to`.
+
+Why: the parent briefed the child and usually holds the answer; the user hears one voice, from the session they are talking to; presentation belongs to that interactive session, not to pi-actors; and it removes the only obligation that could stay outstanding for hours (24 h call timeouts, withdrawal on every outcome, answer authorization). The cost is one model turn per relay level. A pane child can still be talked to directly in its pane.
+
+**Forget (v5)**
+
+- `forget{target}` is sequenced and logged like any op. The sender must be a strict ancestor of the target, and the target and every descendant must be `down` (`bad_request: still running` otherwise).
+- It removes the target and its subtree from agents, mailboxes, leases and sender-seq tracking, and appends their ids to `forgotten`. A forgotten id is never reused by `spawn` (a kill that was `unconfirmed` may leave a process alive), a `hello` claiming it is rejected (`unknown`), and a `send` to it fails with `unknown_target`.
+- Unread mail queued for a forgotten agent is dropped with it; DOWN notices already queued for the parent stay. The model's at-least-once invariant exempts the forgotten agent.
+- A snapshot written before v5 has no `forgotten` field; `apply` normalizes it to `[]`.
+- The panel's `x` and `/actors clear` call it on the tops of the ended subtrees.
 
 **Reload, quit, crash (operator N3)**
 
 - **Reload:** `bye{reload}`, the agent becomes `disconnected`, and the same pid's `hello` supersedes the old connection.
 - **Root `session_shutdown{quit}`:** pi can't tell `/quit` from SIGHUP. So it sends `bye{quit}`, the root becomes `disconnected` with its 300 s grace, and the tree keeps running. Closing the root terminal by accident then costs nothing if you return within 300 s.
-- **Stopping a tree** is only ever explicit: `/actors stop`, which sends `stop_tree`.
+- **Stopping a tree** is only ever explicit: `/actors stop`, or `/new` in the root (v5), both of which send `stop_tree`. On `/new` the carried tree id is dropped too, so the new session starts a fresh tree on its first spawn. `/resume`, `/fork` and reload still keep the tree.
 
 **Broker crash and replay (S5 fixed)**
 
@@ -250,7 +266,7 @@ Delivery: idle agent → `sendMessage(..., {triggerTurn: true})`; busy agent →
 | State                                                                                                          | Owner                                                | Mutated by         | Source of truth                                                     |
 | -------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------- | ------------------ | ------------------------------------------------------------------- |
 | Agents (status, inc, parent, limits, session ID and file, cwd, model, placement, recorded pid, resumes, usage) | Tree                                                 | `apply`, `recover` | EventLog                                                            |
-| Mailboxes and reserves, leases, `last_seq`, idempotency cache, pending calls, spawn counters                   | Tree                                                 | `apply`            | EventLog; leases are dropped on replay because connections are gone |
+| Mailboxes and reserves, leases, `last_seq`, idempotency cache, spawn counters, forgotten ids                   | Tree                                                 | `apply`            | EventLog; leases are dropped on replay because connections are gone |
 | Connections, heartbeats, clocks                                                                                | BrokerServer                                         | BrokerServer       | Memory                                                              |
 | Child process, stdio, pgid                                                                                     | Keeper (headless) / herdr (pane)                     | Keeper / herdr     | OS / herdr                                                          |
 | Consumed IDs, pending acks                                                                                     | Client                                               | Client             | The session's entries / memory                                      |
@@ -295,9 +311,10 @@ Delivery: idle agent → `sendMessage(..., {triggerTurn: true})`; busy agent →
 
 ### D5 — [SUPERSEDED by D8] · D7 — [SUPERSEDED by D10]
 
-### D6: The human is an addressable pseudo-agent
+### D6: The human is an addressable pseudo-agent — [REVERSED 2026-10-09, v5]
 
-- **Validated by:** `test/human.test.ts`. v3 adds the case that only an authorized connection may `answer`.
+- **Was:** `send{to: "human"}` made a `call` listed in the root's panel (or the asker's pane), answered with choices, `/inbox` and `/answer`, with herdr marks and tmux bells.
+- **Now:** there is no `human` address. Questions travel up the tree as mail and the root's model asks the user (Data flow, "Questions for the human"). Reason: the parent has the context, the user hears one voice, the interactive session owns presentation, and the protocol loses its only long-lived obligation.
 
 ### D8: A Keeper per headless child (v3 detail: separate pgid, stdout ring, dialog auto-cancel, retained `proc_exit`, broker signals the pgid directly if the Keeper is gone)
 
@@ -311,7 +328,7 @@ Delivery: idle agent → `sendMessage(..., {triggerTurn: true})`; busy agent →
 
 - **Decision:**
   - ordinary messages: 200 or 2 MiB per agent;
-  - exempt kinds (DOWN, reply, human answer): their own reserve of 400 per agent. Space is held when the message is *caused*: a `call` holds one reply slot in the caller's mailbox, and a spawn holds one DOWN slot in the parent's mailbox. An exempt message therefore always has room, and the cause is rejected up front instead (`reply_reserve_full`, or `mailbox_full` on spawn).
+  - DOWN notices: their own reserve of 400 per agent. Space is held when the DOWN is *caused*: a spawn holds one DOWN slot in the parent's mailbox. A DOWN therefore always has room, and the spawn is rejected up front instead (`mailbox_full`). (Until v5, call replies and human answers shared this reserve.)
 - **Driver:** INV-8, INV-2 (a DOWN must never be dropped).
 - **Alternatives:** a cap on pending calls per caller (v3 draft). Rejected: another workload parameter; the reserve bounds the same thing with no new knob.
 - **Validated by:** `test/tree.property.test.ts`: neither class exceeds its bound, and an exempt message is never rejected.
@@ -367,7 +384,7 @@ Delivery: idle agent → `sendMessage(..., {triggerTurn: true})`; busy agent →
 
 ### D15: The Quint model is the source of truth for Tree's actions
 
-- **Decision:** `model/pi_actors.qnt` models agents, the broker (crash, replay), connections (reload, supersede), Keepers, leases, sequence numbers and parallel fetches. Tree's `apply` cases correspond one-to-one to the model's actions, and the model's invariants are re-implemented as property tests on Tree.
+- **Decision:** `model/pi_actors.qnt` models agents, the broker (crash, replay), connections (reload, supersede), Keepers, leases, sequence numbers, parallel fetches and (v5) `forget`; `model/pi_actors_identity.qnt` models identity: pid ownership, incarnations, the root fence, session switches and `--continue` takeover. Tree's `apply` cases correspond one-to-one to the model's actions, and the model's invariants are re-implemented as property tests on Tree.
 - **Driver:** INV-1..4, INV-10; review rounds 1 and 2 both found interleaving bugs by hand.
 - **Alternatives:**
   - Lean proofs: weeks of proof engineering for a protocol that is still changing;
@@ -380,11 +397,12 @@ Delivery: idle agent → `sendMessage(..., {triggerTurn: true})`; busy agent →
 - **pi-verified-goal:**
   - Lifecycle emits `actors:activity` (spawn, receive) and `actors:usage{delta}` (on DOWN).
   - `/actors stop [id]` is a *command*, so it still works when the goal's budget has blocked all tools (operator N8).
-  - The recommended coordinator pattern is one long `receive{kind: down}` per run.
+  - `actors:waiting {waiting, children}` holds the goal loop while direct children owe a report.
 - **herdr:**
   - Placement polls a single `herdr pane list` every 5 s, and treats a pane that vanished as `proc_exit(killed:pane_closed)`.
   - Placement closes the panes it created when their agent goes down.
   - Pane children receive their identity as flags passed after `--` to `herdr agent start`.
+  - The panel's `f` runs `herdr agent focus <name>` (or `tmux select-window`/`select-pane`) for a running pane agent and reports a failure; for an ended or headless agent it says why there is nothing to focus. Keys are matched with `matchesKey`, because under the kitty keyboard protocol a plain letter arrives as an escape sequence (v5; `f` did nothing before).
 
 ## Failure modes and cross-cutting concerns
 
@@ -394,18 +412,19 @@ Delivery: idle agent → `sendMessage(..., {triggerTurn: true})`; busy agent →
 | Keeper crash                                 | The child's stdin closes and pi exits; the broker signals the recorded pgid; `down(error:keeper_lost)`.                                                                    | Tree, Placement        |
 | Crash before an ack                          | Redelivered, then deduplicated by the consumed-ID set.                                                                                                                     | Client                 |
 | Two parallel `receive`s                      | Sequential execution, plus leases.                                                                                                                                         | Tools, Tree            |
-| A `receive` racing a `call` for its reply    | Replies are excluded from unfiltered `receive`.                                                                                                                            | Tree                   |
 | A stray `pi` in a pane after the child quits | It has no flags, so it isn't an actor.                                                                                                                                     | Lifecycle              |
 | A forked or `--continue`d root session       | The session-ID and dead-pid fence.                                                                                                                                         | Tree                   |
 | Root terminal closed (SIGHUP)                | The root becomes `disconnected` for 300 s; children keep working; `pi --continue` reattaches.                                                                              | Lifecycle, Tree        |
 | Laptop sleep                                 | Deadlines shift by the slept duration.                                                                                                                                     | BrokerServer, Tree     |
 | `pi update` mid-tree                         | The tree keeps running from its snapshot; new trees use a new snapshot.                                                                                                    | Launcher               |
 | An extension dialog in a headless child      | The Keeper cancels it automatically.                                                                                                                                       | Keeper                 |
-| Retransmitted `answer`, `exit` or `kill`     | Gets the cached original response.                                                                                                                                         | Tree                   |
+| Retransmitted `exit`, `kill` or `forget`     | Gets the cached original response.                                                                                                                                         | Tree                   |
 | `kill` during `exiting`                      | Ignored; the result is kept.                                                                                                                                               | Tree                   |
 | A child switches sessions                    | `exit error:session_switched`.                                                                                                                                             | Lifecycle              |
 | The goal's budget blocks tools               | `/actors stop` still works.                                                                                                                                                | Lifecycle              |
-| Ten questions to the human at once           | `/inbox` numbers them (`#1..#n`, which map to refs); `/answer 3 …`; a counted herdr signal on the root.                                                                    | HumanInbox             |
+| Many children with questions at once         | Each reaches its parent as mail; the root's model batches and asks the user.                                                                                               | Tools, root model      |
+| Ended agents pile up in a long session       | The panel collapses them into one ended row; `x` or `/actors clear` forgets them; `/new` stops the tree.                                                                  | Panel, Tree            |
+| Clearing an agent whose exit was unconfirmed | Its id is retired, so a lingering process cannot reconnect or be mistaken for a new agent.                                                                                 | Tree                   |
 | Observability without a live root            | `status.json`, written by the broker (throttled to once a second).                                                                                                         | BrokerServer           |
 | Disk growth                                  | Log compaction; capped stderr; stdout kept only in memory; retention of 5 trees. Child session files in `~/.pi/agent/sessions` are pi's to manage, and documented as such. | EventLog, Keeper       |
 
@@ -440,7 +459,7 @@ Delivery: idle agent → `sendMessage(..., {triggerTurn: true})`; busy agent →
 
 ## Confirmed defaults
 
-User-confirmed 2026-10-05: G = 60 s for children and 300 s for the root; only two limits, max depth (2) and spawn count (40 per tree), both configurable; mailbox safety caps of 200 messages / 2 MiB of ordinary mail per agent, with a 400-slot reserve for DOWN notices and replies.
+User-confirmed 2026-10-05: G = 60 s for children and 300 s for the root; only two limits, max depth (2) and spawn count (40 per tree), both configurable; mailbox safety caps of 200 messages / 2 MiB of ordinary mail per agent, with a 400-slot reserve for DOWN notices.
 
 ## Decisions recorded at release (2026-10-05)
 
@@ -479,3 +498,4 @@ User-confirmed 2026-10-05: G = 60 s for children and 300 s for the root; only tw
 | Review of the N fixes, and performance (2026-10-06)                              | The carry file identifies the process by a token kept on `globalThis` (survives runtime replacement), not by uptime, which stops while the machine sleeps; a broker that lost its lock stops without `server.close()`, which would unlink the new broker's socket; stamps store bodies cut to what the delivery shows; end-notice results are sanitized; an already-aborted signal fails connect at once; a vanished lock is retried once. Performance: lease events (`fetch`, `release`) are appended without fsync (the next fsync covers them); acks stay durable because pi does not fsync its session, so after a machine crash a lost ack would redeliver a message whose consumption was lost too. The log cuts a torn or holed unsynced tail on open (before, a torn line followed by new appends made the next restart fail). The Tree property test crashes the broker losing the unsynced tail, and fails if `send` is made unsynced. Measured with 10 headless stand-in children on the reference Mac: 1:1 round trip p50 41 → 23 ms, 1:10 fan-out p50 379 → 284 ms                                                                                                        |
 | Pre-existing durability gaps (2026-10-06)                                        | `writeAtomic` fsyncs the directory after the rename, so a compaction survives a machine crash; the broker checks it still holds the lock before every append, not only once a second, so a broker that lost the lock never writes to the new owner's log; on macOS libuv's fsync is already F_FULLFSYNC (measured: 4.4 ms, the same as F_FULLFSYNC; plain fsync 0.03 ms), noted in `log.ts`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
 | Calls, answers and identity modelled (2026-10-06)                                | `model/pi_actors_calls.qnt`: call outcomes, who may answer, the human's question list, and identity (pid ownership, incarnations, root pid and session fence, same-process session switch, `--continue` takeover, forks), with 7 mutants. It found that a question to the human stayed listed after a timeout or after its asker ended; `endCall` in `src/tree.ts` now withdraws it on every outcome                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| Quiet actors (user, 2026-10-09)                                                  | v5: the human route is removed (no `human` address, `call`/`reply`/`answer`, choices, `/inbox`, `/answer`, herdr marks or tmux bells for questions; D6 reversed; PROTO 2); questions travel up the tree to the root's model. Deliveries lose their header and footer and render as one collapsed line; a DOWN the agent caused itself is not shown. New `forget` op, panel with running agents first, a collapsible ended row, `x` to clear, a wrapped, scrollable, incrementally read transcript, and `matchesKey` for letters (kitty protocol). `/actors` opens the panel; `/actors clear`; `/new` stops the tree. Models: the calls model became `pi_actors_identity.qnt`; `forget` added to `pi_actors.qnt` with three invariants, a witness and five mutants; `check.sh` now fails on a violation (its grep accepted one before) |

@@ -5,15 +5,15 @@ set -e
 cd "$(dirname "$0")"
 Q="npx quint run pi_actors.qnt --max-samples=${SAMPLES:-20000} --max-steps=${STEPS:-40}"
 echo "== scenarios"; npx quint test pi_actors.qnt | tail -2
-echo "== invariants"; $Q --invariant=all_invariants | grep -E "^\[(ok|violation)\]|No violation|violation"
-for w in witnessConsumed witnessRetransmitPending witnessTwoAccepted witnessChildDown witnessGrandchildKilledByLink; do
+echo "== invariants"; $Q --invariant=all_invariants | grep -E "^\[ok\]"
+for w in witnessConsumed witnessRetransmitPending witnessTwoAccepted witnessChildDown witnessGrandchildKilledByLink witnessForgotten; do
   if $Q --invariant=$w >/dev/null 2>&1; then echo "UNREACHED witness $w"; exit 1; else echo "reached  $w"; fi
 done
-echo "== calls, answers and identity (pi_actors_calls.qnt)"
-C="npx quint run pi_actors_calls.qnt --max-samples=${CALLS_SAMPLES:-5000} --max-steps=${STEPS:-40}"
-npx quint test pi_actors_calls.qnt | tail -2
-$C --invariant=all_invariants | grep -E "^\[(ok|violation)\]|No violation|violation"
-for w in witnessHumanAnswered witnessTimedOut witnessVoided witnessResumed witnessTakeover; do
+echo "== identity (pi_actors_identity.qnt)"
+C="npx quint run pi_actors_identity.qnt --max-samples=${IDENTITY_SAMPLES:-5000} --max-steps=${STEPS:-40}"
+npx quint test pi_actors_identity.qnt | tail -2
+$C --invariant=all_invariants | grep -E "^\[ok\]"
+for w in witnessResumed witnessTakeover; do
   if $C --invariant=$w >/dev/null 2>&1; then echo "UNREACHED witness $w"; exit 1; else echo "reached  $w"; fi
 done
 python3 mutants.py

@@ -44,7 +44,7 @@ test("F2: parallel first spawns share one connection; both return and pushes kee
 		new Promise((_, rej) => setTimeout(() => rej(new Error("a spawn hung")), 10_000)),
 	]);
 	assert.equal((results as unknown[]).length, 2);
-	await h.waitFor(() => /echo:echo/.test(h.inbox()) && (h.inbox().match(/has ended: normal/g) ?? []).length === 2);
+	await h.waitFor(() => /echo:echo/.test(h.inbox()) && (h.inbox().match(/ended: normal/g) ?? []).length === 2);
 });
 
 test("F1: a missing cwd is rejected by the tool; relative paths resolve against the agent's cwd", async () => {
@@ -79,7 +79,7 @@ test("F12: waiting is tracked for direct children only, and cleared when they re
 	const waiting = () => h.events.filter((e) => e.name === "actors:waiting").at(-1)?.data.waiting;
 	await h.tool("spawn", { task: "echo", name: "w" });
 	assert.equal(waiting(), true);
-	await h.waitFor(() => /w has ended/.test(h.inbox()));
+	await h.waitFor(() => /w ended/.test(h.inbox()));
 	assert.equal(waiting(), false);
 	await h.tool("send", { to: "nobody-of-mine", text: "hi" }).catch(() => {});
 	assert.equal(waiting(), false, "a failed or non-child send never sets waiting");
@@ -91,16 +91,16 @@ test("F7: after /actors stop, the next spawn starts a fresh tree instead of fail
 	await h.command("actors", "stop");
 	await new Promise((r) => setTimeout(r, 1500));
 	assert.match((await h.tool("spawn", { task: "echo", name: "again" })).content[0].text, /Started again/);
-	await h.waitFor(() => /again has ended: normal/.test(h.inbox()));
+	await h.waitFor(() => /again ended: normal/.test(h.inbox()));
 });
 
-test("F11: a root session switch keeps the tree (children's reports reach the new session)", async () => {
+test("F11: a root session switch (/fork) keeps the tree (children's reports reach the new session)", async () => {
 	const sessionA = root();
 	await sessionA.tool("spawn", { task: "serve", name: "keep" });
-	await sessionA.fire("session_shutdown", { reason: "new" });
+	await sessionA.fire("session_shutdown", { reason: "fork" });
 	// pi replaces the extension runtime in the same process; the new session has no tree entry.
 	const sessionB = root({}, true);
-	await sessionB.fire("session_start", { reason: "new" });
+	await sessionB.fire("session_start", { reason: "fork" });
 	await sessionB.tool("send", { to: "keep", text: "still there?" });
 	await sessionB.waitFor(() => /echo:still there\?/.test(sessionB.inbox()));
 });
@@ -147,57 +147,99 @@ test("N8: a carry file left by an earlier process with the same pid is ignored",
 	assert.notEqual(treeOf(h), "0123456789");
 });
 
-test("N5: /answer <#> addresses the question /inbox showed, never whatever moved into that position", async () => {
-	const h = root();
-	await h.tool("spawn", { task: "ask first?", name: "qa" });
-	await h.tool("spawn", { task: "ask second?", name: "qb" });
-	for (;;) {
-		await h.command("inbox");
-		if ((lastNote(h).match(/^#\d+ /gm) ?? []).length === 2) break;
-		await new Promise((r) => setTimeout(r, 100));
-	}
-	const listed = [...lastNote(h).matchAll(/^#(\d+) \[(\S+)\] from ([^\s:]+)/gm)].map((m) => ({ n: m[1], ref: m[2], from: m[3] }));
-	await h.command("answer", `${listed[0].ref} by id`);
-	await h.waitFor(() => new RegExp(`got:.*by id`).test(h.inbox()));
-	await h.command("answer", "1 stale position");
-	assert.match(lastNote(h), /no longer open/);
-	await h.command("answer", "2 the second");
-	await h.waitFor(() => /got:.*the second/.test(h.inbox()));
-	assert.doesNotMatch(h.inbox(), /stale position/);
-	assert.match(lastNote(h), new RegExp(`Answered #2 \\(${listed[1].from}\\)`));
+const children = (h: ReturnType<typeof fakeHost>) => h.command("actors").then(() => lastNote(h));
+
+test("/new stops the whole tree; the new session starts a fresh one", async () => {
+	const a = root();
+	await a.tool("spawn", { task: "serve", name: "old" });
+	const oldTree = treeOf(a);
+	await a.fire("session_shutdown", { reason: "new" });
+	const b = root({}, true);
+	await b.fire("session_start", { reason: "new" });
+	await assert.rejects(b.tool("send", { to: "old", text: "there?" }), /unknown_target|no parent/);
+	await b.tool("spawn", { task: "echo", name: "next" });
+	assert.notEqual(treeOf(b), oldTree);
+	assert.doesNotMatch(await children(b), /old/);
 });
 
-test("N6: in herdr, the waiting mark and the widget clear when the tree stops and on shutdown", async () => {
-	const saved = { TMUX: process.env.TMUX, HERDR_ENV: process.env.HERDR_ENV, HERDR_PANE_ID: process.env.HERDR_PANE_ID };
-	delete process.env.TMUX;
-	process.env.HERDR_ENV = "1";
-	process.env.HERDR_PANE_ID = "p-test";
-	try {
-		const h = root({ mode: "tui" });
-		const blocked = () => h.events.filter((e) => e.name === "herdr:blocked").at(-1)?.data.active;
-		await h.fire("session_start", { reason: "startup" });
-		await h.tool("spawn", { task: "ask which?", name: "asker" });
-		await h.waitFor(() => blocked() === true && /question/.test(h.widgets["pi-actors"]?.[0] ?? ""));
-		await h.command("actors", "stop");
-		await h.waitFor(() => blocked() === false && h.widgets["pi-actors"] === undefined);
-		await h.tool("spawn", { task: "ask again?", name: "asker2" });
-		await h.waitFor(() => blocked() === true);
-		await h.fire("session_shutdown", { reason: "reload" });
-		assert.equal(blocked(), false, "a reload never leaves the pane marked");
-	} finally {
-		for (const [k, v] of Object.entries(saved)) v === undefined ? delete process.env[k] : (process.env[k] = v);
-	}
+test("stopping a child is silent; an end the agent did not cause is pushed", async () => {
+	const h = root();
+	await h.tool("spawn", { task: "serve", name: "quiet" });
+	await h.tool("stop", { id: "quiet" });
+	await h.tool("spawn", { task: "crash", name: "loud" });
+	await h.waitFor(() => /loud ended: error:crashed/.test(h.inbox()));
+	while (!/quiet {2}stopped/.test(await children(h))) await new Promise((r) => setTimeout(r, 200));
+	assert.doesNotMatch(h.inbox(), /quiet ended/);
+	assert.equal(h.events.filter((e) => e.name === "actors:waiting").at(-1)?.data.waiting, false);
+});
+
+test("/actors clear removes ended agents (and their subtrees) but leaves running ones", async () => {
+	const h = root();
+	await h.tool("spawn", { task: "echo", name: "done1" });
+	await h.tool("spawn", { task: "serve", name: "busy" });
+	await h.waitFor(() => /done1 ended: normal/.test(h.inbox()));
+	await h.command("actors", "clear");
+	assert.match(lastNote(h), /Cleared 1 ended subtree/);
+	const tree = await children(h);
+	assert.doesNotMatch(tree, /done1/);
+	assert.match(tree, /busy {2}running/);
+	await h.command("actors", "clear");
+	assert.match(lastNote(h), /No ended agents/);
+});
+
+test("panel: kitty-encoded keys work; x on the ended row clears every ended agent while the panel stays open", async () => {
+	const h = root({ mode: "tui" });
+	await h.fire("session_start", { reason: "startup" });
+	await h.tool("spawn", { task: "echo", name: "gone" });
+	await h.tool("spawn", { task: "serve", name: "here" });
+	await h.waitFor(() => /gone ended: normal/.test(h.inbox()));
+	void h.command("actors");
+	await h.waitFor(() => h.overlayOpen());
+	assert.match(h.overlayLines().join("\n"), /▸ 1 ended/);
+	h.press("down"); // to the ended row
+	assert.match(h.overlayLines()[1], /x clear all ended/);
+	h.press("\x1b[120u"); // "x" under the kitty keyboard protocol
+	await h.waitFor(() => !/ended/.test(h.overlayLines().join("\n")));
+	assert.ok(h.overlayOpen(), "the panel stays open");
+	assert.match(h.overlayLines().join("\n"), /here {2}running/);
+	h.press("\x1b[102u"); // "f" on a headless agent explains instead of doing nothing
+	assert.match(lastNote(h), /headless/);
+	h.press("escape");
+	assert.equal(h.overlayOpen(), false);
+});
+
+test("a delivery renders as one collapsed line; expanded shows what the model read", async () => {
+	const h = root();
+	await h.tool("spawn", { task: "echo", name: "r" });
+	await h.waitFor(() => /r ended: normal/.test(h.inbox()));
+	const p = h.pushed.find((x) => /echo:echo/.test(x.content))!;
+	assert.doesNotMatch(p.content, /\[pi-actors\]|Reply with send/, "no header or footer");
+	const theme = { fg: (_c: string, t: string) => t };
+	const collapsed = h.renderers["pi-actors"]({ content: p.content, details: p.details }, { expanded: false, outputPad: 0 }, theme).render(200).join("\n");
+	assert.match(collapsed, /⇢ message from r/);
+	assert.doesNotMatch(collapsed, /echo:echo/);
+	const expanded = h.renderers["pi-actors"]({ content: p.content, details: p.details }, { expanded: true, outputPad: 0 }, theme).render(200).join("\n");
+	assert.match(expanded, /echo:echo/);
+});
+
+test("in tui, the widget counts running agents and clears when the tree stops", async () => {
+	const h = root({ mode: "tui" });
+	await h.fire("session_start", { reason: "startup" });
+	await h.tool("spawn", { task: "serve", name: "w1" });
+	await h.waitFor(() => /1 running/.test(h.widgets["pi-actors"]?.[0] ?? ""), 8000);
+	await h.command("actors", "stop");
+	await h.waitFor(() => h.widgets["pi-actors"] === undefined, 8000);
 });
 
 test("a session switch keeps the tree even when the process uptime clock jumped (system sleep)", async () => {
 	const a = root();
 	await a.tool("spawn", { task: "serve", name: "sleeper" });
-	await a.fire("session_shutdown", { reason: "new" });
+	await a.fire("session_shutdown", { reason: "resume" });
 	const uptime = process.uptime;
 	process.uptime = () => uptime() - 3600; // an hour of sleep, as the monotonic clock sees it
 	try {
 		const b = root({}, true);
-		await b.fire("session_start", { reason: "new" });
+		await b.fire("session_start", { reason: "resume" });
 		await b.tool("send", { to: "sleeper", text: "awake?" });
 		await b.waitFor(() => /echo:awake\?/.test(b.inbox()));
 	} finally {

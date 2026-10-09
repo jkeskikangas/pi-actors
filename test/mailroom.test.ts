@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { dedupeContext, ENTRY_TYPE, type Fetcher, formatDelivery, Mailroom } from "../src/client/mailroom.ts";
+import { dedupeContext, ENTRY_TYPE, type Fetcher, formatDelivery, Mailroom, summarizeDelivery } from "../src/client/mailroom.ts";
 import type { Message } from "../src/protocol.ts";
 
 function fetcher(queue: Message[]): Fetcher & { acked: string[] } {
@@ -44,18 +44,21 @@ test("a message still being delivered is not delivered twice (lease returned aft
 	assert.deepEqual((await room.drain(fetcher([msg("m1")]))).map((m) => m.id), ["m1"]);
 });
 
-test("formatting labels senders, reports, answers and ends; never as user input", () => {
-	const text = formatDelivery("root", [
+test("formatting labels senders, reports, answers and ends; no header, no footer, never as user input", () => {
+	const batch = [
 		msg("t", { tag: "task" }),
 		msg("r", { from: "kid", tag: "report", body: "done" }),
-		msg("h", { from: "human", kind: "reply", ref: "root:1:3", body: "yes" }),
+		msg("a", { from: "kid", ref: "root:1:3", body: "yes" }),
 		msg("d", { from: "broker", kind: "down", body: JSON.stringify({ id: "kid", reason: "killed" }) }),
-	]);
-	assert.match(text, /^\[pi-actors\] 4 updates for root/);
+	];
+	const text = formatDelivery(batch);
+	assert.match(text, /^■ Task from/);
 	assert.match(text, /Report from kid/);
-	assert.match(text, /The human answered your message root:1:3/);
-	assert.match(text, /kid has ended: killed/);
-	assert.match(formatDelivery("a", [msg("big", { body: "x".repeat(20_000) })]), /truncated/);
+	assert.match(text, /kid answered your msg root:1:3/);
+	assert.match(text, /kid ended: killed/);
+	assert.doesNotMatch(text, /\[pi-actors\]|Reply with send/);
+	assert.equal(summarizeDelivery(batch), "task from root · report from kid · answer from kid · kid ended (killed)");
+	assert.match(formatDelivery([msg("big", { body: "x".repeat(20_000) })]), /truncated/);
 });
 
 test("F4: reclaim returns only injections that are old enough and never reached the session", async () => {
@@ -89,7 +92,7 @@ test("F9: a drain requested while one runs is not dropped: the running drain fet
 });
 
 test("N1: the model sees each message once, even when pi kept an injection that was also redelivered", () => {
-	const delivered = (self: string, ms: Message[]) => ({ role: "custom", customType: ENTRY_TYPE, content: formatDelivery(self, ms), details: { actors: { id: self, consumed: ms.map((m) => m.id), messages: ms } } });
+	const delivered = (self: string, ms: Message[]) => ({ role: "custom", customType: ENTRY_TYPE, content: formatDelivery(ms), details: { actors: { id: self, consumed: ms.map((m) => m.id), messages: ms } } });
 	const user = { role: "user", content: "hi" };
 	const first = delivered("a", [msg("m1"), msg("m2")]);
 	const other = delivered("b", [msg("m1")]); // a forked parent's entry: not ours, left alone
@@ -105,12 +108,12 @@ test("stamps keep at most what the delivery shows, and a rebuilt entry still say
 	const room = new Mailroom("a");
 	const stamp = room.stamp([msg("big", { body: "x".repeat(200_000) }), msg("d", { kind: "down", body: JSON.stringify({ id: "kid", reason: "normal", result: "r".repeat(30_000) }) })]);
 	assert.ok(stamp.messages![0].body.length <= 16 * 1024 + 1, "no 200 kB body in the session entry");
-	assert.match(formatDelivery("a", stamp.messages!), /truncated/);
-	assert.match(formatDelivery("a", stamp.messages!), /kid has ended: normal/, "an end notice still parses");
+	assert.match(formatDelivery(stamp.messages!), /truncated/);
+	assert.match(formatDelivery(stamp.messages!), /kid ended: normal/, "an end notice still parses");
 });
 
 test("an end notice's result is shown without terminal control sequences", () => {
-	const text = formatDelivery("root", [msg("d", { from: "broker", kind: "down", body: JSON.stringify({ id: "kid", reason: "normal", result: "ok\u001b[2J\u0007done" }) })]);
+	const text = formatDelivery([msg("d", { from: "broker", kind: "down", body: JSON.stringify({ id: "kid", reason: "normal", result: "ok\u001b[2J\u0007done" }) })]);
 	assert.doesNotMatch(text, /[\u001b\u0007]/);
 	assert.match(text, /ok\[2Jdone/);
 });
@@ -118,8 +121,8 @@ test("an end notice's result is shown without terminal control sequences", () =>
 test("a stamp cut by the shown (cleaned) length keeps the truncated note when rebuilt", () => {
 	const room = new Mailroom("a");
 	const m = msg("ctl", { body: "\u0007".repeat(100) + "x".repeat(16 * 1024 + 50) });
-	assert.match(formatDelivery("a", [m]), /truncated/);
-	assert.match(formatDelivery("a", room.stamp([m]).messages), /truncated/);
+	assert.match(formatDelivery([m]), /truncated/);
+	assert.match(formatDelivery(room.stamp([m]).messages), /truncated/);
 });
 
 test("the context hook passes over a stamp without its messages instead of failing", () => {

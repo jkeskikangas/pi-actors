@@ -9,7 +9,7 @@ export default function (pi: any) {
 		const all = (context.messages ?? []).map(textOf).join("\n");
 		const last = textOf((context.messages ?? []).at(-1));
 		const tool = (name: string, args: any) => fauxAssistantMessage(fauxToolCall(name, args, { id: `c${call}` }), { stopReason: "toolUse" });
-		if (last.includes("has ended")) return fauxAssistantMessage("PANE DONE");
+		if (/^Stopping \S+\.$/.test(last)) return fauxAssistantMessage("PANE DONE"); // a stop it asked for sends no end notice
 		if (last.includes("Report from panekid")) return tool("stop", { id: "panekid" });
 		if (!all.includes("Started panekid")) return tool("spawn", { task: "Say hello", name: "panekid", pane: true });
 		return fauxAssistantMessage("waiting");
