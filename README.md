@@ -37,11 +37,11 @@ A typical pattern: start a few children, end the turn, and act on their reports 
 
 ## The agents panel
 
-While children run, a line under the editor says so: `pi-actors · 2 running — ↓ to open`. Press **↓ on an empty editor**, or run `/actors`, to open the panel.
+While children run, a line under the editor says so: `pi-actors · 2 running — ↓ to open`. Press **↓ on an empty editor**, or run `/actors`, to open the panel. It takes the editor's place, like pi's own selectors.
 
 - **Running agents come first**, in tree order, with their status, model and placement.
 - **Ended agents fold into one row**, `▸ 5 ended`. Enter unfolds it. Their transcripts stay readable until you clear them.
-- **Enter** shows an agent's transcript: its task, what it said, and the tools it ran with their main argument (`⚙ bash  git diff --stat`). ↑↓, PgUp/PgDn and Home/End scroll it; it follows new output while you're at the end. `e` expands tool output and full messages.
+- **Enter** shows an agent's transcript full screen, drawn the way pi draws your own session: rendered markdown, and tool rows from the same renderers (with [pi-minimum-sufficient-output](https://github.com/jkeskikangas/pi-minimum-sufficient-output), one line per call). ↑↓, PgUp/PgDn and Home/End scroll it; it follows new output while you're at the end. `e` or ctrl+o expands tool output and full messages; esc returns to the list.
 - **`x`** clears an ended agent together with its ended children, or, on the `ended` row, every ended agent. The panel stays open.
 - **`f`** jumps to an agent's pane, when it runs in one.
 

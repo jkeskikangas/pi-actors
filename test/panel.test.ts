@@ -1,10 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { appendFileSync, mkdtempSync, renameSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
-import { tmpdir } from "node:os";
 import type { Snapshot } from "../src/client/connection.ts";
-import { endedRoots, initialState, items, type PanelKey, type PanelState, press, readTranscript, shortModel, statusLabel, summary, transcriptLines, view, withSnapshot } from "../src/client/panel.ts";
+import { endedRoots, initialState, items, type PanelKey, type PanelState, press, shortModel, statusLabel, summary, view, withSnapshot } from "../src/client/panel.ts";
 
 const agent = (id: string, parent: string, status = "live", extra = {}) => ({ id, parent, status, inc: 1, connected: true, mailbox: 0, spawns: 0, ...extra });
 const snap = (agents = [
@@ -47,7 +44,7 @@ test("labels read as words; models are shortened; ended agents drop pane and que
 	assert.equal(statusLabel("down", "error:crashed(3)"), "crashed (3)");
 	assert.equal(shortModel("claude-sdk/claude-opus-5-5"), "opus-5-5");
 	const st = { ...initialState(snap()), showEnded: true };
-	const text = view(st, 200, 30, () => []).lines.map((l) => l.text).join("\n");
+	const text = view(st, 200, 30, () => []).body.map((l) => l.text).join("\n");
 	assert.match(text, /● be {2}running · opus-5-5 · pane/);
 	assert.match(text, /○ old {2}stopped, exit unconfirmed$/m);
 });
@@ -93,46 +90,20 @@ test("a new snapshot keeps the cursor on the same agent; a cleared viewed agent 
 	assert.equal(withSnapshot({ ...st, viewing: "old" }, snap([agent("root", null as never), agent("fe", "root")])).viewing, undefined);
 });
 
-test("the transcript wraps, shows tool calls with their key argument, scrolls and follows the end", () => {
-	const f = join(mkdtempSync(join(tmpdir(), "pia-tr-")), "s.jsonl");
-	const task = { id: "m1", from: "root", to: "fe", kind: "mail", tag: "task", body: "build it" };
-	const lines = [
-		{ type: "session" },
-		{ type: "custom_message", customType: "pi-actors", content: "■ Task from root (msg m1):\nbuild it", details: { actors: { messages: [task] } } },
-		{ type: "message", message: { role: "assistant", content: [{ type: "toolCall", name: "bash", arguments: { command: "git diff --stat" } }, { type: "text", text: "word ".repeat(30).trim() }] } },
-		{ type: "message", message: { role: "toolResult", toolName: "bash", content: [{ type: "text", text: "a\nb\nc" }] } },
-	];
-	writeFileSync(f, `${lines.map((l) => JSON.stringify(l)).join("\n")}\n`);
-	const entries = readTranscript(f);
-	const collapsed = transcriptLines(entries, 40, false).map((l) => l.text);
-	assert.equal(collapsed[0], "⇢ task from root");
-	assert.ok(collapsed.includes("  ⚙ bash  git diff --stat"));
-	assert.ok(collapsed.includes("    ↳ 3 lines"));
-	assert.ok(collapsed.filter((l) => l.startsWith("word")).length > 1, "long text wraps instead of being cut");
-	const expanded = transcriptLines(entries, 40, true).map((l) => l.text);
-	assert.ok(expanded.includes("      b"));
-	assert.ok(expanded.includes("  build it"));
-
-	// Appended lines are picked up incrementally.
-	appendFileSync(f, `${JSON.stringify({ type: "message", message: { role: "assistant", content: [{ type: "text", text: "LAST" }] } })}\n`);
-	const all = readTranscript(f);
-	assert.equal(all.length, entries.length + 1);
-
-	const st = { ...initialState(snap([agent("root", null as never), agent("fe", "root", "live", { sessionFile: f })])), viewing: "fe" };
-	assert.equal(view(st, 40, 5, () => all).lines.at(-1)!.text, "LAST", "follows the end");
+test("a transcript fills the height, follows the end, scrolls, and stays put while output grows", () => {
+	const all = Array.from({ length: 20 }, (_, i) => `line ${i}`);
+	const st = { ...initialState(snap([agent("root", null as never), agent("fe", "root")])), viewing: "fe" };
+	const end = view(st, 40, 5, () => [...all, "", ""]);
+	assert.deepEqual(end.body.map((l) => l.text), ["line 15", "line 16", "line 17", "line 18", "line 19"], "trailing blank lines are dropped");
+	assert.match(end.head.text, /fe {2}running/);
+	assert.match(view(st, 120, 5, () => all).foot.text, /e expand · esc back$/);
 	const up = view({ ...st, scroll: 1_000 }, 40, 5, () => all);
-	assert.ok(up.scroll > 0 && up.scroll < 1_000, "scroll is clamped to the transcript");
-	assert.match(up.lines.at(-1)!.text, /more lines? below/);
-	assert.deepEqual(readTranscript(undefined), []);
-
-	// Scrolled up, the view stays on the same lines while output grows.
+	assert.equal(up.scroll, 15, "scroll is clamped to the transcript");
+	assert.match(up.foot.text, /15 more lines/);
 	const at = view({ ...st, scroll: 2 }, 40, 5, () => all);
-	const more = [...all, { kind: "assistant" as const, text: "NEWER" }];
-	const after = view({ ...st, scroll: at.scroll, seen: at.seen }, 40, 5, () => more);
-	assert.deepEqual(after.lines.slice(1, -1), at.lines.slice(1, -1));
-
-	// A file replaced by a shorter one is read again from the start.
-	writeFileSync(`${f}.new`, `${JSON.stringify({ type: "message", message: { role: "user", content: "fresh" } })}\n`);
-	renameSync(`${f}.new`, f);
-	assert.deepEqual(readTranscript(f), [{ kind: "user", text: "fresh" }]);
+	const after = view({ ...st, scroll: at.scroll, seen: at.seen }, 40, 5, () => [...all, "NEWER"]);
+	assert.deepEqual(after.body, at.body);
+	const short = view(st, 40, 5, () => ["only"]);
+	assert.equal(short.body.length, 5, "a short transcript is padded to the height");
+	assert.equal(view(st, 40, 5, () => []).body[0].text, " (nothing yet)");
 });

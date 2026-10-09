@@ -206,7 +206,7 @@ test("panel: kitty-encoded keys work; x on the ended row clears every ended agen
 	await h.waitFor(() => h.overlayOpen());
 	assert.match(h.overlayLines().join("\n"), /▸ 1 ended/);
 	h.press("down"); // to the ended row
-	assert.match(h.overlayLines()[1], /x clear all ended/);
+	assert.match(h.overlayLines().join("\n"), /x clear all ended/);
 	h.press("\x1b[120u"); // "x" under the kitty keyboard protocol
 	await h.waitFor(() => !/ended/.test(h.overlayLines().join("\n")));
 	assert.ok(h.overlayOpen(), "the panel stays open");
