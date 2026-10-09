@@ -237,11 +237,16 @@ Why: the parent briefed the child and usually holds the answer; the user hears o
 
 **Forget (v5)**
 
-- `forget{target}` is sequenced and logged like any op. The sender must be a strict ancestor of the target, and the target and every descendant must be `down` (`bad_request: still running` otherwise). While the target's parent runs, only that parent may forget it, since it may still resume the child or read its notice (`bad_request: its parent still runs`). The Quint model allows the wider rule, so this guard only narrows it.
+- `forget{target}` is sequenced and logged like any op. The sender must be a strict ancestor of the target, and the target and every descendant must be `down` (`bad_request: still running` otherwise). While the target's parent runs, only that parent may forget it, since it may still resume the child or read its notice (`bad_request: its parent still runs`). The Quint model checks this rule (`noForgetUnderRunningParent`), and also checks that it never leaves an ended agent stuck: once its parent has ended, a running ancestor can clear it (`endedIsClearable`).
 - It removes the target and its subtree from agents, mailboxes, leases and sender-seq tracking, and appends their ids to `forgotten`. A forgotten id is never reused by `spawn` (a kill that was `unconfirmed` may leave a process alive), a `hello` claiming it is rejected (`unknown`), and a `send` to it fails with `unknown_target`.
 - Unread mail queued for a forgotten agent is dropped with it; DOWN notices already queued for the parent stay. The model's at-least-once invariant exempts the forgotten agent.
 - A snapshot written before v5 has no `forgotten` field; `apply` normalizes it to `[]`.
 - The panel's `x` and `/actors clear` call it on the tops of the ended subtrees in the agent's own subtree. An ended child of another running agent stays listed under that agent and is not offered for clearing.
+
+**Finished trees on disk (2026-10-09)**
+
+- A finished tree is never restarted, so its directory only serves reading old transcripts. When a root connects, at most once per process, the launcher prunes trees that finished more than `keepFinishedDays` ago (default 7; `~/.pi/agent/pi-actors.json`). It deletes everything except `status.json`, which it rewrites as `{finished: true, pruned}`. That marker keeps a session that recorded the tree id from starting an empty tree under it.
+- It skips a tree whose broker lock is held by a live process. The finish time is `status.json`'s mtime, which the broker writes last on shutdown.
 
 **Reload, quit, crash (operator N3)**
 

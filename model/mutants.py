@@ -39,6 +39,10 @@ MUTANTS = [
      "    status(st, c) == Unborn,\n", "    (status(st, c) == Unborn or status(st, c) == Gone),\n"),
     ("mail to a forgotten agent is still queued",
      "x != Down and x != Unborn and x != Gone", "x != Down and x != Unborn"),
+    ("parent-only clear removed: the root forgets a running parent's ended child",
+     "par == p or status(st, par) == Down or status(st, par) == Gone", "true"),
+    ("parent-only clear over-restricted: only the parent ever forgets, so a dead parent's child is stuck",
+     "par == p or status(st, par) == Down or status(st, par) == Gone", "par == p"),
     ("forget keeps the forgotten agent's mailbox",
      "mailbox: s.mailbox.keys().mapBy(x => if (gone.contains(x)) List() else s.mailbox.get(x)),\n      leases", "leases"),
 ]

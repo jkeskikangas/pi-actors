@@ -42,8 +42,8 @@ export async function startPane(rootPaneId: string, name: string, cwd: string, p
 	if (!paneId) throw new Error("herdr pane split returned no pane id");
 	try {
 		// The child learns its own pane: if it loses its tree it closes the pane itself (a herdr pane
-		// is a shell that outlives pi). Never from HERDR_PANE_ID, which a headless child inherits
-		// from the root.
+		// is a shell that outlives pi). Explicit, rather than read from the environment: the broker
+		// strips herdr's pane identity from children (N2).
 		await herdr(["agent", "start", name, "--kind", "pi", "--pane", paneId, "--timeout", "120000", "--", ...piArgs, `--actors-pane=${paneId}`], 130_000);
 	} catch (err) {
 		await closePane(paneId);

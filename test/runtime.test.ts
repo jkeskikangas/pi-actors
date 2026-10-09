@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { after, test } from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -156,4 +156,43 @@ test("a pane child that lost its tree closes exactly its own pane on exit, and o
 	process.removeListener("exit", hook);
 	hook();
 	assert.deepEqual(calls, [[process.env.HERDR_BIN ?? "herdr", "pane", "close", "w1:p9"]]);
+});
+
+test("finished trees older than the retention lose all but a finished marker; nothing else is touched", async () => {
+	const saved = process.env.PI_ACTORS_HOME;
+	const home = mkdtempSync("/tmp/pia-prune-");
+	process.env.PI_ACTORS_HOME = home;
+	try {
+		const { ensureBroker, pruneFinishedTrees } = await import("../src/client/launcher.ts");
+		const day = 24 * 3600 * 1000;
+		const now = Date.now();
+		const tree = (id: string, status: object | undefined, ageDays: number, lockPid?: number) => {
+			const dir = join(home, "trees", id);
+			mkdirSync(join(dir, "sessions"), { recursive: true });
+			writeFileSync(join(dir, "sessions", "kid.jsonl"), "{}\n");
+			writeFileSync(join(dir, "events.log"), "");
+			if (lockPid) writeFileSync(join(dir, "broker.lock"), JSON.stringify({ pid: lockPid, bootTime: 0 }));
+			if (status) {
+				writeFileSync(join(dir, "status.json"), JSON.stringify(status));
+				const t = new Date(now - ageDays * day);
+				utimesSync(join(dir, "status.json"), t, t);
+			}
+			return dir;
+		};
+		const old = tree("old", { finished: true }, 8);
+		const young = tree("young", { finished: true }, 6);
+		const running = tree("running", { finished: false }, 30);
+		const noStatus = tree("nostatus", undefined, 30);
+		const closing = tree("closing", { finished: true }, 30, process.pid);
+		assert.deepEqual(pruneFinishedTrees(7 * day, now), ["old"]);
+		assert.deepEqual(readdirSync(old), ["status.json"]);
+		assert.equal(JSON.parse(readFileSync(join(old, "status.json"), "utf8")).finished, true);
+		for (const kept of [young, running, noStatus, closing]) assert.ok(readdirSync(kept).includes("sessions"), kept);
+		assert.deepEqual(pruneFinishedTrees(7 * day, now + 365 * day), ["young"], "a pruned tree is not pruned again; the closing one still holds its lock");
+		await assert.rejects(ensureBroker({ treeId: "old", rootCwd: home }), /finished/, "a recorded id never restarts as an empty tree");
+	} finally {
+		if (saved === undefined) delete process.env.PI_ACTORS_HOME;
+		else process.env.PI_ACTORS_HOME = saved;
+		rmSync(home, { recursive: true, force: true });
+	}
 });

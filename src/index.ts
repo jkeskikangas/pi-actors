@@ -14,7 +14,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { matchesKey, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { Client } from "./client/connection.ts";
-import { ensureBroker } from "./client/launcher.ts";
+import { DEFAULT_KEEP_FINISHED_DAYS, ensureBroker, pruneFinishedTrees } from "./client/launcher.ts";
 import { dedupeContext, ENTRY_TYPE, endNotice, formatDelivery, Mailroom, summarizeDelivery } from "./client/mailroom.ts";
 import { agentLine, endedRoots, initialState, items, type PanelAction, type PanelKey, type PanelState, press, readTranscript, summary, view, withSnapshot } from "./client/panel.ts";
 import type { Snapshot } from "./client/connection.ts";
@@ -93,6 +93,7 @@ export default function piActors(pi: ExtensionAPI) {
 		// The root: the tree this process is running (carried across a session switch) wins over
 		// the tree the session recorded (N4); then the recorded one; then a new one. A finished tree
 		// (stopped, or its root was gone too long) is skipped (F7).
+		pruneOnce();
 		const candidates = [...new Set([carriedTreeId(), rootTreeId(ctx)].filter((x): x is string => !!x)), newTreeId()];
 		for (let attempt = 0; ; attempt++) {
 			const treeId = candidates[attempt];
@@ -193,10 +194,32 @@ export default function piActors(pi: ExtensionAPI) {
 		return undefined;
 	}
 
-	/** User limits from ~/.pi/agent/pi-actors.json: {"maxDepth": 2, "maxSpawns": 40}. */
+	/** User settings in ~/.pi/agent/pi-actors.json: {"maxDepth": 2, "maxSpawns": 40, "keepFinishedDays": 7}. */
+	function readSettings(): Record<string, unknown> {
+		try {
+			return JSON.parse(readFileSync(join(homedir(), ".pi", "agent", "pi-actors.json"), "utf8"));
+		} catch {
+			return {};
+		}
+	}
+
+	/** Once per process, when a root connects: clear old finished trees off the disk. */
+	let pruned = false;
+	function pruneOnce() {
+		if (pruned) return;
+		pruned = true;
+		const days = readSettings().keepFinishedDays;
+		const keep = typeof days === "number" && days >= 0 ? days : DEFAULT_KEEP_FINISHED_DAYS;
+		try {
+			pruneFinishedTrees(keep * 24 * 3600 * 1000);
+		} catch {
+			// best effort
+		}
+	}
+
 	function readLimits(): Partial<Limits> | undefined {
 		try {
-			const raw = JSON.parse(readFileSync(join(homedir(), ".pi", "agent", "pi-actors.json"), "utf8"));
+			const raw = readSettings() as { maxDepth: number; maxSpawns: number };
 			const out: Partial<Limits> = {};
 			if (Number.isInteger(raw.maxDepth) && raw.maxDepth >= 0) out.maxDepth = raw.maxDepth;
 			if (Number.isInteger(raw.maxSpawns) && raw.maxSpawns >= 0) out.maxSpawns = raw.maxSpawns;
