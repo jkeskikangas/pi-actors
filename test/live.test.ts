@@ -3,14 +3,26 @@
 // report, stops the child and receives its end notice.
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { after, test } from "node:test";
 import { fileURLToPath } from "node:url";
 
 const here = (p: string) => fileURLToPath(new URL(p, import.meta.url));
 const home = mkdtempSync("/tmp/pia-live-");
+/** herdr panes this run opened (a child's pane runs in its cwd, under `home`). */
+const ourPanes = (under = home): string[] => {
+	const r = spawnSync("herdr", ["pane", "list"], { encoding: "utf8" });
+	try {
+		return (JSON.parse(r.stdout).result.panes as { pane_id: string; cwd?: string }[]).filter((p) => p.cwd?.startsWith(realpathSync(under))).map((p) => p.pane_id);
+	} catch {
+		return [];
+	}
+};
+
 after(() => {
+	// A failed test can leave panes behind once its processes are killed: close them first.
+	if (process.env.HERDR_ENV === "1") for (const p of ourPanes()) spawnSync("herdr", ["pane", "close", p]);
 	try {
 		spawn("pkill", ["-f", home]);
 	} catch {}
@@ -119,6 +131,20 @@ test("pane placement: an interactive child in a herdr pane reports and is stoppe
 	const texts = await runRoot("./fixtures/faux-root-pane.ts", "start", "PANE DONE");
 	assert.ok(texts.some((t) => t.includes("Report from panekid") && t.includes("hello from kid")), texts.join("\n"));
 	assert.ok(!texts.some((t) => t.includes("panekid ended")), texts.join("\n"));
+});
+
+test("a herdr pane child whose broker died closes its own pane", { timeout: 240_000, skip: process.env.HERDR_ENV !== "1" ? "needs herdr" : false }, async () => {
+	const dir = join(home, "orphan"); // its own cwd: other tests' panes may still be closing
+	mkdirSync(dir);
+	await runRoot("./fixtures/faux-root-orphan.ts", "start", "ORPHAN READY"); // the root exits after this
+	const panes = ourPanes(dir);
+	assert.equal(panes.length, 1, "the child's pane");
+	spawnSync("pkill", ["-9", "-f", `broker/main.ts ${join(home, "h")}`]);
+	// The child gives up on the broker after its grace period (60 s), then exits and closes its pane.
+	for (let i = 0; ourPanes(dir).includes(panes[0]); i++) {
+		assert.ok(i < 180, "the orphaned pane was not closed");
+		await new Promise((r) => setTimeout(r, 1000));
+	}
 });
 
 const hasTmux = (() => {

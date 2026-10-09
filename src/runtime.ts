@@ -1,6 +1,7 @@
 // Paths, broker lock, runtime snapshot and node resolution (design D12, D13).
 // Used by both the agent side (Launcher) and the broker; no pi or typebox imports.
 
+import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { closeSync, cpSync, existsSync, linkSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync, writeSync } from "node:fs";
 import { homedir, tmpdir, uptime, userInfo } from "node:os";
@@ -246,6 +247,23 @@ export interface KeeperSpec {
 
 /** herdr agent names are global across herdr: prefix with the tree id. */
 // herdr requires: lowercase letter first, then [a-z0-9_-], at most 32 characters.
+/**
+ * A herdr pane child that lost its tree closes its own pane as the process exits: the pane is a
+ * shell that pi runs in, and the broker that would close it is gone. A no-op without a pane id.
+ */
+export function closeOwnPaneOnExit(paneId: unknown, run: (bin: string, args: string[]) => void = detachedRun): void {
+	if (typeof paneId !== "string" || !paneId) return;
+	process.once("exit", () => run(process.env.HERDR_BIN ?? "herdr", ["pane", "close", paneId]));
+}
+
+function detachedRun(bin: string, args: string[]) {
+	try {
+		spawn(bin, args, { detached: true, stdio: "ignore" }).unref();
+	} catch {
+		// best effort: the pane stays open
+	}
+}
+
 export const paneAgentName = (treeId: string, id: string) =>
 	`a${treeId.slice(-6)}-${id}`.toLowerCase().replace(/[^a-z0-9_-]/g, "-").slice(0, 32);
 

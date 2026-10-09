@@ -18,7 +18,7 @@ import { ensureBroker } from "./client/launcher.ts";
 import { dedupeContext, ENTRY_TYPE, endNotice, formatDelivery, Mailroom, summarizeDelivery } from "./client/mailroom.ts";
 import { agentLine, endedRoots, initialState, items, type PanelAction, type PanelKey, type PanelState, press, readTranscript, summary, view, withSnapshot } from "./client/panel.ts";
 import type { Snapshot } from "./client/connection.ts";
-import { detectMux, paneAgentName, stateRoot } from "./runtime.ts";
+import { closeOwnPaneOnExit, detectMux, paneAgentName, stateRoot } from "./runtime.ts";
 import { type Limits, type Message, TIMING } from "./protocol.ts";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -33,7 +33,7 @@ function isInertCopy(argv: string[] = process.argv): boolean {
 
 export default function piActors(pi: ExtensionAPI) {
 	if (isInertCopy()) return;
-	for (const name of ["runtime", "socket", "tree", "id", "inc"]) pi.registerFlag(`actors-${name}`, { type: "string", description: `pi-actors internal (${name})` });
+	for (const name of ["runtime", "socket", "tree", "id", "inc", "pane"]) pi.registerFlag(`actors-${name}`, { type: "string", description: `pi-actors internal (${name})` });
 
 	let client: Client | undefined;
 	let mailroom: Mailroom | undefined;
@@ -128,16 +128,19 @@ export default function piActors(pi: ExtensionAPI) {
 			void refreshUi();
 		});
 		c.on("terminate", () => current() && terminate());
-		const gone = () => {
+		const gone = (orphaned: boolean) => {
 			if (!current()) return;
 			client = undefined;
 			// A child that lost its identity (tree finished, superseded, or the broker gone past G)
-			// must not run on unlinked (F5).
-			if (isChild()) terminate();
+			// must not run on unlinked (F5). Orphaned, nobody else will close its herdr pane;
+			// superseded, another process holds the identity and may be in that very pane.
+			if (!isChild()) return;
+			if (orphaned) closeOwnPaneOnExit(pi.getFlag("actors-pane"));
+			terminate();
 		};
-		c.on("superseded", gone);
-		c.on("rejected", gone);
-		c.on("lost", gone);
+		c.on("superseded", () => gone(false));
+		c.on("rejected", () => gone(true));
+		c.on("lost", () => gone(true));
 		// Set before start(): the welcome handler delivers queued mail immediately.
 		client = c;
 		mailroom = room;
