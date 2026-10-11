@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { dedupeContext, ENTRY_TYPE, type Fetcher, formatDelivery, Mailroom, summarizeDelivery } from "../src/client/mailroom.ts";
+import { cutReport, dedupeContext, ENTRY_TYPE, type Fetcher, formatDelivery, Mailroom, summarizeDelivery } from "../src/client/mailroom.ts";
 import type { Message } from "../src/protocol.ts";
 
 function fetcher(queue: Message[]): Fetcher & { acked: string[] } {
@@ -13,6 +13,28 @@ function fetcher(queue: Message[]): Fetcher & { acked: string[] } {
 }
 const msg = (id: string, extra: Partial<Message> = {}): Message => ({ id, from: "root", to: "a", kind: "mail", body: `body ${id}`, ...extra });
 const entry = (ids: string[], self = "a") => ({ type: "custom_message", customType: ENTRY_TYPE, details: { actors: { id: self, consumed: ids } } });
+
+test("#6: a report over 16K characters reaches the parent cut, still naming the child's session file", () => {
+	const file = "/s/kid.jsonl";
+	assert.equal(cutReport("short", file), "short");
+	const exact = "x".repeat(16 * 1024);
+	assert.equal(cutReport(exact, file), exact, "exactly 16 KiB is not cut");
+	const shown = formatDelivery([msg("r", { from: "kid", tag: "report", body: cutReport("x".repeat(40_000), file) })]);
+	assert.match(shown, /truncated; full text in \/s\/kid\.jsonl/);
+	assert.doesNotMatch(shown, /ask the sender/, "not cut a second time at delivery");
+	const at = (n: number) => formatDelivery([msg("m", { body: "y".repeat(n) })]);
+	assert.doesNotMatch(at(16 * 1024), /truncated/, "a message of exactly 16K characters arrives whole");
+	assert.match(at(16 * 1024 + 1), /truncated/, "one character more arrives cut (send's tool text)");
+	const lone = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+	// Both parities, so one of them puts the cut between the halves of a surrogate pair.
+	for (const text of ["😀".repeat(20_000), `a${"😀".repeat(20_000)}`]) {
+		const body = cutReport(text, file);
+		assert.ok(body.length <= 16 * 1024, `marker and path fit the inline limit (${body.length})`);
+		assert.ok(Buffer.byteLength(body) > 16 * 1024, "the limit counts characters, not bytes (tool text says 16K characters)");
+		assert.doesNotMatch(body, lone, "no surrogate pair split");
+		assert.match(body, /full text in \/s\/kid\.jsonl\)$/);
+	}
+});
 
 test("drain collects a batch; settle acks only what is persisted", async () => {
 	const room = new Mailroom("a");

@@ -256,6 +256,59 @@ test("a session switch keeps the tree even when the process uptime clock jumped 
 	}
 });
 
+// Issue #6: tool text states what the tools do, accurately and once; workflow policy is left to the project.
+const toolText = (t: any) => [
+	t.description,
+	t.promptSnippet,
+	...(t.promptGuidelines ?? []),
+	...Object.values(t.parameters.properties).map((p: any) => p.description).filter(Boolean),
+] as string[];
+
+test("#6: no tool text prescribes when to delegate, what to report or how to escalate", () => {
+	const h = root();
+	const policy = /delegat|escalat|trivial|well-scoped|own context|quote|forward|decision|ask the user|final answer should|no longer need/i;
+	for (const name of ["spawn", "send", "stop"]) for (const s of toolText(h.tools[name])) assert.doesNotMatch(s, policy, `${name}: ${s}`);
+});
+
+test("#6: no fact appears twice across a tool's description, summary, guidelines and parameters", () => {
+	const h = root();
+	const words = (s: string) => s.toLowerCase().replace(/[^a-z0-9 ]/g, " ").split(/\s+/).filter(Boolean);
+	for (const name of ["spawn", "send", "stop"]) {
+		const t = h.tools[name];
+		assert.ok(!t.promptSnippet.startsWith(`${name}:`), `pi already prefixes the snippet with "${name}:"`);
+		const seen = new Map<string, number>();
+		// Field by field, sentence by sentence: a 4-word run shared by two of them restates a fact.
+		const parts = toolText(t).flatMap((field) => field.split(/(?<=[.;:])\s+/));
+		parts.forEach((part, i) => {
+			const w = words(part);
+			for (let k = 0; k + 4 <= w.length; k++) {
+				const g = w.slice(k, k + 4).join(" ");
+				const j = seen.get(g);
+				assert.ok(j === undefined || j === i, `${name}: "${g}" in both "${parts[j!]}" and "${part}"`);
+				seen.set(g, i);
+			}
+		});
+	}
+});
+
+test("#6: send says any agent in the tree is reachable and the user only through the parent", () => {
+	const d = root().tools.send.description;
+	assert.match(d, /any agent in your tree/);
+	assert.match(d, /only the root agent can reach the user/i);
+	assert.match(d, /through its parent/);
+	assert.match(d, /over 16K characters arrives cut/, "delivery cuts long messages (mailroom formatOne)");
+	for (const name of ["spawn", "send", "stop"]) for (const s of toolText(root().tools[name])) assert.doesNotMatch(s, /KiB/, `${name}: limits are in characters`);
+	assert.doesNotMatch(root().tools.send.promptSnippet, /child or your parent/);
+});
+
+test("#6: spawn says reports over 16K characters are cut and name the session file with the full text", () => {
+	const d = root().tools.spawn.description;
+	assert.match(d, /over 16K characters/, "the cut counts characters (mailroom INLINE_LIMIT), not bytes");
+	assert.match(d, /session file/);
+	assert.match(d, /continue it with send/);
+	assert.match(root().tools.spawn.parameters.properties.resume.description, /ended child/);
+});
+
 test("a tool call whose signal is already aborted does not start anything", async () => {
 	const h = root();
 	await assert.rejects(h.tools.spawn.execute("c1", { task: "echo", name: "never" }, AbortSignal.abort(), undefined, h.ctx), /abort/i);

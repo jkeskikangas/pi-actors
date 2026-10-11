@@ -15,7 +15,7 @@ import { type Component, matchesKey, type OverlayHandle } from "@earendil-works/
 import { Type } from "typebox";
 import { Client } from "./client/connection.ts";
 import { DEFAULT_KEEP_FINISHED_DAYS, ensureBroker, pruneFinishedTrees } from "./client/launcher.ts";
-import { dedupeContext, ENTRY_TYPE, endNotice, formatDelivery, Mailroom } from "./client/mailroom.ts";
+import { cutReport, dedupeContext, ENTRY_TYPE, endNotice, formatDelivery, Mailroom } from "./client/mailroom.ts";
 import { type AgentItem, agentLine, endedRoots, initialState, items, type Line, type PanelAction, type PanelKey, type PanelState, press, summary, view, withSnapshot } from "./client/panel.ts";
 import { captureRunner, readSession, renderDelivery, Transcript } from "./client/transcript.ts";
 import type { Snapshot } from "./client/connection.ts";
@@ -24,7 +24,6 @@ import { type Limits, type Message, TIMING } from "./protocol.ts";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT_ENTRY = "pi-actors-root";
-const REPORT_LIMIT = 16 * 1024;
 
 /** Double-load rule (spike): decide from argv in the factory, before registering anything. */
 function isInertCopy(argv: string[] = process.argv): boolean {
@@ -568,7 +567,7 @@ export default function piActors(pi: ExtensionAPI) {
 		if (client && mailroom) for (const id of mailroom.reclaim(ctx.sessionManager.getEntries())) client.release(id);
 		// A child's final answer is its report (no exit tool to forget).
 		if (isChild() && client && parent && lastAssistantText.trim() && !lastRunInteractive) {
-			const body = lastAssistantText.length > REPORT_LIMIT ? `${lastAssistantText.slice(0, REPORT_LIMIT)}\n…(truncated; full text in ${ctx.sessionManager.getSessionFile()})` : lastAssistantText;
+			const body = cutReport(lastAssistantText, ctx.sessionManager.getSessionFile());
 			lastAssistantText = "";
 			await client.op("send", { to: parent, kind: "mail", tag: "report", body });
 		}
@@ -593,22 +592,19 @@ export default function piActors(pi: ExtensionAPI) {
 		name: "spawn",
 		label: "Spawn agent",
 		description:
-			"Start a child agent on a task. Returns its id immediately; its report (its final answer) is pushed to you each time it finishes a run, so end your turn to wait. Spawn several in a row to run them in parallel. Continue a finished child with send. fork: true gives the child your whole conversation.",
-		promptSnippet: "spawn: start a child agent (fresh or forked from this conversation, any model)",
-		promptGuidelines: [
-			"Delegate independent, well-scoped work with spawn; give each child a clear task and expected output. Don't spawn for trivial steps.",
-			"After spawning, end your turn: reports and messages arrive by themselves. Never poll.",
-		],
+			"Start a child agent on a task and return its id at once. Each time the child finishes a run, its final answer is pushed to you as a report; a report over 16K characters is cut and names the child's session file, which holds the full text. Several spawns in a row run in parallel. A child that finished a run stays alive: continue it with send.",
+		promptSnippet: "run a task in a child agent",
+		promptGuidelines: ["After spawning, end your turn: reports and messages arrive by themselves, so never poll."],
 		parameters: Type.Object({
-			task: Type.String({ description: "What the child should do and what its final answer should contain." }),
+			task: Type.String({ description: "The child's instructions, delivered to it as a message." }),
 			name: Type.Optional(Type.String({ description: "Short readable name, e.g. 'backend'." })),
 			model: Type.Optional(Type.String({ description: "provider/model; default: yours." })),
 			thinking: Type.Optional(Type.String({ description: "Thinking level, e.g. low, medium, high." })),
 			fork: Type.Optional(Type.Boolean({ description: "Start from a copy of this conversation instead of a fresh context." })),
 			cwd: Type.Optional(Type.String({ description: "Working directory, e.g. a git worktree." })),
-			pane: Type.Optional(Type.Boolean({ description: "Run in a visible pane the human can watch and talk to (only when pi runs inside herdr or tmux)." })),
-			timeout_minutes: Type.Optional(Type.Number({ description: "Stop the child after this much active time." })),
-			resume: Type.Optional(Type.String({ description: "Id of an ended child to restart with its conversation." })),
+			pane: Type.Optional(Type.Boolean({ description: "Run in a visible pane the user can watch and talk to; runs the user starts there are not reported (only when pi runs inside herdr or tmux)." })),
+			timeout_minutes: Type.Optional(Type.Number({ description: "Stop the child this many minutes after it starts (machine sleep not counted)." })),
+			resume: Type.Optional(Type.String({ description: "Id of your ended child to restart with its conversation, instead of starting a new one." })),
 		}),
 		async execute(_id, p, signal, _onUpdate, ctx) {
 			ctxRef = ctx;
@@ -635,14 +631,10 @@ export default function piActors(pi: ExtensionAPI) {
 		name: "send",
 		label: "Send message",
 		description:
-			"Send a message to another agent (its id) or to your parent (\"parent\"). Never blocks: answers, reports and end notices arrive by themselves. Use reply_to to answer a message you received.",
-		promptSnippet: "send: message a child or your parent (answers are pushed to you)",
-		promptGuidelines: [
-			"Messages from other agents arrive by themselves; answer one with send{to, text, reply_to: <its msg id>} when it needs an answer.",
-			"A decision you cannot make from your own context goes to your parent with send{to: \"parent\"}. When a child asks you something, answer from your own context if you can; otherwise ask your own parent (quote the question and name the asking agent) or, with no parent, ask the user yourself. Then send the answer back with reply_to.",
-		],
+			"Send a message to any agent in your tree that has not ended. It does not wait for a reply: replies arrive by themselves. A message over 16K characters arrives cut. Only the root agent can reach the user; any other agent reaches the user through its parent.",
+		promptSnippet: "message other agents",
 		parameters: Type.Object({
-			to: Type.String({ description: "Agent id or \"parent\"." }),
+			to: Type.String({ description: "Agent id, or \"parent\"." }),
 			text: Type.String(),
 			reply_to: Type.Optional(Type.String({ description: "The msg id you are answering." })),
 			urgent: Type.Optional(Type.Boolean({ description: "Deliver mid-turn instead of after the recipient's current run." })),
@@ -664,7 +656,7 @@ export default function piActors(pi: ExtensionAPI) {
 		name: "stop",
 		label: "Stop agent",
 		description: "Stop a descendant agent (and its own children).",
-		promptSnippet: "stop: end a child agent you no longer need",
+		promptSnippet: "end an agent below you in the tree",
 		parameters: Type.Object({ id: Type.String() }),
 		async execute(_id, p, signal, _onUpdate, ctx) {
 			ctxRef = ctx;

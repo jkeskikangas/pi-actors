@@ -14,7 +14,7 @@ Running agents in the background goes wrong in predictable ways: messages get lo
 - **No orphaned agents.** If an agent goes away and doesn't come back within a short grace period, its children are stopped, and so are theirs. Nothing keeps running and spending tokens unseen.
 - **No polling.** Results and messages are pushed into the agent's conversation when they arrive. An agent waiting for children simply ends its turn and is woken up.
 - **Three tools, small and hard to misuse.** `spawn`, `send` and `stop` add about 700 tokens to the context. There are no multi-purpose tools with dozens of options for the model to get wrong.
-- **One voice talks to you.** Agents only talk to each other. A child that needs a decision asks its parent, which answers from its own context when it can and otherwise asks further up. Only your session's agent asks you, in its own words and its own way.
+- **One voice talks to you.** Agents only talk to each other. A question can travel up the tree, parent by parent, and only your session's agent asks you, in its own words and its own way. When agents delegate and when they escalate is up to your workflow, not built into the tools.
 - **Checked, not just tested.** The coordination protocol is written as formal models in [Quint](https://quint-lang.org), a specification language built on TLA+'s logic: message delivery, the agent lifecycle (clearing ended agents included), and which process may act as which agent. Tools explore thousands of interleavings of crashes, reloads, retries and restarts against their guarantees. Deliberately injected bugs are caught every time, and the implementation is tested against the same guarantees.
 
 ## The three tools
@@ -22,12 +22,12 @@ Running agents in the background goes wrong in predictable ways: messages get lo
 | Tool | What it does |
 |---|---|
 | `spawn{task, name?, model?, thinking?, fork?, cwd?, pane?, timeout_minutes?, resume?}` | Starts a child and returns its id immediately. `fork: true` gives the child a copy of this conversation. `model` can be any provider's model, and `cwd` can point to, say, a git worktree. `pane: true` runs the child in a visible pane when pi runs inside [herdr](https://herdr.dev) or tmux. |
-| `send{to, text, reply_to?, urgent?}` | Sends a message to a child (by id) or to `"parent"`. It never blocks. `reply_to` answers a message. |
-| `stop{id}` | Stops a child, together with its own children. |
+| `send{to, text, reply_to?, urgent?}` | Sends a message to any agent in the tree that has not ended (by id), or to `"parent"`. It doesn't wait for a reply. A message over 16K characters arrives cut. `reply_to` answers a message. |
+| `stop{id}` | Stops a descendant, together with its own children. |
 
 What arrives by itself:
 
-- **Reports:** each time a child finishes a piece of work, its final answer is delivered to its parent. The child then waits; another `send` continues it.
+- **Reports:** each time a child finishes a piece of work, its final answer is delivered to its parent (over 16K characters, it is cut and names the child's session file, which holds the full text). The child then waits; another `send` continues it.
 - **Messages and answers:** from other agents. Answers say which message they reply to.
 - **End notices:** if a child crashes, times out or is lost, the parent hears about it once, with the reason. A child the parent stopped itself ends quietly.
 

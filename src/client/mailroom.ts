@@ -169,6 +169,15 @@ export function dedupeContext<T>(self: string, messages: readonly T[]): T[] | un
 
 const clean = (s: string) => s.replace(/[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/g, "");
 
+/** A child's final answer as its report: a long one is cut to fit delivery whole, naming the file with the full text. */
+export function cutReport(text: string, sessionFile: string | undefined): string {
+	if (text.length <= INLINE_LIMIT) return text;
+	const note = `\n…(truncated; full text in ${sessionFile ?? "its session"})`;
+	let end = INLINE_LIMIT - note.length;
+	if (/[\uD800-\uDBFF]/.test(text[end - 1] ?? "")) end -= 1; // never split a surrogate pair
+	return `${text.slice(0, end)}${note}`;
+}
+
 /** One delivery as the model reads it: sender-labelled, never phrased as user input. */
 export function formatDelivery(messages: readonly Message[]): string {
 	return messages.map(formatOne).join("\n\n");
