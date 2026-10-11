@@ -173,7 +173,9 @@ const clean = (s: string) => s.replace(/[\u0000-\u0008\u000b-\u001f\u007f-\u009f
 export function cutReport(text: string, sessionFile: string | undefined): string {
 	if (text.length <= INLINE_LIMIT) return text;
 	const note = `\n…(truncated; full text in ${sessionFile ?? "its session"})`;
-	return `${text.slice(0, INLINE_LIMIT - note.length)}${note}`;
+	let end = INLINE_LIMIT - note.length;
+	if (/[\uD800-\uDBFF]/.test(text[end - 1] ?? "")) end -= 1; // never split a surrogate pair
+	return `${text.slice(0, end)}${note}`;
 }
 
 /** One delivery as the model reads it: sender-labelled, never phrased as user input. */

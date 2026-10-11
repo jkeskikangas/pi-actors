@@ -22,6 +22,14 @@ test("#6: a report over 16 KiB reaches the parent cut, still naming the child's 
 	const shown = formatDelivery([msg("r", { from: "kid", tag: "report", body: cutReport("x".repeat(40_000), file) })]);
 	assert.match(shown, /truncated; full text in \/s\/kid\.jsonl/);
 	assert.doesNotMatch(shown, /ask the sender/, "not cut a second time at delivery");
+	const lone = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+	// Both parities, so one of them puts the cut between the halves of a surrogate pair.
+	for (const text of ["😀".repeat(20_000), `a${"😀".repeat(20_000)}`]) {
+		const body = cutReport(text, file);
+		assert.ok(body.length <= 16 * 1024, `marker and path fit the inline limit (${body.length})`);
+		assert.doesNotMatch(body, lone, "no surrogate pair split");
+		assert.match(body, /full text in \/s\/kid\.jsonl\)$/);
+	}
 });
 
 test("drain collects a batch; settle acks only what is persisted", async () => {
