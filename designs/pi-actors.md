@@ -373,18 +373,20 @@ Why: the parent briefed the child and usually holds the answer; the user hears o
   - the launcher touches the socket path every hour, so macOS's periodic `/tmp` cleanup doesn't remove it.
 - **Validated by:** `test/launch.test.ts` (two concurrent launchers produce one broker; a stale lock after a "reboot" is replaced) and `test/log.test.ts`.
 
-### D14: Only two limits: nesting depth and spawn count (v3, per user direction)
+### D14: Only two limits: nesting depth and running agents (v3; running count 2026-10-11, per user direction)
 
 - **Decision:**
 
   - `max_depth`: default 2;
-  - `max_spawns`: total spawns in the tree, counting resumes, default 40.
+  - `max_spawns`: agents running at once below an agent, default 50. An agent counts from spawn (or resume) until it is `down`, so one that finished, failed to start or was killed frees its place; one being killed holds it until its process is gone. The count is derived from agent status at spawn time, never stored, so replay and old event logs need nothing.
 
-  Both come from settings (`piActors.maxDepth`, `piActors.maxSpawns`) or `/actors limits`. A `spawn{limits}` may only *tighten* them for the child's subtree: that subtree's spawns count against both its own cap and every ancestor's.
+  Both come from settings (`piActors.maxDepth`, `piActors.maxSpawns`; the key keeps its name for existing settings files) or `/actors limits`. A `spawn{limits}` may only *tighten* them for the child's subtree: that subtree's running agents count against both its own cap and every ancestor's. `spawns` remains a per-agent lifetime statistic in `/actors` status.
 
-- **Driver:** INV-5. Both limits are workload-independent. Depth bounds recursion; the spawn count bounds total cost and total processes.
+- **Driver:** INV-5. Both limits are workload-independent. Depth bounds recursion; the running count bounds concurrent processes and cost rate.
 
-- **Alternatives:** caps on live children, live agents or pending calls, and budgets per root child (v2/v3 drafts). Rejected: they encode one workflow's shape (a backlog coordinator) and make other workflows tune knobs that don't protect anything the two limits don't.
+- **Superseded (2026-10-11):** the first D14 capped *total* spawns in the tree at 40, counting resumes and failed starts. In a long orchestrating session that exhausted the root's budget with every agent already finished (one tree: 16 children and 24 grandchildren, none running), and failed starts spent budget without doing work. 40 had no recorded rationale; 50 is the user's choice and, like 40, not derived from a measurement.
+
+- **Alternatives:** caps on live children only, pending calls, and budgets per root child (v2/v3 drafts). Rejected: they encode one workflow's shape (a backlog coordinator) and make other workflows tune knobs that don't protect anything the two limits don't. A total-spawn cap: rejected 2026-10-11 as above.
 
 - **Reversibility:** cheap.
 

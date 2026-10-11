@@ -50,7 +50,7 @@ export interface Agent {
 	sessionFile?: string;
 	spec?: SpawnRequest;
 	limits: Limits;
-	/** Spawns admitted in this agent's subtree (counted at every ancestor). */
+	/** Spawns admitted in this agent's subtree, resumes included (statistics; the limit counts running agents). */
 	spawns: number;
 	resumes: number;
 	/** Deadline of the current status (starting, disconnected, exiting, killing). */
@@ -333,13 +333,28 @@ function ancestors(st: TreeState, a: Agent): Agent[] {
 	return out;
 }
 
+/** Agents not yet down below each member of `chain`: derived from status, so nothing to reclaim or replay. */
+function running(st: TreeState, chain: Agent[]): Map<string, number> {
+	const counts = new Map(chain.map((x) => [x.id, 0]));
+	for (const a of Object.values(st.agents)) {
+		if (a.status === "down") continue;
+		for (let p = a.parent ? st.agents[a.parent] : undefined; p; p = p.parent ? st.agents[p.parent] : undefined) {
+			const n = counts.get(p.id);
+			if (n !== undefined) counts.set(p.id, n + 1);
+		}
+	}
+	return counts;
+}
+
 function spawn(st: TreeState, parent: Agent, ev: Extract<Event, { type: "spawn" }>, fx: Effect[]): Response {
 	const req = ev.req;
 	if (byteLength(req.task) > LIMITS.frameBytes) return fail("too_large");
 	const chain = ancestors(st, parent);
 	// Limits are absolute and only tighten down the tree, so the parent's depth limit is the effective one.
 	if (!req.resume && parent.depth + 1 > parent.limits.maxDepth) return fail("limit_depth");
-	if (chain.some((x) => x.spawns >= x.limits.maxSpawns)) return fail("budget_exhausted");
+	const live = running(st, chain);
+	const full = chain.find((x) => (live.get(x.id) ?? 0) >= x.limits.maxSpawns);
+	if (full) return fail("budget_exhausted", `${full.limits.maxSpawns} agents already running under ${full.id}`);
 	if (parent.reserve >= LIMITS.reserve) return fail("mailbox_full", "no DOWN reserve left");
 
 	let child: Agent;

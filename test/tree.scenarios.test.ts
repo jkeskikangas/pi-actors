@@ -216,7 +216,7 @@ test("forget is replayable and survives a snapshot written before it existed", (
 
 // ---- limits, mailbox ------------------------------------------------------------------
 
-test("limits: depth and the spawn count apply at every ancestor; a subtree can only tighten them", () => {
+test("limits: depth and the running-agent cap apply at every ancestor; a subtree can only tighten them", () => {
 	const d = driver({ maxDepth: 2, maxSpawns: 3 });
 	d.hello(ROOT, 1);
 	d.spawn(ROOT, { name: "a", limits: { maxSpawns: 1, maxDepth: 5 } });
@@ -225,9 +225,28 @@ test("limits: depth and the spawn count apply at every ancestor; a subtree can o
 	assert.equal(d.spawn("a", { name: "c" }).ok, true);
 	d.start("a.c", 300);
 	assert.deepEqual(d.spawn("a.c", { name: "x" }), { ok: false, error: "limit_depth", detail: undefined });
-	assert.deepEqual(d.spawn("a", { name: "d" }), { ok: false, error: "budget_exhausted", detail: undefined }, "a's own cap of 1");
+	assert.deepEqual(d.spawn("a", { name: "d" }), { ok: false, error: "budget_exhausted", detail: "1 agents already running under a" }, "a's own cap of 1");
 	assert.equal(d.spawn(ROOT, { name: "b" }).ok, true);
-	assert.deepEqual(d.spawn(ROOT, { name: "e" }), { ok: false, error: "budget_exhausted", detail: undefined }, "tree cap of 3");
+	assert.deepEqual(d.spawn(ROOT, { name: "e" }), { ok: false, error: "budget_exhausted", detail: "3 agents already running under root" }, "tree cap of 3");
+});
+
+test("limits: an agent that ends, fails to start or is killed frees its place", () => {
+	const d = driver({ maxDepth: 2, maxSpawns: 1 });
+	d.hello(ROOT, 1);
+	assert.equal(d.spawn(ROOT, { name: "a" }).ok, true);
+	assert.equal(d.spawn(ROOT, { name: "b" }).ok, false, "a still starting");
+	d.run({ type: "procExit", now: 0, id: "a", inc: 1, code: null, signal: "start_failed" });
+	assert.equal(d.st.agents.a.status, "down");
+	assert.equal(d.spawn(ROOT, { name: "b" }).ok, true, "a failed start freed its place");
+	d.start("b", 200);
+	d.run({ type: "procExit", now: 0, id: "b", inc: 1, code: 0, signal: null });
+	assert.equal(d.spawn(ROOT, { name: "c" }).ok, true, "b's end freed its place");
+	d.start("c", 300);
+	d.run({ type: "kill", now: 0, from: ROOT, seq: d.nextSeq(ROOT), target: "c" });
+	assert.equal(d.spawn(ROOT, { name: "d" }).ok, false, "a killed agent holds its place until its process is gone");
+	d.run({ type: "procExit", now: 0, id: "c", inc: 1, code: null, signal: "SIGTERM" });
+	assert.equal(d.spawn(ROOT, { name: "d" }).ok, true, "c's kill freed its place");
+	assert.equal(d.st.agents[ROOT].spawns, 4, "spawns stays a lifetime statistic");
 });
 
 test("mailbox: ordinary mail is bounded; DOWN is exempt", () => {
