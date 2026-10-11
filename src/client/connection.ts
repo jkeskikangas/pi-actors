@@ -1,6 +1,8 @@
 // Client: an agent's connection to its tree's broker (design: Identity, Data flow).
 // Sender sequence numbers make retransmits idempotent; unanswered frames are re-sent in order
-// after a reconnect; the connection is retried until the link grace runs out.
+// after a reconnect; the connection is retried until the link grace runs out. A broker that
+// stops answering counts as gone: silence, or any request unanswered, for the heartbeat timeout
+// drops the connection, and the reconnect recovers (issue #5).
 
 import { EventEmitter } from "node:events";
 import { connect, type Socket } from "node:net";
@@ -32,6 +34,10 @@ export interface Snapshot {
 
 type OpFrame = { t: "op"; seq: number; op: string } & Record<string, unknown>;
 
+const WATCHDOG_MS = 1000;
+/** A check this late ran after a sleep or a blocked event loop: it measured us, not the broker. */
+const LATE_MS = 5000;
+
 /**
  * Events: "welcome", "mail" (urgent), "terminate" (reason), "superseded",
  * "rejected" (reason), "lost" (no broker within the grace period).
@@ -48,6 +54,11 @@ export class Client extends EventEmitter {
 	private closed = false;
 	private lostSince: number | undefined;
 	private hb: NodeJS.Timeout | undefined;
+	/** When this connection last heard the broker, and what it still owes: request -> when asked. */
+	private heard = 0;
+	private owed = new Map<string, number>();
+	private watchdog: NodeJS.Timeout | undefined;
+	private checked = 0;
 	connected = false;
 	usage: () => Record<string, number> | undefined = () => undefined;
 
@@ -71,6 +82,7 @@ export class Client extends EventEmitter {
 	private shut(reason: string) {
 		this.closed = true;
 		clearInterval(this.hb);
+		clearInterval(this.watchdog);
 		for (const [, w] of this.waiters) w({ ok: false, error: "not_live", detail: reason });
 		this.waiters.clear();
 		this.inflight = [];
@@ -108,7 +120,12 @@ export class Client extends EventEmitter {
 			this.sock = s;
 			this.buf = "";
 			const { socket: _s, ...id } = this.identity;
-			this.write({ t: "hello", proto: PROTO, ...id });
+			this.heard = this.checked = Date.now();
+			this.owed.clear();
+			this.ask("hello", { t: "hello", proto: PROTO, ...id });
+			clearInterval(this.watchdog);
+			this.watchdog = setInterval(() => this.overdue(Date.now()) && s.destroy(), WATCHDOG_MS);
+			this.watchdog.unref();
 		});
 		s.on("data", (d: string) => this.onData(d));
 		s.on("error", () => {});
@@ -117,6 +134,8 @@ export class Client extends EventEmitter {
 			const was = this.connected;
 			this.connected = false;
 			clearInterval(this.hb);
+			clearInterval(this.watchdog);
+			this.owed.clear();
 			for (const [, r] of this.fetches) r(null); // leases die with the connection
 			this.fetches.clear();
 			if (was) this.emit("disconnected");
@@ -143,7 +162,23 @@ export class Client extends EventEmitter {
 		});
 	}
 
+	/** The broker owes an answer: silence, or any request unanswered, past the heartbeat timeout. */
+	private overdue(now: number): boolean {
+		const late = now - this.checked > LATE_MS;
+		this.checked = now;
+		if (late) {
+			// Restart the clocks: the broker's answers may be waiting unread in the socket.
+			this.heard = now;
+			for (const key of this.owed.keys()) this.owed.set(key, now);
+			return false;
+		}
+		if (now - this.heard >= TIMING.heartbeatTimeoutMs) return true;
+		for (const at of this.owed.values()) if (now - at >= TIMING.heartbeatTimeoutMs) return true;
+		return false;
+	}
+
 	private onData(d: string) {
+		this.heard = Date.now();
 		const { frames, rest } = decode(this.buf + d);
 		this.buf = rest;
 		for (const f of frames as Record<string, any>[]) {
@@ -152,14 +187,16 @@ export class Client extends EventEmitter {
 					this.connected = true;
 					this.lostSince = undefined;
 					this.counter = 0;
+					this.owed.delete("hello");
 					if (this.inflight.length === 0) this.nextSeq = f.lastSeq + 1;
-					for (const op of this.inflight) this.write(op); // retransmit in order
+					for (const op of this.inflight) this.ask(`op:${op.seq}`, op); // retransmit in order
 					clearInterval(this.hb);
 					this.hb = setInterval(() => this.write({ t: "hb", usage: this.usage() }), TIMING.heartbeatMs);
 					this.hb.unref();
 					this.emit("welcome", f);
 					break;
 				case "resp": {
+					this.owed.delete(`op:${f.seq}`);
 					this.inflight = this.inflight.filter((x) => x.seq !== f.seq);
 					const w = this.waiters.get(f.seq);
 					this.waiters.delete(f.seq);
@@ -167,12 +204,14 @@ export class Client extends EventEmitter {
 					break;
 				}
 				case "fetched": {
+					this.owed.delete(`fetch:${f.fetchId}`);
 					const r = this.fetches.get(f.fetchId);
 					this.fetches.delete(f.fetchId);
 					r?.(f.message ?? null);
 					break;
 				}
 				case "inspect": {
+					this.owed.delete(`inspect:${f.reqId}`);
 					const r = this.inspects.get(f.reqId);
 					this.inspects.delete(f.reqId);
 					r?.(f.state);
@@ -203,6 +242,12 @@ export class Client extends EventEmitter {
 		if (this.sock && !this.sock.destroyed) this.sock.write(encode(frame));
 	}
 
+	/** A request the broker owes an answer to on this connection. */
+	private ask(key: string, frame: object) {
+		this.owed.set(key, Date.now());
+		this.write(frame);
+	}
+
 	/** A sequenced operation (spawn, send, exit, kill, forget); idempotent across reconnects. */
 	op(op: string, fields: Record<string, unknown>, signal?: AbortSignal): Promise<Response> {
 		if (this.closed) return Promise.resolve({ ok: false, error: "not_live", detail: "connection closed" });
@@ -219,7 +264,7 @@ export class Client extends EventEmitter {
 				if (this.waiters.delete(frame.seq)) resolve({ ok: false, error: "not_live", detail: "aborted" });
 			}, { once: true });
 		});
-		if (this.connected) this.write(frame);
+		if (this.connected) this.ask(`op:${frame.seq}`, frame);
 		return p;
 	}
 
@@ -228,7 +273,7 @@ export class Client extends EventEmitter {
 		if (!this.connected) return Promise.resolve(null);
 		const fetchId = `f${++this.counter}-${Date.now()}`;
 		const p = new Promise<Message | null>((resolve) => this.fetches.set(fetchId, resolve));
-		this.write({ t: "fetch", fetchId, ...filter });
+		this.ask(`fetch:${fetchId}`, { t: "fetch", fetchId, ...filter });
 		return p;
 	}
 
@@ -244,7 +289,7 @@ export class Client extends EventEmitter {
 		if (!this.connected) return Promise.resolve(undefined);
 		const reqId = `i${++this.counter}`;
 		const p = new Promise<Snapshot>((resolve) => this.inspects.set(reqId, resolve));
-		this.write({ t: "inspect", reqId });
+		this.ask(`inspect:${reqId}`, { t: "inspect", reqId });
 		return Promise.race([p, new Promise<undefined>((r) => setTimeout(() => r(undefined), 5000).unref())]);
 	}
 

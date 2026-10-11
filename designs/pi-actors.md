@@ -309,12 +309,13 @@ Why: the parent briefed the child and usually holds the answer; the user hears o
 
 ### D4: Liveness from socket and heartbeat, plus sleep compensation
 
-- **Driver:** INV-1, INV-6.
+- **Both directions (issue #5):** the agent's Client also watches the broker. It drops its connection when the broker has sent nothing, heartbeat answers included, for 45 s (`TIMING.heartbeatTimeoutMs`), or when any request it sent (`hello`, an op, `fetch`, `inspect`) is still unanswered after 45 s. The ordinary reconnect then recovers: pending fetches return nothing, leases return, unanswered ops are resent in seq order and answered from the idempotency cache. In the model this is `connectionDrop`. Because of that drop, a `hello` the broker is still checking (a pane's pid lookup) or holding (until `proc_start`) can outlive its connection. The broker ignores such a hello: it neither supersedes the new connection nor changes state.
+- **Driver:** INV-1, INV-6; INV-3 and UC-4 for the agent side.
 - **Alternatives:**
   - PID polling: reused PIDs and zombies;
   - "timer fired late" sleep detection: the monotonic clock pauses on macOS.
 - **Reversibility:** cheap.
-- **Validated by:** `test/clock.test.ts` with fake wall and monotonic clocks: a 1 h sleep shifts deadlines by exactly 1 h, and a dead agent still goes down within G of active time.
+- **Validated by:** `test/clock.test.ts` with fake wall and monotonic clocks: a 1 h sleep shifts deadlines by exactly 1 h, and a dead agent still goes down within G of active time. `test/liveness.test.ts` runs a real broker behind a proxy that swallows frames, with the agent's clock mocked: silence drops the connection at 45 s; a lost `fetched` or `resp` is recovered within 60 s; random lost answers never lose or repeat a message.
 
 ### D5 — [SUPERSEDED by D8] · D7 — [SUPERSEDED by D10]
 
@@ -417,6 +418,7 @@ Why: the parent briefed the child and usually holds the answer; the user hears o
 | Scenario                                     | Behaviour                                                                                                                                                                  | Owner                  |
 | -------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------- |
 | Broker crash                                 | Replay plus `recover`; headless children survive; Keepers report retained exits; no `start` is replayed.                                                                   | EventLog, Tree, Keeper |
+| Broker stops answering (socket stays open)   | After 45 s of silence or an unanswered request, the agent drops the connection and reconnects (D4). A broker hung outright is not restarted; agents treat it as unreachable, so children end about 45 s + G after it went quiet. | Client                 |
 | Keeper crash                                 | The child's stdin closes and pi exits; the broker signals the recorded pgid; `down(error:keeper_lost)`.                                                                    | Tree, Placement        |
 | Crash before an ack                          | Redelivered, then deduplicated by the consumed-ID set.                                                                                                                     | Client                 |
 | Two parallel `receive`s                      | Sequential execution, plus leases.                                                                                                                                         | Tools, Tree            |

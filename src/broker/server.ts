@@ -259,9 +259,13 @@ export async function startBroker(dir: string, sock: string, config: Config): Pr
 			pendingHello.set(f.id, { conn: c, frame: f });
 			return;
 		}
+		const owns = await ownsPid(f);
+		// A hello held, or checked, past its connection's end is void: the agent has already dropped
+		// that connection (its client does so when the broker is slow) and may be live on a new one.
+		if (c.socket.destroyed || !conns.has(c)) return;
 		const fx = run({
 			type: "hello", now: Date.now(), id: f.id, inc: f.inc, pid: f.pid, sessionId: f.sessionId, sessionFile: f.sessionFile,
-			ownsPid: await ownsPid(f), recordedPidAlive: f.id === ROOT ? !!st.agents[ROOT]?.pid && pidAlive(st.agents[ROOT].pid!) : undefined,
+			ownsPid: owns, recordedPidAlive: f.id === ROOT ? !!st.agents[ROOT]?.pid && pidAlive(st.agents[ROOT].pid!) : undefined,
 		}, c);
 		if (fx.some((e) => e.type === "hold")) pendingHello.set(f.id, { conn: c, frame: f });
 	};
