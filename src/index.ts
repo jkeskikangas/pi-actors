@@ -592,7 +592,7 @@ export default function piActors(pi: ExtensionAPI) {
 		name: "spawn",
 		label: "Spawn agent",
 		description:
-			"Start a child agent on a task and return its id at once. Each time the child finishes a run, its final answer is pushed to you as a report; a report over 16 KiB is cut and names the child's session file, which holds the full text. Several spawns in a row run in parallel. A child that finished a run stays alive: continue it with send.",
+			"Start a child agent on a task and return its id at once. Each time the child finishes a run, its final answer is pushed to you as a report; a report over 16K characters is cut and names the child's session file, which holds the full text. Several spawns in a row run in parallel. A child that finished a run stays alive: continue it with send.",
 		promptSnippet: "run a task in a child agent",
 		promptGuidelines: ["After spawning, end your turn: reports and messages arrive by themselves, so never poll."],
 		parameters: Type.Object({
@@ -631,7 +631,7 @@ export default function piActors(pi: ExtensionAPI) {
 		name: "send",
 		label: "Send message",
 		description:
-			"Send a message to any agent in your tree that has not ended. It does not wait for a reply: replies arrive by themselves. Only the root agent can reach the user; any other agent reaches the user through its parent.",
+			"Send a message to any agent in your tree that has not ended. It does not wait for a reply: replies arrive by themselves. A message over 16K characters arrives cut. Only the root agent can reach the user; any other agent reaches the user through its parent.",
 		promptSnippet: "message other agents",
 		parameters: Type.Object({
 			to: Type.String({ description: "Agent id, or \"parent\"." }),

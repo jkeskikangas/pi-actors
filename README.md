@@ -22,12 +22,12 @@ Running agents in the background goes wrong in predictable ways: messages get lo
 | Tool | What it does |
 |---|---|
 | `spawn{task, name?, model?, thinking?, fork?, cwd?, pane?, timeout_minutes?, resume?}` | Starts a child and returns its id immediately. `fork: true` gives the child a copy of this conversation. `model` can be any provider's model, and `cwd` can point to, say, a git worktree. `pane: true` runs the child in a visible pane when pi runs inside [herdr](https://herdr.dev) or tmux. |
-| `send{to, text, reply_to?, urgent?}` | Sends a message to any agent in the tree that has not ended (by id), or to `"parent"`. It doesn't wait for a reply. `reply_to` answers a message. |
+| `send{to, text, reply_to?, urgent?}` | Sends a message to any agent in the tree that has not ended (by id), or to `"parent"`. It doesn't wait for a reply. A message over 16K characters arrives cut. `reply_to` answers a message. |
 | `stop{id}` | Stops a descendant, together with its own children. |
 
 What arrives by itself:
 
-- **Reports:** each time a child finishes a piece of work, its final answer is delivered to its parent (over 16 KiB, it is cut and names the child's session file, which holds the full text). The child then waits; another `send` continues it.
+- **Reports:** each time a child finishes a piece of work, its final answer is delivered to its parent (over 16K characters, it is cut and names the child's session file, which holds the full text). The child then waits; another `send` continues it.
 - **Messages and answers:** from other agents. Answers say which message they reply to.
 - **End notices:** if a child crashes, times out or is lost, the parent hears about it once, with the reason. A child the parent stopped itself ends quietly.
 

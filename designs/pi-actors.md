@@ -180,12 +180,12 @@ Three single-purpose tools. Everything the model needs to *know* arrives by push
 **Pushed into the conversation** (one coalesced entry per delivery, labelled by sender, never as user input):
 
 - messages and answers from other agents (`reply_to` shown);
-- a **report** each time a child finishes a run: its final answer (≤ 16 KiB inline; longer answers say where the full text is);
+- a **report** each time a child finishes a run: its final answer (≤ 16K characters inline, counted in UTF-16 code units, not bytes; longer answers say where the full text is). Any other message over that limit is cut at delivery too;
 - DOWN notices with the reason. Since v5 a DOWN the agent caused itself is acked without being shown: `killed` (or `killed:unconfirmed`) for an id it stopped with `stop` or `/actors stop <id>`, and `killed:tree_stopped`. Unexpected ends (`error`, crashes, `timeout`, `lost`, start failures) are still pushed.
 
 **Formatting (v5).** A delivery is the messages alone, one `■` block each (`Task from …`, `Report from …`, `X answered your msg …`, `X ended: …`); there is no `[pi-actors] N updates` header and no "Reply with send{…}" footer. How to answer is stated once, in `send`'s `reply_to` parameter. In the TUI a delivery renders through `registerMessageRenderer` as one dim line (`⇢ report from X · …`) that expands to the full text the model read.
 
-**Tool text (v6, issue #6).** The tool text states, once, what `spawn`, `send` and `stop` do: `send` reaches any agent in the tree that has not ended, and only the root reaches the user; reports over 16 KiB are cut and name the child's session file. The only guideline is `spawn`'s "end your turn, never poll". When to delegate, what to report and how to escalate are left to the project's workflow (its AGENTS.md or skills). `test/extension.test.ts` (#6 tests) pins this.
+**Tool text (v6, issue #6).** The tool text states, once, what `spawn`, `send` and `stop` do: `send` reaches any agent in the tree that has not ended, and only the root reaches the user; reports over 16K characters are cut and name the child's session file, and any message over 16K characters arrives cut. The only guideline is `spawn`'s "end your turn, never poll". When to delegate, what to report and how to escalate are left to the project's workflow (its AGENTS.md or skills). `test/extension.test.ts` (#6 tests) pins this.
 
 Delivery: idle agent → `sendMessage(..., {triggerTurn: true})`; busy agent → `deliverAs: "followUp"`, or `"steer"` when `urgent`. **Waiting** is ending the turn; pushes wake the agent. **A child's result** is simply its final answer — no `exit` tool, no done-nudge (D10 is superseded). A finished child is idle but alive; `send` continues it; it ends when stopped, when its parent goes down, or when the tree stops.
 

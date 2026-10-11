@@ -296,12 +296,14 @@ test("#6: send says any agent in the tree is reachable and the user only through
 	assert.match(d, /any agent in your tree/);
 	assert.match(d, /only the root agent can reach the user/i);
 	assert.match(d, /through its parent/);
+	assert.match(d, /over 16K characters arrives cut/, "delivery cuts long messages (mailroom formatOne)");
+	for (const name of ["spawn", "send", "stop"]) for (const s of toolText(root().tools[name])) assert.doesNotMatch(s, /KiB/, `${name}: limits are in characters`);
 	assert.doesNotMatch(root().tools.send.promptSnippet, /child or your parent/);
 });
 
-test("#6: spawn says reports over 16 KiB are cut and name the session file with the full text", () => {
+test("#6: spawn says reports over 16K characters are cut and name the session file with the full text", () => {
 	const d = root().tools.spawn.description;
-	assert.match(d, /16 KiB/);
+	assert.match(d, /over 16K characters/, "the cut counts characters (mailroom INLINE_LIMIT), not bytes");
 	assert.match(d, /session file/);
 	assert.match(d, /continue it with send/);
 	assert.match(root().tools.spawn.parameters.properties.resume.description, /ended child/);
