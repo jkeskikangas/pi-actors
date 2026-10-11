@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { dedupeContext, ENTRY_TYPE, type Fetcher, formatDelivery, Mailroom, summarizeDelivery } from "../src/client/mailroom.ts";
+import { cutReport, dedupeContext, ENTRY_TYPE, type Fetcher, formatDelivery, Mailroom, summarizeDelivery } from "../src/client/mailroom.ts";
 import type { Message } from "../src/protocol.ts";
 
 function fetcher(queue: Message[]): Fetcher & { acked: string[] } {
@@ -13,6 +13,16 @@ function fetcher(queue: Message[]): Fetcher & { acked: string[] } {
 }
 const msg = (id: string, extra: Partial<Message> = {}): Message => ({ id, from: "root", to: "a", kind: "mail", body: `body ${id}`, ...extra });
 const entry = (ids: string[], self = "a") => ({ type: "custom_message", customType: ENTRY_TYPE, details: { actors: { id: self, consumed: ids } } });
+
+test("#6: a report over 16 KiB reaches the parent cut, still naming the child's session file", () => {
+	const file = "/s/kid.jsonl";
+	assert.equal(cutReport("short", file), "short");
+	const exact = "x".repeat(16 * 1024);
+	assert.equal(cutReport(exact, file), exact, "exactly 16 KiB is not cut");
+	const shown = formatDelivery([msg("r", { from: "kid", tag: "report", body: cutReport("x".repeat(40_000), file) })]);
+	assert.match(shown, /truncated; full text in \/s\/kid\.jsonl/);
+	assert.doesNotMatch(shown, /ask the sender/, "not cut a second time at delivery");
+});
 
 test("drain collects a batch; settle acks only what is persisted", async () => {
 	const room = new Mailroom("a");

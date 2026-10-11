@@ -175,7 +175,7 @@ Three single-purpose tools. Everything the model needs to *know* arrives by push
 | ------- | ----------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------- |
 | `spawn` | `task, name?, model?, thinking?, fork?: bool, cwd?, pane?: bool, timeout_minutes?, resume?: id` | `{id}` immediately; never blocks. The child's reports arrive later by push                  |
 | `send`  | `to: id \| "parent", text, reply_to?, urgent?`                                                  | `{msg_id}` once durably accepted. `reply_to` marks the message as an answer to that message |
-| `stop`  | `id`                                                                                            | Descendants only. Returns once the agent is down                                            |
+| `stop`  | `id`                                                                                            | Descendants only. Returns once the stop has begun; the agent's own children go down with it |
 
 **Pushed into the conversation** (one coalesced entry per delivery, labelled by sender, never as user input):
 
@@ -183,7 +183,9 @@ Three single-purpose tools. Everything the model needs to *know* arrives by push
 - a **report** each time a child finishes a run: its final answer (≤ 16 KiB inline; longer answers say where the full text is);
 - DOWN notices with the reason. Since v5 a DOWN the agent caused itself is acked without being shown: `killed` (or `killed:unconfirmed`) for an id it stopped with `stop` or `/actors stop <id>`, and `killed:tree_stopped`. Unexpected ends (`error`, crashes, `timeout`, `lost`, start failures) are still pushed.
 
-**Formatting (v5).** A delivery is the messages alone, one `■` block each (`Task from …`, `Report from …`, `X answered your msg …`, `X ended: …`); there is no `[pi-actors] N updates` header and no "Reply with send{…}" footer. That guidance lives once in the `send` tool's `promptGuidelines`, with the escalation rule: answer a child from your own context if you can, otherwise forward the question to your parent (quoted, naming the asker), or, with no parent, ask the user, then answer with `reply_to`. In the TUI a delivery renders through `registerMessageRenderer` as one dim line (`⇢ report from X · …`) that expands to the full text the model read.
+**Formatting (v5).** A delivery is the messages alone, one `■` block each (`Task from …`, `Report from …`, `X answered your msg …`, `X ended: …`); there is no `[pi-actors] N updates` header and no "Reply with send{…}" footer. How to answer is stated once, in `send`'s `reply_to` parameter. In the TUI a delivery renders through `registerMessageRenderer` as one dim line (`⇢ report from X · …`) that expands to the full text the model read.
+
+**Tool text (v6, issue #6).** The tool text states, once, what `spawn`, `send` and `stop` do: `send` reaches any agent in the tree that has not ended, and only the root reaches the user; reports over 16 KiB are cut and name the child's session file. The only guideline is `spawn`'s "end your turn, never poll". When to delegate, what to report and how to escalate are left to the project's workflow (its AGENTS.md or skills). `test/extension.test.ts` (#6 tests) pins this.
 
 Delivery: idle agent → `sendMessage(..., {triggerTurn: true})`; busy agent → `deliverAs: "followUp"`, or `"steer"` when `urgent`. **Waiting** is ending the turn; pushes wake the agent. **A child's result** is simply its final answer — no `exit` tool, no done-nudge (D10 is superseded). A finished child is idle but alive; `send` continues it; it ends when stopped, when its parent goes down, or when the tree stops.
 
@@ -200,7 +202,7 @@ Delivery: idle agent → `sendMessage(..., {triggerTurn: true})`; busy agent →
 | UC-3 send/reply      | Tree                                                                                                                                                                         | No routing, correlation or authorization                                                                                                           |
 | UC-4 receive + wake  | Client                                                                                                                                                                       | No consumption; idle agents never wake                                                                                                             |
 | UC-5 exit → DOWN     | Tree                                                                                                                                                                         | Results and failures are invisible                                                                                                                 |
-| UC-6 escalation      | Tools (`send` `promptGuidelines`) + the root's model                                                                                                                         | Questions stop at an agent that cannot decide (v5: there is no `human` address by design)                                                          |
+| UC-6 escalation      | Tree (routing to `"parent"`) + the root's model; the policy is the project's workflow (v6)                                                                                    | Questions cannot travel up the tree (v5: there is no `human` address by design)                                                                    |
 | UC-7 kill            | Tree + Keeper/Placement                                                                                                                                                      | Runaways need manual killing                                                                                                                       |
 | UC-8 resume          | Tree + Placement (`--session <stored file>` plus the recorded `--model` and `--thinking`, because the session file keeps the original model; a pane resume opens a new pane) | Identity churn                                                                                                                                     |
 | UC-9 inspect, clear  | Panel + Lifecycle `/actors` + Tree `forget` + BrokerServer `status.json`                                                                                                     | The tree is opaque, or ended agents pile up                                                                                                        |
@@ -230,8 +232,8 @@ Delivery: idle agent → `sendMessage(..., {triggerTurn: true})`; busy agent →
 **Questions for the human (v5; replaces "Call and human")**
 
 1. A child that needs a decision sends it to `"parent"` as ordinary mail.
-1. The parent answers from its own context if it can. Otherwise it forwards the question to its own parent, quoting it and naming the asking agent, and later relays the answer down with `reply_to`.
-1. The root's model asks the user however it chooses (its own question tool, plain text) and sends the answer back with `reply_to`.
+1. The parent can answer with `reply_to`, or send the question on to its own parent and later relay the answer down. Which it does, and how, is the project's workflow (v6); the tools prescribe neither.
+1. Only the root's model can reach the user, however it chooses (its own question tool, plain text).
 
 Why: the parent briefed the child and usually holds the answer; the user hears one voice, from the session they are talking to; presentation belongs to that interactive session, not to pi-actors; and it removes the only obligation that could stay outstanding for hours (24 h call timeouts, withdrawal on every outcome, answer authorization). The cost is one model turn per relay level. A pane child can still be talked to directly in its pane.
 
