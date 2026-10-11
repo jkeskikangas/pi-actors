@@ -44,40 +44,61 @@ after(async () => {
 
 type Frame = Record<string, any>;
 
+/** Requests the real broker has received and not yet answered, over every proxy connection. */
+const atBroker = new Set<string>();
+
+/** The request a frame to the broker makes, and the one a frame from it answers. */
+const asks = (f: Frame) => (f.t === "hello" ? "hello" : f.t === "op" ? `op:${f.seq}` : f.t === "fetch" ? `fetch:${f.fetchId}` : f.t === "inspect" ? `inspect:${f.reqId}` : f.t === "hb" ? "hb" : undefined);
+const answers = (f: Frame) => (f.t === "welcome" || f.t === "reject" || f.t === "proto_mismatch" ? "hello" : f.t === "resp" ? `op:${f.seq}` : f.t === "fetched" ? `fetch:${f.fetchId}` : f.t === "inspect" ? `inspect:${f.reqId}` : f.t === "hb" ? "hb" : undefined);
+
 /**
  * A pass-through between an agent and its broker. `toAgent` / `toBroker` return false to swallow
- * a frame on connection `conn` (1-based) while the socket stays open.
+ * a frame on connection `conn` (1-based) while the socket stays open. It also tracks what the
+ * broker still owes (in `atBroker`), so the agent's mocked clock can wait for the real broker.
  */
 async function proxy(upstream: string, faults: { toAgent?: (f: Frame, conn: number) => boolean; toBroker?: (f: Frame, conn: number) => boolean }) {
 	const sock = join(home, `p${++n}.sock`);
 	const lastToAgent: number[] = [];
-	const closedAt: number[] = [];
 	let conns = 0;
-	const pipe = (from: Socket, to: Socket, keep: (f: Frame) => boolean, onPass?: () => void) => {
+	const pipe = (from: Socket, to: Socket, handle: (f: Frame) => boolean, onClose: () => void) => {
 		let buf = "";
 		from.setEncoding("utf8");
 		from.on("data", (d: string) => {
 			const lines = (buf + d).split("\n");
 			buf = lines.pop() ?? "";
-			for (const line of lines) {
-				if (!line || !keep(JSON.parse(line))) continue;
-				to.write(`${line}\n`);
-				onPass?.();
-			}
+			for (const line of lines) if (line && handle(JSON.parse(line))) to.write(`${line}\n`);
 		});
 		from.on("error", () => {});
-		from.on("close", () => to.destroy());
+		from.on("close", () => (onClose(), to.destroy()));
 	};
 	const server = createServer((agent) => {
 		const i = ++conns;
+		const key = (k: string) => `${sock}#${i}#${k}`;
+		const hbs = { sent: 0, answered: 0 };
+		const forget = () => {
+			for (const k of [...atBroker]) if (k.startsWith(`${sock}#${i}#`)) atBroker.delete(k);
+		};
+		atBroker.add(key("hello")); // a new connection's first frame is its hello
 		const broker = connect(upstream);
-		pipe(agent, broker, (f) => faults.toBroker?.(f, i) ?? true);
-		pipe(broker, agent, (f) => faults.toAgent?.(f, i) ?? true, () => (lastToAgent[i] = Date.now()));
-		agent.on("close", () => (closedAt[i] = Date.now()));
+		pipe(agent, broker, (f) => {
+			const k = asks(f);
+			const pass = faults.toBroker?.(f, i) ?? true;
+			if (k === "hello" && !pass) atBroker.delete(key(k));
+			else if (k === "hb") pass && atBroker.add(key(`hb${++hbs.sent}`));
+			else if (k && pass) atBroker.add(key(k));
+			return pass;
+		}, forget);
+		pipe(broker, agent, (f) => {
+			const k = answers(f);
+			if (k) atBroker.delete(key(k === "hb" ? `hb${++hbs.answered}` : k));
+			const pass = faults.toAgent?.(f, i) ?? true;
+			if (pass) lastToAgent[i] = Date.now();
+			return pass;
+		}, forget);
 	});
 	await new Promise<void>((r) => server.listen(sock, r));
 	servers.push(server);
-	return { sock, conns: () => conns, lastToAgent, closedAt };
+	return { sock, conns: () => conns, lastToAgent };
 }
 
 async function tree() {
@@ -90,12 +111,18 @@ function mockClock() {
 	mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"], now: Date.now() });
 }
 
-/** Advance mocked time in small steps, letting real I/O run in between, until `done` holds. */
+/**
+ * Advance mocked time in small steps, letting real I/O run in between, until `done` holds. The
+ * clock stands still while the real broker owes an answer: a broker slowed by a loaded machine
+ * must not look like 45 s of silence to the agent.
+ */
 async function advanceUntil(done: () => boolean, what: string, maxMs = 600_000): Promise<number> {
 	const start = Date.now();
+	const realEnd = performance.now() + 120_000;
 	while (!done()) {
 		if (Date.now() - start > maxMs) throw new Error(`${what}: not within ${maxMs} ms of client time`);
-		mock.timers.tick(200);
+		if (performance.now() > realEnd) throw new Error(`${what}: the broker still owes ${[...atBroker].join(", ")} after 2 real minutes`);
+		if (atBroker.size === 0) mock.timers.tick(200);
 		await realSleep(2);
 	}
 	return Date.now() - start;
@@ -150,7 +177,9 @@ test("AC1: when the broker sends nothing, heartbeats included, for 45 s, the age
 	mockClock();
 	const { c } = await rootAgent(p.sock);
 	let welcomes = 0;
+	let droppedAt = 0;
 	c.on("welcome", () => welcomes++);
+	c.on("disconnected", () => (droppedAt = Date.now()));
 
 	await advance(180_000);
 	assert.equal(p.conns(), 1, "answered heartbeats keep the connection: no reconnect in 3 minutes");
@@ -158,7 +187,7 @@ test("AC1: when the broker sends nothing, heartbeats included, for 45 s, the age
 	silent = 1;
 	await advanceUntil(() => welcomes === 1, "reconnect after silence");
 	assert.equal(p.conns(), 2);
-	const silence = p.closedAt[1] - p.lastToAgent[1];
+	const silence = droppedAt - p.lastToAgent[1];
 	assert.ok(silence >= TIMING.heartbeatTimeoutMs, `dropped after ${silence} ms of silence, before 45 s`);
 	assert.ok(silence <= TIMING.heartbeatTimeoutMs + 1500, `dropped only after ${silence} ms of silence`);
 	assert.equal(c.connected, true);
