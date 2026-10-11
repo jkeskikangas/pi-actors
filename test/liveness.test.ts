@@ -116,9 +116,10 @@ async function settled<T>(p: Promise<T>, what: string): Promise<T> {
 /**
  * The root agent as the extension wires it: a mail notice or a welcome with mail drains the
  * Mailroom; each batch is "shown to the model" (recorded with the client time) and persisted at
- * once, which acks it.
+ * once. It is acked at once, or with `ackLater` only by `settle()` (one long turn), so it stays
+ * in flight across reconnects.
  */
-async function rootAgent(sock: string) {
+async function rootAgent(sock: string, ackLater = false) {
 	const c = new Client({ socket: sock, id: "root", inc: 1, pid: process.pid, sessionId: "S" }, TIMING.rootGraceMs);
 	clients.push(c);
 	const room = new Mailroom("root");
@@ -129,12 +130,12 @@ async function rootAgent(sock: string) {
 		if (batch.length === 0) return;
 		for (const m of batch) shown.push({ m, at: Date.now() });
 		entries.push({ type: "custom_message", customType: ENTRY_TYPE, details: { actors: room.stamp(batch) } });
-		room.settle(entries, c);
+		if (!ackLater) room.settle(entries, c);
 	};
 	c.on("mail", () => void deliver());
 	c.on("welcome", (w: { mailbox?: number }) => (w.mailbox ?? 0) > 0 && void deliver());
 	await settled(c.start(), "welcome");
-	return { c, shown, ids: () => shown.map((s) => s.m.id), bodies: () => shown.map((s) => s.m.body) };
+	return { c, shown, settle: () => room.settle(entries, c), ids: () => shown.map((s) => s.m.id), bodies: () => shown.map((s) => s.m.body) };
 }
 
 const spawnReq = (task: string) => ({ req: { task, context: "fresh", placement: "headless" } });
@@ -160,6 +161,27 @@ test("AC1: when the broker sends nothing, heartbeats included, for 45 s, the age
 	assert.ok(silence >= TIMING.heartbeatTimeoutMs, `dropped after ${silence} ms of silence, before 45 s`);
 	assert.ok(silence <= TIMING.heartbeatTimeoutMs + 1500, `dropped only after ${silence} ms of silence`);
 	assert.equal(c.connected, true);
+});
+
+test("AC1/AC2 bound: from the broker's last frame to the next welcome takes under 60 s at every reconnect backoff step", async () => {
+	let silent = 0;
+	const p = await proxy(await tree(), { toAgent: (_f, conn) => conn !== silent });
+	mockClock();
+	const { c } = await rootAgent(p.sock);
+	const welcomedAt: number[] = [];
+	c.on("welcome", () => welcomedAt.push(Date.now()));
+	const took: number[] = [];
+	// The backoff grows with the client's request counter (reset at welcome): k requests before
+	// the silence give a 500 * 2^k ms backoff, capped at 5 s.
+	for (let k = 0; k <= 4; k++) {
+		for (let i = 0; i < k; i++) await settled(c.inspect(), "inspect");
+		silent = p.conns();
+		const before = welcomedAt.length;
+		await advanceUntil(() => welcomedAt.length > before, `reconnect ${k}`);
+		took.push(welcomedAt.at(-1)! - p.lastToAgent[silent]);
+	}
+	assert.ok(took.every((ms) => ms < 60_000), `last frame -> welcome: ${took.join(", ")} ms`);
+	assert.ok(Math.max(...took) >= TIMING.heartbeatTimeoutMs + 5000, `the 5 s backoff was exercised: ${took.join(", ")} ms`);
 });
 
 test("a sleep or a blocked event loop is not mistaken for a silent broker", async () => {
@@ -246,7 +268,7 @@ function prng(seed: number) {
 
 test("INV-3 under random lost answers and requests: every accepted message reaches the model exactly once", async () => {
 	let faults = 0;
-	for (const seed of [1, 2, 3]) {
+	for (const seed of [1, 2, 3, 4]) {
 		const broker = await tree();
 		const rand = prng(seed);
 		let armed = false;
@@ -264,7 +286,7 @@ test("INV-3 under random lost answers and requests: every accepted message reach
 			toBroker: (f) => !drop(f, ["fetch", "ack"]),
 		});
 		mockClock();
-		const root = await rootAgent(p.sock);
+		const root = await rootAgent(p.sock, seed % 2 === 1);
 		const child = (await settled(root.c.op("spawn", spawnReq("serve")), "spawn")) as Extract<Response, { type: "spawned" }>;
 		armed = true;
 		const N = 8;
@@ -272,6 +294,7 @@ test("INV-3 under random lost answers and requests: every accepted message reach
 		const results = await settled(Promise.all(sends), `sends (seed ${seed})`);
 		assert.ok(results.every((r) => r.ok), `seed ${seed}: ${JSON.stringify(results)}`);
 		await advanceUntil(() => root.bodies().filter((b) => b.startsWith("echo:")).length >= N, `echoes (seed ${seed}, dropped ${dropped.join(",")})`);
+		root.settle();
 		await advance(60_000);
 		const echoes = root.bodies().filter((b) => b.startsWith("echo:")).sort();
 		assert.deepEqual(echoes, Array.from({ length: N }, (_, i) => `echo:m${i}`).sort(), `seed ${seed}, dropped ${dropped.join(",")}`);
