@@ -19,7 +19,6 @@ module pi_actors {
     agents: str -> Agent,
     mailbox: str -> List[Msg],
     lastSeq: str -> int,
-    spawns: int,
     downCount: str -> int,
     rejected: Set[int],
     forgotten: Set[str],
@@ -66,7 +65,8 @@ module pi_actors {
   pure val DEPTH = Map("r" -> 0, "a" -> 1, "b" -> 1, "c" -> 2)
   pure val DOWN_UID = Map("r" -> 1000, "a" -> 1001, "b" -> 1002, "c" -> 1003)
   pure val MAX_DEPTH = 2
-  pure val MAX_SPAWNS = 3
+  // Below the three non-root agents, so the cap binds and a freed place must be reused.
+  pure val MAX_RUNNING = 2
   pure val MAX_SENT = 4
   pure val MAX_FETCHED = 2
   pure val MAX_FAULTS = 2  // bounds environment faults per trace so random simulation reaches deep paths
@@ -79,7 +79,6 @@ module pi_actors {
     agents: AGENTS.mapBy(id => { status: if (id == "r") Live else Unborn, parent: PARENT.get(id), depth: DEPTH.get(id) }),
     mailbox: emptyMap(List()),
     lastSeq: emptyMap(0),
-    spawns: 0,
     downCount: emptyMap(0),
     rejected: Set(),
     forgotten: Set(),
@@ -115,6 +114,9 @@ module pi_actors {
   pure def isActive(x: Status): bool = x == Starting or x == Live or x == Disconnected
   // A forgotten (Gone) target is unknown: mail to it is refused, never queued.
   pure def accepting(x: Status): bool = x != Down and x != Unborn and x != Gone
+  // INV-5: agents below the root whose process may still run; one that ends frees its place.
+  pure def running(st: State): int =
+    AGENTS.filter(id => id != "r" and not(Set(Unborn, Down, Gone).contains(status(st, id)))).size()
 
   // Link rule: active children of `id` start being killed.
   pure def killChildren(st: State, id: str): State =
@@ -169,13 +171,13 @@ module pi_actors {
     st.agents.get(c).parent == p,
     status(st, c) == Unborn,
     st.agents.get(c).depth <= MAX_DEPTH,
-    st.spawns < MAX_SPAWNS,
+    running(st) < MAX_RUNNING,
   }
 
   action spawn(p: str, c: str): bool = all {
     canSpawn(s, p, c),
     val st1 = setStatus(s, c, Starting)
-    s' = { ...st1, spawns: s.spawns + 1, procAlive: s.procAlive.set(c, true) },
+    s' = { ...st1, procAlive: s.procAlive.set(c, true) },
   }
 
   // Accepted hello. welcome.last_seq resyncs the client's counter when nothing is in flight.
@@ -496,7 +498,7 @@ module pi_actors {
     (s.agents.get(id).parent != "" and status(s, s.agents.get(id).parent) == Down)
       implies not(isActive(status(s, id))))
   // INV-5: limits.
-  val limits = s.spawns <= MAX_SPAWNS and AGENTS.forall(id => status(s, id) != Unborn implies s.agents.get(id).depth <= MAX_DEPTH)
+  val limits = running(s) <= MAX_RUNNING and AGENTS.forall(id => status(s, id) != Unborn implies s.agents.get(id).depth <= MAX_DEPTH)
   // Leases never outlive the connection that took them.
   val leasesNeedConnection = AGENTS.forall(id => s.leases.get(id).size() > 0 implies s.connected.get(id))
 
@@ -535,6 +537,8 @@ module pi_actors {
   val witnessChildDown = AGENTS.forall(id => id == "r" or status(s, id) != Down)
   val witnessGrandchildKilledByLink = not(status(s, "a") == Down and status(s, "c") == Down)
   val witnessForgotten = s.forgotten.size() == 0
+  // Every non-root agent has been started, which the cap of 2 allows only after one ended.
+  val witnessPlaceReused = not(AGENTS.forall(id => status(s, id) != Unborn))
   // c ended while a ran; a was killed or lost later; the root then cleared c.
   val witnessClearedAfterParentKilled = not(s.forgottenBy.get("c") == "r" and s.endedBeforeParent.contains("c"))
 

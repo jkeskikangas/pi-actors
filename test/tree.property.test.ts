@@ -298,7 +298,8 @@ function checkInvariants(w: World) {
 		assert.ok(a.depth <= LIMITS.maxDepth, "INV-5: depth");
 		if (Object.keys(st.leases[a.id] ?? {}).length > 0) assert.ok(a.connected, `lease without connection: ${a.id}`);
 	}
-	assert.ok(st.agents[ROOT].spawns <= LIMITS.maxSpawns, "INV-5: spawns");
+	const running = Object.values(st.agents).filter((a) => a.id !== ROOT && a.status !== "down").length;
+	assert.ok(running <= LIMITS.maxSpawns, "INV-5: running agents");
 	for (const a of Object.values(st.agents)) {
 		const parentDowns = (st.mailbox[a.id] ?? []).filter((m) => m.kind === "down").map((m) => JSON.parse(m.body).id + ":" + JSON.parse(m.body).inc);
 		assert.equal(new Set(parentDowns).size, parentDowns.length, "INV-2: duplicate DOWN in a mailbox");

@@ -195,7 +195,7 @@ export default function piActors(pi: ExtensionAPI) {
 		return undefined;
 	}
 
-	/** User settings in ~/.pi/agent/pi-actors.json: {"maxDepth": 2, "maxSpawns": 40, "keepFinishedDays": 7}. */
+	/** User settings in ~/.pi/agent/pi-actors.json: {"maxDepth": 2, "maxSpawns": 50, "keepFinishedDays": 7}. */
 	function readSettings(): Record<string, unknown> {
 		try {
 			return JSON.parse(readFileSync(join(homedir(), ".pi", "agent", "pi-actors.json"), "utf8"));

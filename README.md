@@ -65,11 +65,11 @@ Outside both, `pane: true` fails immediately with a clear message.
 Set in `~/.pi/agent/pi-actors.json`:
 
 ```json
-{ "maxDepth": 2, "maxSpawns": 40, "keepFinishedDays": 7 }
+{ "maxDepth": 2, "maxSpawns": 50, "keepFinishedDays": 7 }
 ```
 
 - **`maxDepth`:** how many levels of children below you are allowed.
-- **`maxSpawns`:** how many agents can be started in total, including restarts.
+- **`maxSpawns`:** how many agents can run at once below you. An agent that finishes, fails to start or is stopped frees its place.
 
 An agent can set lower limits for the children it starts, but never higher ones. When a limit is reached, the agent is told to do the work itself.
 

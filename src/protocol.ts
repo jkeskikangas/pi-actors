@@ -28,10 +28,11 @@ export const TIMING = {
 	heartbeatTimeoutMs: 45_000,
 } as const;
 
-export const DEFAULT_LIMITS: Limits = { maxDepth: 2, maxSpawns: 40 };
+export const DEFAULT_LIMITS: Limits = { maxDepth: 2, maxSpawns: 50 };
 
 export interface Limits {
 	maxDepth: number;
+	/** Agents running at once below an agent; one that ends (finished, failed or killed) frees its place. */
 	maxSpawns: number;
 }
 
