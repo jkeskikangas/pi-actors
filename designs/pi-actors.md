@@ -307,7 +307,7 @@ Why: the parent briefed the child and usually holds the answer; the user hears o
 
 ### D4: Liveness from socket and heartbeat, plus sleep compensation
 
-- **Both directions (issue #5):** the agent's Client also watches the broker. It drops its connection when the broker has sent nothing, heartbeat answers included, for 45 s (`TIMING.heartbeatTimeoutMs`), or when any request it sent (`hello`, an op, `fetch`, `inspect`) is still unanswered after 45 s. The ordinary reconnect then recovers: pending fetches return nothing, leases return, unanswered ops are resent in seq order and answered from the idempotency cache. In the model this is `connectionDrop`.
+- **Both directions (issue #5):** the agent's Client also watches the broker. It drops its connection when the broker has sent nothing, heartbeat answers included, for 45 s (`TIMING.heartbeatTimeoutMs`), or when any request it sent (`hello`, an op, `fetch`, `inspect`) is still unanswered after 45 s. The ordinary reconnect then recovers: pending fetches return nothing, leases return, unanswered ops are resent in seq order and answered from the idempotency cache. In the model this is `connectionDrop`. Because of that drop, a `hello` the broker is still checking (a pane's pid lookup) or holding (until `proc_start`) can outlive its connection. The broker ignores such a hello: it neither supersedes the new connection nor changes state.
 - **Driver:** INV-1, INV-6; INV-3 and UC-4 for the agent side.
 - **Alternatives:**
   - PID polling: reused PIDs and zombies;

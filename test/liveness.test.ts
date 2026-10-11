@@ -4,7 +4,7 @@
 
 import assert from "node:assert/strict";
 import { execSync } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { connect, createServer, type Server, type Socket } from "node:net";
 import { join } from "node:path";
 import { after, afterEach, before, mock, test } from "node:test";
@@ -12,7 +12,8 @@ import { fileURLToPath } from "node:url";
 import { Client } from "../src/client/connection.ts";
 import { ensureBroker } from "../src/client/launcher.ts";
 import { ENTRY_TYPE, Mailroom } from "../src/client/mailroom.ts";
-import { type Message, type Response, TIMING } from "../src/protocol.ts";
+import { startBroker } from "../src/broker/server.ts";
+import { DEFAULT_LIMITS, type Message, PROTO, type Response, TIMING } from "../src/protocol.ts";
 
 const home = mkdtempSync("/tmp/pia-live-");
 const fake = fileURLToPath(new URL("./fixtures/fake-agent.ts", import.meta.url));
@@ -304,4 +305,114 @@ test("INV-3 under random lost answers and requests: every accepted message reach
 		mock.timers.reset();
 	}
 	assert.ok(faults >= 3, `only ${faults} frames dropped: the property was barely exercised`);
+});
+
+// ---------------------------------------------------------------- a hello outlived by its connection
+// Since the agent drops a connection the broker is slow to answer, a hello the broker is still
+// checking can belong to a connection that is already gone. Applying it then must change nothing:
+// before the fix it superseded the agent's new, live connection, and the agent shut itself down.
+
+/** An in-process broker whose pane placement is a fake tmux and whose Keepers do nothing. */
+async function inProcessBroker(mux: "tmux" | undefined) {
+	const id = `ip${++n}`;
+	const runtimeDir = join(home, id, "rt");
+	mkdirSync(join(runtimeDir, "keeper"), { recursive: true });
+	writeFileSync(join(runtimeDir, "keeper", "main.ts"), ""); // the test plays the Keeper
+	const sock = join(home, "s", `${id}.sock`);
+	const broker = await startBroker(join(home, id, "tree"), sock, { treeId: id, limits: DEFAULT_LIMITS, rootCwd: home, piCommand: ["pi"], runtimeDir, mux, rootPaneId: mux ? "%0" : undefined });
+	const root = new Client({ socket: sock, id: "root", inc: 1, pid: process.pid, sessionId: "S" });
+	clients.push(root);
+	await root.start();
+	return { broker, sock, root, dir: join(home, id) };
+}
+
+const rawHello = async (sock: string, id: string, pid: number) => {
+	const s = connect(sock);
+	s.on("error", () => {});
+	await new Promise((r) => s.once("connect", r));
+	s.write(`${JSON.stringify({ t: "hello", proto: PROTO, id, inc: 1, pid })}\n`);
+	return s;
+};
+
+async function waitFor(cond: () => boolean, what: string, ms = 8000) {
+	const end = Date.now() + ms;
+	while (!cond()) {
+		if (Date.now() > end) throw new Error(`${what}: not within ${ms} ms`);
+		await realSleep(20);
+	}
+}
+
+test("a slow hello finishing after its connection dropped does not supersede the agent's new connection", async () => {
+	// tmux's pane-pid lookup (the pane child's identity check) blocks on its first call until the
+	// test opens the gate; later lookups answer at once.
+	const bin = join(home, "faketmux");
+	mkdirSync(bin, { recursive: true });
+	writeFileSync(join(bin, "tmux"), `#!/bin/sh
+case "$*" in
+  *pane_pid*) if mkdir "${bin}/first" 2>/dev/null; then while [ ! -e "${bin}/gate" ]; do sleep 0.02; done; fi; echo ${process.pid} ;;
+  display-message*) echo %0 ;;
+  split-window*) echo %1 ;;
+  list-panes*) printf '%%0\\n%%1\\n' ;;
+esac
+`);
+	chmodSync(join(bin, "tmux"), 0o755);
+	process.env.TMUX_BIN = join(bin, "tmux");
+	const { broker, sock, root } = await inProcessBroker("tmux");
+	try {
+		const kid = (await root.op("spawn", { req: { task: "t", context: "fresh", placement: "pane" } })) as Extract<Response, { type: "spawned" }>;
+		await waitFor(() => !!broker.state.agents[kid.id]?.paneId, "placed");
+
+		const conn1 = await rawHello(sock, kid.id, process.pid); // hello 1: its identity check hangs
+		await waitFor(() => existsSync(join(bin, "first")), "hello 1 being checked");
+		conn1.destroy(); // the agent gives up on it
+		await realSleep(100);
+
+		const c = new Client({ socket: sock, id: kid.id, inc: 1, pid: process.pid });
+		clients.push(c);
+		let superseded = false;
+		c.on("superseded", () => (superseded = true));
+		await c.start(); // hello 2 is welcomed
+
+		writeFileSync(join(bin, "gate"), ""); // hello 1's check completes
+		await realSleep(500);
+		assert.equal(superseded, false, "the live connection was superseded by a dead one");
+		assert.equal(c.connected, true);
+		assert.equal(broker.state.agents[kid.id].connected, true);
+		const r = await Promise.race([c.op("send", { to: "root", kind: "mail", body: "still here" }), realSleep(3000).then(() => "no answer")]);
+		assert.equal((r as Response).ok, true, `the broker serves the new connection: ${JSON.stringify(r)}`);
+	} finally {
+		delete process.env.TMUX_BIN;
+		for (const c of clients.splice(0)) c.close();
+		await broker.stop();
+	}
+});
+
+test("a held hello resumed by proc_start after its connection dropped changes nothing", async () => {
+	const { broker, sock, root } = await inProcessBroker(undefined);
+	try {
+		const kid = (await root.op("spawn", { req: { task: "t", context: "fresh", placement: "headless" } })) as Extract<Response, { type: "spawned" }>;
+		const keeper = connect(sock);
+		keeper.on("error", () => {});
+		await new Promise((r) => keeper.once("connect", r));
+		keeper.write(`${JSON.stringify({ t: "keeper_hello", proto: PROTO, id: kid.id, inc: 1, keeper_pid: process.pid })}\n`);
+
+		const conn1 = await rawHello(sock, kid.id, process.pid); // held: the Keeper has not reported the process yet
+		await realSleep(100);
+		conn1.destroy();
+		await realSleep(100);
+		const before = structuredClone(broker.state.agents[kid.id]);
+		keeper.write(`${JSON.stringify({ t: "proc_start", pid: process.pid, pgid: process.pid })}\n`);
+		await realSleep(200);
+		const a = broker.state.agents[kid.id];
+		assert.deepEqual([a.status, a.connected, a.conn], [before.status, false, before.conn], "the dead connection's hello was applied");
+
+		const c = new Client({ socket: sock, id: kid.id, inc: 1, pid: process.pid });
+		clients.push(c);
+		await c.start();
+		assert.equal(broker.state.agents[kid.id].status, "live", "the next hello is welcomed");
+		keeper.destroy();
+	} finally {
+		for (const c of clients.splice(0)) c.close();
+		await broker.stop();
+	}
 });
