@@ -264,10 +264,20 @@ const toolText = (t: any) => [
 	...Object.values(t.parameters.properties).map((p: any) => p.description).filter(Boolean),
 ] as string[];
 
-test("#6: no tool text prescribes when to delegate, what to report or how to escalate", () => {
+// When to spawn, fork and stop is lifecycle guidance the tools give; reporting and escalation stay with workflows.
+test("#6: no tool text prescribes what to report or how to escalate", () => {
 	const h = root();
-	const policy = /delegat|escalat|trivial|well-scoped|own context|quote|forward|decision|ask the user|final answer should|no longer need/i;
+	const policy = /escalat|quote|forward|decision|ask the user|final answer should/i;
 	for (const name of ["spawn", "send", "stop"]) for (const s of toolText(h.tools[name])) assert.doesNotMatch(s, policy, `${name}: ${s}`);
+});
+
+test("tool text guides the child lifecycle: fork, pane and stop", () => {
+	const t = root().tools;
+	const g = (name: string) => (t[name].promptGuidelines ?? []).join(" ");
+	assert.match(g("spawn"), /do small tasks yourself/i);
+	assert.match(g("spawn"), /fork only if the child needs this conversation/i);
+	assert.match(g("spawn"), /pane only when the user asks/i);
+	assert.match(g("stop"), /stop each child once you need nothing more from it/i);
 });
 
 test("#6: no fact appears twice across a tool's description, summary, guidelines and parameters", () => {

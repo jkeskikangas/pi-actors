@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { Snapshot } from "../src/client/connection.ts";
-import { endedRoots, initialState, items, type PanelKey, type PanelState, press, shortModel, statusLabel, summary, view, withSnapshot } from "../src/client/panel.ts";
+import { editorFocused, endedRoots, initialState, items, type PanelKey, type PanelState, press, shortModel, statusLabel, summary, view, withSnapshot } from "../src/client/panel.ts";
 
 const agent = (id: string, parent: string, status = "live", extra = {}) => ({ id, parent, status, inc: 1, connected: true, mailbox: 0, spawns: 0, ...extra });
 const snap = (agents = [
@@ -106,4 +106,14 @@ test("a transcript fills the height, follows the end, scrolls, and stays put whi
 	const short = view(st, 40, 5, () => ["only"]);
 	assert.equal(short.body.length, 5, "a short transcript is padded to the height");
 	assert.equal(view(st, 40, 5, () => []).body[0].text, " (nothing yet)");
+});
+
+test("↓ opens the panel only from the main editor, not from a dialog holding focus", () => {
+	const focused = (c: unknown) => ({ getFocusedComponent: () => c });
+	assert.equal(editorFocused(focused({ getText: () => "", setText() {}, handleInput() {} })), true);
+	assert.equal(editorFocused(focused({ handleInput() {}, render: () => [] })), false, "a selector");
+	assert.equal(editorFocused(focused({ getValue: () => "", handleInput() {} })), false, "a search input");
+	assert.equal(editorFocused(focused(null)), false);
+	assert.equal(editorFocused(undefined), true, "no TUI at hand: keep the old behaviour");
+	assert.equal(editorFocused({}), true, "a pi without getFocusedComponent: keep the old behaviour");
 });

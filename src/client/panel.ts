@@ -114,6 +114,17 @@ export function endedRoots(st: Pick<PanelState, "snap">): string[] {
 	return sections(st.snap).ended.filter((x) => x.depth === 0).map((x) => x.id);
 }
 
+/**
+ * ↓ opens the panel only from pi's main editor, never from a dialog (model, login, …) that holds
+ * focus while the editor is empty. Any editor component has getText and setText; dialogs do not.
+ * Without the TUI at hand, assume the editor.
+ */
+export function editorFocused(tui: { getFocusedComponent?(): unknown } | undefined): boolean {
+	if (typeof tui?.getFocusedComponent !== "function") return true;
+	const f = tui.getFocusedComponent() as { getText?: unknown; setText?: unknown } | null;
+	return typeof f?.getText === "function" && typeof f?.setText === "function";
+}
+
 export function summary(snap: Snapshot | undefined): string | undefined {
 	if (!snap) return undefined;
 	const running = snap.agents.filter((a) => a.id !== "root" && isActive(a.status)).length;

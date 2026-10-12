@@ -16,7 +16,7 @@ import { Type } from "typebox";
 import { Client } from "./client/connection.ts";
 import { DEFAULT_KEEP_FINISHED_DAYS, ensureBroker, pruneFinishedTrees } from "./client/launcher.ts";
 import { cutReport, dedupeContext, ENTRY_TYPE, endNotice, formatDelivery, Mailroom } from "./client/mailroom.ts";
-import { type AgentItem, agentLine, endedRoots, initialState, items, type Line, type PanelAction, type PanelKey, type PanelState, press, summary, view, withSnapshot } from "./client/panel.ts";
+import { type AgentItem, agentLine, editorFocused, endedRoots, initialState, items, type Line, type PanelAction, type PanelKey, type PanelState, press, summary, view, withSnapshot } from "./client/panel.ts";
 import { captureRunner, readSession, renderDelivery, Transcript } from "./client/transcript.ts";
 import type { Snapshot } from "./client/connection.ts";
 import { closeOwnPaneOnExit, detectMux, paneAgentName, stateRoot } from "./runtime.ts";
@@ -332,8 +332,15 @@ export default function piActors(pi: ExtensionAPI) {
 		if (ctx.mode !== "tui" || uiTimer) return;
 		uiTimer = setInterval(() => void refreshUi(), 5000);
 		uiTimer.unref();
+		// pi hands the TUI only to factories: a throwaway widget captures it for the focus check.
+		let tui: { getFocusedComponent?(): unknown } | undefined;
+		ctx.ui.setWidget("pi-actors", (t) => {
+			tui = t as typeof tui;
+			return { render: () => [], invalidate() {} };
+		}, { placement: "belowEditor" });
+		ctx.ui.setWidget("pi-actors", undefined, { placement: "belowEditor" });
 		ctx.ui.onTerminalInput((data) => {
-			if (panelOpen || !matchesKey(data, "down") || ctx.ui.getEditorText() !== "") return undefined;
+			if (panelOpen || !matchesKey(data, "down") || ctx.ui.getEditorText() !== "" || !editorFocused(tui)) return undefined;
 			if (!lastSnap || items({ snap: lastSnap, showEnded: false }).length === 0) return undefined;
 			void openPanel(ctx);
 			return { consume: true };
@@ -594,7 +601,12 @@ export default function piActors(pi: ExtensionAPI) {
 		description:
 			"Start a child agent on a task and return its id at once. Each time the child finishes a run, its final answer is pushed to you as a report; a report over 16K characters is cut and names the child's session file, which holds the full text. Several spawns in a row run in parallel. A child that finished a run stays alive: continue it with send.",
 		promptSnippet: "run a task in a child agent",
-		promptGuidelines: ["After spawning, end your turn: reports and messages arrive by themselves, so never poll."],
+		promptGuidelines: [
+			"Spawn for independent, parallel or context-heavy work; do small tasks yourself.",
+			"After spawning, end your turn: reports and messages arrive by themselves, so never poll.",
+			"Fork only if the child needs this conversation; otherwise give a fresh child a self-contained task.",
+			"Use pane only when the user asks.",
+		],
 		parameters: Type.Object({
 			task: Type.String({ description: "The child's instructions, delivered to it as a message." }),
 			name: Type.Optional(Type.String({ description: "Short readable name, e.g. 'backend'." })),
@@ -657,6 +669,7 @@ export default function piActors(pi: ExtensionAPI) {
 		label: "Stop agent",
 		description: "Stop a descendant agent (and its own children).",
 		promptSnippet: "end an agent below you in the tree",
+		promptGuidelines: ["Stop each child once you need nothing more from it; until then it idles. A stopped child can be resumed."],
 		parameters: Type.Object({ id: Type.String() }),
 		async execute(_id, p, signal, _onUpdate, ctx) {
 			ctxRef = ctx;
