@@ -114,6 +114,7 @@ test("↓ opens the panel only from the main editor, not from a dialog holding f
 	assert.equal(editorFocused(focused({ handleInput() {}, render: () => [] })), false, "a selector");
 	assert.equal(editorFocused(focused({ getValue: () => "", handleInput() {} })), false, "a search input");
 	assert.equal(editorFocused(focused(null)), false);
-	assert.equal(editorFocused(undefined), true, "no TUI at hand: keep the old behaviour");
-	assert.equal(editorFocused({}), true, "a pi without getFocusedComponent: keep the old behaviour");
+	assert.equal(editorFocused(focused({ getText: () => "" })), false, "getText without setText is not the editor");
+	assert.equal(editorFocused(undefined), false, "no TUI at hand: fail closed, do not hijack ↓");
+	assert.equal(editorFocused({}), false, "a pi without getFocusedComponent: fail closed");
 });

@@ -116,11 +116,13 @@ export function endedRoots(st: Pick<PanelState, "snap">): string[] {
 
 /**
  * ↓ opens the panel only from pi's main editor, never from a dialog (model, login, …) that holds
- * focus while the editor is empty. Any editor component has getText and setText; dialogs do not.
- * Without the TUI at hand, assume the editor.
+ * focus while the editor is empty. Pi focuses the dialog component itself (a container), while
+ * the main editor is the component with getText and setText. Fail closed: without positive
+ * proof the editor holds focus, ↓ belongs to whatever pi has open — hijacking a selector is
+ * worse than losing the shortcut (the panel still opens via /actors).
  */
 export function editorFocused(tui: { getFocusedComponent?(): unknown } | undefined): boolean {
-	if (typeof tui?.getFocusedComponent !== "function") return true;
+	if (typeof tui?.getFocusedComponent !== "function") return false;
 	const f = tui.getFocusedComponent() as { getText?: unknown; setText?: unknown } | null;
 	return typeof f?.getText === "function" && typeof f?.setText === "function";
 }
