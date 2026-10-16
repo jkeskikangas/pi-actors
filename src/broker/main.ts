@@ -12,7 +12,9 @@ const config = JSON.parse(readFileSync(configPath, "utf8")) as Config;
 try {
 	const broker = await startBroker(dir, sock, config);
 	console.log(`broker ${process.pid} listening on ${sock}`);
-	for (const sig of ["SIGTERM", "SIGINT", "SIGHUP"] as const) process.on(sig, () => void broker.stop());
+	// A signal stops this process, not the tree: Keepers wait out the grace period and reconnect
+	// to a relaunched broker. Only `stop_tree` (or every agent ending) finishes the tree.
+	for (const sig of ["SIGTERM", "SIGINT", "SIGHUP"] as const) process.on(sig, () => void broker.close());
 	await broker.done;
 	process.exit(0);
 } catch (err) {

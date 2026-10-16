@@ -18,7 +18,13 @@ The model's `fetch` / `persist` / `ack` actions describe the client's mailroom, 
 
 ## Covered
 
-Lifecycle and DOWN notices, links, depth and spawn limits, sender sequence numbers with retransmit, leased fetch with client dedupe and deferred ack, pi dropping an injected message and the reclaim that redelivers it, reloads, process crashes, broker crash with effect-free replay plus `recover()`, and forgetting ended agents.
+Lifecycle and DOWN notices, links, depth and spawn limits, sender sequence numbers with retransmit and `seq_gap` resync, leased fetch with client dedupe and deferred ack, pi dropping an injected message and the reclaim that redelivers it, reloads, process crashes, broker crash with effect-free replay plus `recover()`, and forgetting ended agents.
+
+## Sequencing and broker signals (0.2.7)
+
+The 0.2.5 incident: a broker that let one connection's frames overtake each other (op 180 passed an awaiting `spawn{resume}` 179 and got `seq_gap`), and a client that then failed every later op with the same `expected` seq. `legacyBroker` (chosen at init) stands for a 0.2.6 broker in a mixed-version tree: `brokerAcceptAny` may process any frame on the wire, while the current broker processes only the oldest (`brokerAccept`). A frame answered `seq_gap` stays in flight, held (`gapped`), until `clientResend`; `hello` renumbers unapplied frames from `last_seq + 1` (`realign`). Invariants: `appliedOnce`, `appliedInSendOrder`, `noSilentDrop` (every op sent is applied, still in flight, or died with its client), `brokerInOrder` (the current broker never answers `seq_gap` while the expected frame is on that connection) and `noWedge` (with nothing in flight the next seq is the broker's next, and a held head frame is the one the broker waits for).
+
+`brokerSigterm` stops the broker like a crash; `stopTree` and `brokerFinish` model `stop_tree` and the finished-tree shutdown, after which `keeperShutdown` kills any child left. Invariant `noKillWithoutStop`: no Keeper kills its child unless the tree was stopped. Witnesses: `witnessGapRecovered`, `witnessSigtermSurvived`, `witnessTreeFinished`. Mutants reintroduce each 0.2.6 bug (broker reordering, client dropping a `seq_gap` op, both together, SIGTERM as shutdown); all are caught (`noSilentDrop` and `noWedge` catch the client, `brokerInOrder` the broker, `noKillWithoutStop` the signal). `stopTree` counts against `MAX_FAULTS` so random traces still reach deep paths.
 
 ## Forget
 

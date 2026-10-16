@@ -79,7 +79,7 @@ An agent can set lower limits for the children it starts, but never higher ones.
 
 ## How it works
 
-Each tree of agents is coordinated by one small background process, the broker. Every change it makes is written to disk before it is confirmed, so after a crash it can be restarted and carry on exactly where it was. Agents that run without a visible pane are each watched by a tiny keeper process, which keeps them alive if the broker restarts. Each tree runs from its own copy of this extension's code, so updating pi in the middle of a run never mixes versions.
+Each tree of agents is coordinated by one small background process, the broker. Every change it makes is written to disk before it is confirmed, so after a crash it can be restarted and carry on exactly where it was. Agents that run without a visible pane are each watched by a tiny keeper process, which keeps them alive if the broker restarts. Stopping the broker with a signal (SIGTERM, SIGINT, SIGHUP) counts as such a restart, not as stopping the tree (`/actors stop`, `/new`). Each tree runs from its own copy of this extension's code, so updating pi in the middle of a run never mixes versions.
 
 The design (`designs/pi-actors.md`), the spec (`specs/pi-actors.md`) and the formal model (`model/`) are in the repository.
 
