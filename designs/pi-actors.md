@@ -127,7 +127,9 @@ graph TD
 
 - `seq = last + 1`: applied;
 - `seq ≤ last`: returns the cached response from the last 256 seqs;
-- `seq > last + 1`: `seq_gap`.
+- `seq > last + 1`: `seq_gap` (`detail: "expected <last + 1>"`), not applied.
+
+The broker processes one connection's frames strictly in arrival order, one at a time: a frame that awaits something (a `spawn{resume}` checking that the old process is gone) holds back the frames behind it, and is not applied if its connection was superseded meanwhile. A client keeps a frame answered `seq_gap` in flight instead of failing it. Once every frame before it is answered it resends it, and the frames behind it, in order. If the expected seq is no longer in flight, the client reconnects, and on `welcome{last_seq}` it renumbers its unapplied frames from `last_seq + 1`; frames up to `last_seq` keep their seq, so their resend returns the cached response and nothing is applied twice. This also recovers a client from a 0.2.6 broker, which could apply one connection's frames out of order (incident on 0.2.5: op 180 overtook a `spawn{resume}` 179, got `seq_gap`, and every later op failed with `expected 180`).
 
 A reload loses the unaccepted frames held in memory. A tool interrupted by the reload reports `interrupted{seq}` to the model, and the model's own retry is a new message (spec INV-3).
 
@@ -267,6 +269,8 @@ Why: the parent briefed the child and usually holds the answer; the user hears o
    - `start` effects are **never** re-executed;
    - a sweep sends any non-down agent whose parent is `down` into `killing` with `killed:parent_down`.
 1. Keepers send `keeper_hello` and then their retained `proc_start` / `proc_exit`.
+
+**Broker signals.** SIGTERM, SIGINT and SIGHUP stop the broker process, not the tree: it closes its connections and socket, releases the lock and exits, exactly like a crash but without a torn log. Keepers keep their children for the grace period and reconnect to the relaunched broker, which replays its log. Only a finished tree (every agent `down`, after `stop_tree` or the root ending) makes the broker send `shutdown` to its Keepers, which then kill any child still running. Before 0.2.7 a signal was treated as tree shutdown, so restarting a broker with SIGTERM killed every running agent.
 
 ## State ownership
 
@@ -420,6 +424,7 @@ Why: the parent briefed the child and usually holds the answer; the user hears o
 | Scenario                                     | Behaviour                                                                                                                                                                  | Owner                  |
 | -------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------- |
 | Broker crash                                 | Replay plus `recover`; headless children survive; Keepers report retained exits; no `start` is replayed.                                                                   | EventLog, Tree, Keeper |
+| Broker stopped by SIGTERM, SIGINT or SIGHUP  | Same as a broker crash: agents keep running; Keepers wait out G and reconnect; the relaunched broker replays its log. No `shutdown` to Keepers.                            | BrokerServer, Keeper   |
 | Broker stops answering (socket stays open)   | After 45 s of silence or an unanswered request, the agent drops the connection and reconnects (D4). A broker hung outright is not restarted; agents treat it as unreachable, so children end about 45 s + G after it went quiet. | Client                 |
 | Keeper crash                                 | The child's stdin closes and pi exits; the broker signals the recorded pgid; `down(error:keeper_lost)`.                                                                    | Tree, Placement        |
 | Crash before an ack                          | Redelivered, then deduplicated by the consumed-ID set.                                                                                                                     | Client                 |

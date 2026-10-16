@@ -47,6 +47,8 @@ export class Client extends EventEmitter {
 	private buf = "";
 	private nextSeq = 1;
 	private inflight: OpFrame[] = [];
+	/** In-flight frames the broker refused with seq_gap (not applied): held for a resend in order. */
+	private gapped = new Set<number>();
 	private waiters = new Map<number, (r: Response) => void>();
 	private fetches = new Map<string, (m: Message | null) => void>();
 	private inspects = new Map<string, (s: Snapshot) => void>();
@@ -86,6 +88,7 @@ export class Client extends EventEmitter {
 		for (const [, w] of this.waiters) w({ ok: false, error: "not_live", detail: reason });
 		this.waiters.clear();
 		this.inflight = [];
+		this.gapped.clear();
 		for (const [, r] of this.fetches) r(null);
 		this.fetches.clear();
 	}
@@ -188,7 +191,7 @@ export class Client extends EventEmitter {
 					this.lostSince = undefined;
 					this.counter = 0;
 					this.owed.delete("hello");
-					if (this.inflight.length === 0) this.nextSeq = f.lastSeq + 1;
+					this.realign(f.lastSeq);
 					for (const op of this.inflight) this.ask(`op:${op.seq}`, op); // retransmit in order
 					clearInterval(this.hb);
 					this.hb = setInterval(() => this.write({ t: "hb", usage: this.usage() }), TIMING.heartbeatMs);
@@ -197,10 +200,22 @@ export class Client extends EventEmitter {
 					break;
 				case "resp": {
 					this.owed.delete(`op:${f.seq}`);
+					const gap = f.response?.error === "seq_gap" && /^expected (\d+)$/.exec(String(f.response.detail ?? ""));
+					if (gap) {
+						// Not applied: keep it in flight and resend once the broker can take it (issue: seq_gap wedge).
+						if (!this.inflight.some((x) => x.seq === f.seq)) break;
+						this.gapped.add(f.seq);
+						// The seq the broker waits for is no longer ours to send: reconnect, and the
+						// welcome renumbers. Otherwise it is still in flight: resend after its answer.
+						const want = Number(gap[1]);
+						if (want >= f.seq || !this.inflight.some((x) => x.seq === want)) this.sock?.destroy();
+						break;
+					}
 					this.inflight = this.inflight.filter((x) => x.seq !== f.seq);
 					const w = this.waiters.get(f.seq);
 					this.waiters.delete(f.seq);
 					w?.(f.response);
+					this.resync();
 					break;
 				}
 				case "fetched": {
@@ -235,6 +250,40 @@ export class Client extends EventEmitter {
 					break;
 				}
 			}
+		}
+	}
+
+	/**
+	 * After a welcome: frames up to `lastSeq` were applied (their resends get the cached answer);
+	 * the rest were not, so they are numbered on from `lastSeq + 1`, in order. Nothing is applied
+	 * twice (applied seqs keep their number) and nothing is skipped.
+	 */
+	private realign(lastSeq: number) {
+		this.gapped.clear();
+		let next = lastSeq + 1;
+		for (const op of this.inflight) {
+			if (op.seq <= lastSeq) continue;
+			if (op.seq !== next) {
+				const w = this.waiters.get(op.seq);
+				this.waiters.delete(op.seq);
+				op.seq = next;
+				if (w) this.waiters.set(op.seq, w);
+			}
+			next++;
+		}
+		this.nextSeq = next;
+	}
+
+	/**
+	 * Once every frame before the held (seq_gap) ones is answered, resend them in order. If one
+	 * gaps again for a seq no longer in flight, the client reconnects (see "resp"), so this never loops.
+	 */
+	private resync() {
+		const head = this.inflight[0];
+		if (!head || !this.gapped.has(head.seq) || !this.connected) return;
+		for (const op of this.inflight) {
+			if (!this.gapped.delete(op.seq)) break;
+			this.ask(`op:${op.seq}`, op);
 		}
 	}
 

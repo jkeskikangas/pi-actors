@@ -58,6 +58,27 @@ module pi_actors {
     forgottenBy: str -> str,
     redeliveries: int,
     faults: int,
+    // --- sequencing across broker versions (incident 0.2.5: seq_gap wedge) ---
+    // A 0.2.6 broker in a mixed-version tree: it may apply one connection's frames out of order.
+    legacyBroker: bool,
+    // Client: in-flight uids the broker answered seq_gap (not applied), held for a resend.
+    gapped: str -> Set[int],
+    // Observation: every op a client sent; ops lost with client memory (reload, process end).
+    sentUids: Set[int],
+    lostWithClient: Set[int],
+    appliedUids: Set[int],
+    lastAppliedUid: str -> int,
+    dupApplied: bool,
+    appliedOutOfOrder: bool,
+    // A seq_gap while the expected frame was still on the same connection (frames overtook).
+    reorderGap: bool,
+    resentUids: Set[int],
+    // --- stopping: broker process vs tree ---
+    treeStopped: bool,
+    // The broker told Keepers to leave (finished-tree shutdown); they kill any child left.
+    shutdownSent: bool,
+    killedWithoutStop: bool,
+    sigtermed: bool,
   }
 
   pure val AGENTS = Set("r", "a", "b", "c")
@@ -75,7 +96,12 @@ module pi_actors {
 
   pure def emptyMap(v) = AGENTS.mapBy(_ => v)
 
-  action init = s' = {
+  action init = {
+    nondet lb = Set(true, false).oneOf()
+    initWith(lb)
+  }
+
+  action initWith(lb: bool): bool = s' = {
     agents: AGENTS.mapBy(id => { status: if (id == "r") Live else Unborn, parent: PARENT.get(id), depth: DEPTH.get(id) }),
     mailbox: emptyMap(List()),
     lastSeq: emptyMap(0),
@@ -106,6 +132,20 @@ module pi_actors {
     forgottenBy: AGENTS.mapBy(_ => ""),
     redeliveries: 0,
     faults: 0,
+    legacyBroker: lb,
+    gapped: emptyMap(Set()),
+    sentUids: Set(),
+    lostWithClient: Set(),
+    appliedUids: Set(),
+    lastAppliedUid: emptyMap(-1),
+    dupApplied: false,
+    appliedOutOfOrder: false,
+    reorderGap: false,
+    resentUids: Set(),
+    treeStopped: false,
+    shutdownSent: false,
+    killedWithoutStop: false,
+    sigtermed: false,
   }
 
   pure def status(st: State, id: str): Status = st.agents.get(id).status
@@ -139,6 +179,8 @@ module pi_actors {
   }
 
   pure def clientMemoryLost(st: State, id: str): State = { ...st,
+    lostWithClient: st.lostWithClient.union(st.inflight.get(id).foldl(Set(), (acc, m) => acc.union(Set(m.uid)))),
+    gapped: st.gapped.set(id, Set()),
     inflight: st.inflight.set(id, List()),
     fetched: st.fetched.set(id, List()),
     injected: st.injected.set(id, Set()),
@@ -180,7 +222,14 @@ module pi_actors {
     s' = { ...st1, procAlive: s.procAlive.set(c, true) },
   }
 
-  // Accepted hello. welcome.last_seq resyncs the client's counter when nothing is in flight.
+  // welcome.last_seq: frames up to it were applied and keep their seq (a resend gets the cached
+  // answer); the rest were not, and are numbered on from last_seq + 1, in order.
+  pure def unapplied(l: List[Msg], last: int): List[Msg] = l.select(m => m.seq > last)
+  pure def realign(l: List[Msg], last: int): List[Msg] =
+    l.foldl(List(), (acc, m) => if (m.seq <= last) acc.append(m)
+      else acc.append({ ...m, seq: last + 1 + unapplied(acc, last).length() }))
+
+  // Accepted hello. welcome.last_seq realigns the client's numbering; everything held is resent.
   pure def canHello(st: State, id: str): bool = all {
     st.brokerUp,
     st.procAlive.get(id),
@@ -193,7 +242,9 @@ module pi_actors {
     val st1 = setStatus(s, id, Live)
     s' = { ...st1,
       connected: s.connected.set(id, true),
-      nextSeq: if (s.inflight.get(id).length() == 0) s.nextSeq.set(id, s.lastSeq.get(id) + 1) else s.nextSeq,
+      inflight: s.inflight.set(id, realign(s.inflight.get(id), s.lastSeq.get(id))),
+      nextSeq: s.nextSeq.set(id, s.lastSeq.get(id) + 1 + unapplied(s.inflight.get(id), s.lastSeq.get(id)).length()),
+      gapped: s.gapped.set(id, Set()),
     },
   }
 
@@ -207,26 +258,68 @@ module pi_actors {
       inflight: s.inflight.setBy(src, l => l.append(m)),
       nextSeq: s.nextSeq.set(src, n + 1),
       uidCounter: s.uidCounter + 1,
+      sentUids: s.sentUids.union(Set(m.uid)),
     },
   }
 
-  // Broker applies the oldest in-flight frame (also retransmission after reconnect).
+  // Frames on the wire: in flight and not held after a seq_gap answer.
+  pure def wire(st: State, src: str): List[Msg] = st.inflight.get(src).select(m => not(st.gapped.get(src).contains(m.uid)))
+
   // seq = last+1: logged; appended if the target accepts mail, otherwise logged as rejected.
+  pure def applyFrame(st: State, src: str, m: Msg): State = {
+    val st1 = if (accepting(status(st, m.dst))) { ...st, mailbox: st.mailbox.setBy(m.dst, l => l.append(m)) }
+      else { ...st, rejected: st.rejected.union(Set(m.uid)) }
+    { ...st1,
+      lastSeq: st1.lastSeq.set(src, m.seq),
+      appliedUids: st1.appliedUids.union(Set(m.uid)),
+      dupApplied: st1.dupApplied or st1.appliedUids.contains(m.uid),
+      appliedOutOfOrder: st1.appliedOutOfOrder or m.uid <= st1.lastAppliedUid.get(src),
+      lastAppliedUid: st1.lastAppliedUid.set(src, m.uid),
+    }
+  }
+
+  // seq > last+1: answered seq_gap, not applied. The client holds the frame for a resend.
+  pure def gapAnswer(st: State, src: str, m: Msg): State = { ...st,
+    gapped: st.gapped.setBy(src, g => g.union(Set(m.uid))),
+    reorderGap: st.reorderGap or wire(st, src).select(x => x.seq == st.lastSeq.get(src) + 1).length() > 0,
+  }
+
   // seq <= last: duplicate, no change (the cached response is returned).
-  action brokerAccept(src: str): bool = all {
+  pure def brokerProcess(st: State, src: str, m: Msg): State =
+    if (m.seq == st.lastSeq.get(src) + 1) applyFrame(st, src, m)
+    else if (m.seq > st.lastSeq.get(src) + 1) gapAnswer(st, src, m)
+    else st
+
+  // The broker processes the frame at position i of the wire. The current broker takes only
+  // the oldest (per-connection queue); a 0.2.6 broker may let later frames overtake an awaiting
+  // one (spawn{resume} awaits the process check).
+  pure def canBrokerAccept(st: State, src: str, i: int): bool = all {
+    st.brokerUp,
+    st.connected.get(src),
+    i >= 0, i < wire(st, src).length(),
+    i == 0 or st.legacyBroker,
+  }
+
+  action brokerAcceptAt(src: str, i: int): bool = all {
+    canBrokerAccept(s, src, i),
+    s' = brokerProcess(s, src, wire(s, src)[i]),
+  }
+
+  action brokerAccept(src: str): bool = brokerAcceptAt(src, 0)
+
+  action brokerAcceptAny(src: str): bool = all {
+    wire(s, src).length() > 0,
+    nondet i = wire(s, src).indices().oneOf()
+    brokerAcceptAt(src, i),
+  }
+
+  // Every frame before the held ones is answered: resend them, in order.
+  action clientResend(src: str): bool = all {
     s.brokerUp,
     s.connected.get(src),
     s.inflight.get(src).length() > 0,
-    val m = s.inflight.get(src).head()
-    s' = if (m.seq == s.lastSeq.get(src) + 1) {
-        if (accepting(status(s, m.dst))) { ...s,
-          lastSeq: s.lastSeq.set(src, m.seq),
-          mailbox: s.mailbox.setBy(m.dst, l => l.append(m)),
-        } else { ...s,
-          lastSeq: s.lastSeq.set(src, m.seq),
-          rejected: s.rejected.union(Set(m.uid)),
-        }
-      } else s,
+    s.gapped.get(src).contains(s.inflight.get(src).head().uid),
+    s' = { ...s, gapped: s.gapped.set(src, Set()), resentUids: s.resentUids.union(s.gapped.get(src)) },
   }
 
   // The broker's response reaches the client; the frame leaves its memory.
@@ -237,6 +330,7 @@ module pi_actors {
     val m = s.inflight.get(src).head()
     all {
       m.seq <= s.lastSeq.get(src),
+      not(s.gapped.get(src).contains(m.uid)),
       s' = { ...s,
         inflight: s.inflight.setBy(src, l => l.tail()),
         acceptedBySender: if (s.rejected.contains(m.uid)) s.acceptedBySender else s.acceptedBySender.union(Set(m)),
@@ -454,6 +548,36 @@ module pi_actors {
     s' = { ...fault(s), brokerUp: false, connected: emptyMap(false), leases: emptyMap(Set()) },
   }
 
+  // SIGTERM/SIGINT/SIGHUP to the broker process: it stops like a crash. Keepers keep their
+  // children through the grace period and reconnect to the relaunched broker.
+  action brokerSigterm: bool = all {
+    s.brokerUp, s.faults < MAX_FAULTS,
+    s' = { ...fault(s), brokerUp: false, connected: emptyMap(false), leases: emptyMap(Set()), sigtermed: true },
+  }
+
+  // stop_tree (root): kill every agent; the root's record ends. Counted against MAX_FAULTS only
+  // so that random traces do not end the tree early and still reach deep paths.
+  action stopTree: bool = all {
+    canAct(s, "r"), s.faults < MAX_FAULTS,
+    val st1 = AGENTS.filter(id => id != "r" and isActive(status(s, id))).fold(goDown(fault(s), "r"), (acc, id) => setStatus(acc, id, Killing))
+    s' = { ...st1, treeStopped: true },
+  }
+
+  pure def finished(st: State): bool = AGENTS.forall(id => Set(Down, Unborn, Gone).contains(status(st, id)))
+
+  // A finished tree: the broker tells Keepers to leave, compacts and exits.
+  action brokerFinish: bool = all {
+    s.brokerUp, finished(s),
+    s' = { ...s, brokerUp: false, connected: emptyMap(false), leases: emptyMap(Set()), shutdownSent: true },
+  }
+
+  // A Keeper told to leave kills its child, if it still runs.
+  action keeperShutdown(id: str): bool = all {
+    s.shutdownSent, id != "r", s.procAlive.get(id),
+    val st1 = procStops(s, id)
+    s' = { ...st1, killedWithoutStop: s.killedWithoutStop or not(s.treeStopped) },
+  }
+
   // Replay is effect-free; recover() turns live agents into disconnected ones and sweeps orphans.
   pure def recover(st: State): State = {
     val st1 = AGENTS.filter(id => status(st, id) == Live).fold(st, (acc, id) => setStatus(acc, id, Disconnected))
@@ -471,7 +595,8 @@ module pi_actors {
     nondet a = AGENTS.oneOf()
     nondet b = AGENTS.oneOf()
     any {
-      spawn(a, b), hello(a), send(a, b), brokerAccept(a), clientAccepted(a),
+      spawn(a, b), hello(a), send(a, b), brokerAccept(a), brokerAcceptAny(a), clientResend(a), clientAccepted(a),
+      brokerSigterm, stopTree, brokerFinish, keeperShutdown(a),
       fetch(a), persist(a), ack(a), piDrops(a), piKeeps(a), piDeliversKept(a), reclaim(a), exit(a), kill(a, b), forget(a, b),
       graceExpire(a), startTimeout(a), processEnds(a), procExitReported(a), killingExpire(a),
       processCrash(a), reload(a), connectionDrop(a), brokerCrash, brokerRestart,
@@ -523,10 +648,29 @@ module pi_actors {
       implies (activeAncestors.size() == 0 or activeAncestors.exists(p => mayForget(s, p, id)))
   })
 
+  // Sequencing: every op is applied at most once, in the order its sender sent it, and is never
+  // silently dropped: it is applied, still in flight, or died with its client (reload, process end).
+  val appliedOnce = not(s.dupApplied)
+  val appliedInSendOrder = not(s.appliedOutOfOrder)
+  val noSilentDrop = s.sentUids.forall(u => s.appliedUids.contains(u) or s.lostWithClient.contains(u)
+    or AGENTS.exists(id => s.inflight.get(id).select(m => m.uid == u).length() > 0))
+  // The current broker applies one connection's frames in arrival order: no seq_gap while the
+  // expected frame is on that connection (only a 0.2.6 broker in a mixed tree does that).
+  val brokerInOrder = not(s.legacyBroker) implies not(s.reorderGap)
+  // A seq_gap never wedges a sender: with nothing in flight its next seq is the broker's next,
+  // and a held frame at the head is the one the broker waits for, so it can be resent.
+  val noWedge = AGENTS.forall(id => canAct(s, id) implies (
+    (s.inflight.get(id).length() == 0 implies s.nextSeq.get(id) == s.lastSeq.get(id) + 1)
+    and (s.inflight.get(id).length() > 0 and s.gapped.get(id).contains(s.inflight.get(id).head().uid)
+      implies s.inflight.get(id).head().seq == s.lastSeq.get(id) + 1)))
+  // Stopping the broker process (signal) never kills an agent: only a stopped, finished tree does.
+  val noKillWithoutStop = not(s.killedWithoutStop)
+
   val all_invariants = downOnce and downNotified and consumedOnce and noLossOnAck and atLeastOnce
     and fifo and noOrphans and limits and leasesNeedConnection
     and forgetsOnlyDown and forgottenStaysGone and forgottenHoldsNothing
     and noForgetUnderRunningParent and endedIsClearable
+    and appliedOnce and appliedInSendOrder and noSilentDrop and brokerInOrder and noWedge and noKillWithoutStop
 
   // ---------------- reachability witnesses (each MUST be violated by simulation) ----------------
   val witnessConsumed = AGENTS.forall(id => s.persisted.get(id).size() == 0)
@@ -541,8 +685,47 @@ module pi_actors {
   val witnessPlaceReused = not(AGENTS.forall(id => status(s, id) != Unborn))
   // c ended while a ran; a was killed or lost later; the root then cleared c.
   val witnessClearedAfterParentKilled = not(s.forgottenBy.get("c") == "r" and s.endedBeforeParent.contains("c"))
+  // A frame refused with seq_gap (a 0.2.6 broker reordered it) was resent and applied.
+  val witnessGapRecovered = not(s.resentUids.exists(u => s.appliedUids.contains(u)))
+  // After a broker SIGTERM and relaunch, a child is live and connected again.
+  val witnessSigtermSurvived = not(s.sigtermed and s.brokerUp
+    and AGENTS.exists(id => id != "r" and status(s, id) == Live and s.procAlive.get(id) and s.connected.get(id)))
+  // A stopped tree finished and the broker told its Keepers to leave.
+  val witnessTreeFinished = not(s.shutdownSent)
 
   // ---------------- deterministic scenario tests (quint test; mirrored as Tree unit tests) ----------------
+  // The incident: op 1 (spawn{resume}) awaits the process check on a 0.2.6 broker; op 2 overtakes
+  // it and is refused with seq_gap. The client holds op 2, resends it after op 1's answer, and
+  // each op is applied once, in order.
+  run seqGapRecoveredTest =
+    initWith(true).then(spawn("r", "a")).then(hello("a")).then(send("r", "a")).then(send("r", "a"))
+      .then(brokerAcceptAt("r", 1))
+      .then(all { assert(s.gapped.get("r") == Set(1) and s.lastSeq.get("r") == 0), s' = s })
+      .then(brokerAccept("r")).then(clientAccepted("r")).then(clientResend("r"))
+      .then(brokerAccept("r")).then(clientAccepted("r"))
+      .then(all { assert(s.mailbox.get("a").length() == 2 and s.inflight.get("r").length() == 0 and all_invariants), s' = s })
+      .then(send("r", "a")).then(brokerAccept("r")).then(clientAccepted("r"))
+      .then(all { assert(s.mailbox.get("a").length() == 3 and all_invariants), s' = s })
+
+  // The current broker never lets a frame overtake another on one connection.
+  run inOrderBrokerTest =
+    initWith(false).then(spawn("r", "a")).then(hello("a")).then(send("r", "a")).then(send("r", "a"))
+      .then(all { assert(canBrokerAccept(s, "r", 0) and not(canBrokerAccept(s, "r", 1))), s' = s })
+
+  // A broker SIGTERM is a crash, not a tree stop: the child lives on and reconnects.
+  run sigtermKeepsTreeTest =
+    initWith(false).then(spawn("r", "a")).then(hello("a")).then(brokerSigterm)
+      .then(all { assert(not(s.shutdownSent) and s.procAlive.get("a")), s' = s })
+      .then(brokerRestart).then(hello("r")).then(hello("a"))
+      .then(all { assert(status(s, "a") == Live and s.procAlive.get("a") and all_invariants), s' = s })
+
+  // stop_tree: everything ends, then the finished broker tells the Keepers to leave.
+  run stopTreeFinishesTest =
+    initWith(false).then(spawn("r", "a")).then(hello("a")).then(stopTree)
+      .then(all { assert(status(s, "a") == Killing and status(s, "r") == Down), s' = s })
+      .then(processEnds("a")).then(procExitReported("a")).then(brokerFinish)
+      .then(all { assert(s.shutdownSent and all_invariants), s' = s })
+
   run redeliveryAfterReloadTest =
     init.then(spawn("r", "a")).then(hello("a")).then(send("r", "a")).then(brokerAccept("r"))
       .then(clientAccepted("r")).then(fetch("a")).then(persist("a")).then(reload("a"))

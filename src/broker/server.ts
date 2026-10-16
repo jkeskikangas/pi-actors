@@ -23,10 +23,15 @@ interface Conn {
 	inc?: number;
 	lastSeen: number;
 	buf: string;
+	/** Frames of one connection run strictly in arrival order, one at a time (sender seq order). */
+	queue: Promise<void>;
 }
 
 export interface BrokerHandle {
+	/** Finished-tree shutdown: Keepers are told to leave (and kill any child left). */
 	stop(): Promise<void>;
+	/** Stop the broker process only, like a crash: agents keep running and reconnect. */
+	close(): Promise<void>;
 	readonly state: TreeState;
 	readonly done: Promise<void>;
 }
@@ -317,6 +322,8 @@ export async function startBroker(dir: string, sock: string, config: Config): Pr
 					// Resume only once the broker itself sees the old process gone (F15).
 					const old = req?.resume ? st.agents[req.resume] : undefined;
 					const resumeProcGone = old ? await processGone(old) : undefined;
+					// The check may outlive the connection: a superseded one must not apply anything.
+					if (agentConn.get(id) !== c) return send(c, { t: "resp", seq, response: { ok: false, error: "not_live", detail: "not the current connection" } });
 					run({ type: "spawn", now, from: id, seq, req, resumeProcGone });
 				}
 				else if (op === "send") run({ type: "send", now, from: id, seq, to: String(f.to ?? ""), kind: f.kind as "mail", body: String(f.body ?? ""), tag: f.tag as string | undefined, ref: f.ref as string | undefined, urgent: !!f.urgent });
@@ -382,13 +389,14 @@ export async function startBroker(dir: string, sock: string, config: Config): Pr
 	ensurePrivateDir(dirname(sock)); // shared /tmp: must be ours and private (F6)
 	rmSync(sock, { force: true }); // we hold the lock, so any socket file here is stale
 	const server: Server = createServer((socket) => {
-		const c: Conn = { socket, lastSeen: Date.now(), buf: "" };
+		const c: Conn = { socket, lastSeen: Date.now(), buf: "", queue: Promise.resolve() };
 		conns.add(c);
 		socket.setEncoding("utf8");
 		socket.on("data", (data: string) => {
 			const { frames, rest } = decode(c.buf + data);
 			c.buf = rest.length > 256 * 1024 ? "" : rest;
-			for (const f of frames) void onFrame(c, f as Record<string, unknown>).catch((err) => console.error("frame error", err));
+			// Chained, never concurrent: an awaiting frame (spawn with resume) must not be overtaken.
+			for (const f of frames) c.queue = c.queue.then(async () => void (await onFrame(c, f as Record<string, unknown>))).catch((err) => console.error("frame error", err));
 		});
 		socket.on("error", () => {});
 		socket.on("close", () => {
@@ -446,6 +454,24 @@ export async function startBroker(dir: string, sock: string, config: Config): Pr
 		}
 	}, 5000);
 
+	/**
+	 * Stop this broker process only (SIGTERM, SIGINT, SIGHUP): like a crash, the tree goes on.
+	 * Keepers keep their children and reconnect to the next broker, which replays the log.
+	 */
+	const close = async () => {
+		if (stopping) return;
+		stopping = true;
+		clearInterval(timer);
+		clearInterval(paneTimer);
+		for (const c of conns) c.socket.destroy();
+		await new Promise<void>((r) => server.close(() => r()));
+		rmSync(sock, { force: true });
+		log.close();
+		releaseLock(dir);
+		resolveDone();
+	};
+
+	/** The tree is finished: tell Keepers to leave, compact, exit. */
 	const shutdown = async () => {
 		if (stopping) return;
 		stopping = true;
@@ -473,6 +499,7 @@ export async function startBroker(dir: string, sock: string, config: Config): Pr
 
 	return {
 		stop: shutdown,
+		close,
 		get state() {
 			return st;
 		},
