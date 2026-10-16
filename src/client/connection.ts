@@ -28,7 +28,8 @@ export interface FetchFilter {
 export interface Snapshot {
 	treeId: string;
 	self: string;
-	agents: { id: string; parent: string | null; status: string; inc: number; reason?: string; connected: boolean; placement?: string; paneId?: string; model?: string; mailbox: number; spawns: number; sessionFile?: string; task?: string }[];
+	/** `running`: executing a run (not idle) on its current connection; absent from older brokers. */
+	agents: { id: string; parent: string | null; status: string; inc: number; reason?: string; connected: boolean; running?: boolean; placement?: string; paneId?: string; model?: string; mailbox: number; spawns: number; sessionFile?: string; task?: string }[];
 	liveChildren: number;
 }
 
@@ -59,6 +60,7 @@ export class Client extends EventEmitter {
 	private owed = new Map<string, number>();
 	private watchdog: NodeJS.Timeout | undefined;
 	private checked = 0;
+	private running = false;
 	connected = false;
 	usage: () => Record<string, number> | undefined = () => undefined;
 
@@ -190,6 +192,7 @@ export class Client extends EventEmitter {
 					this.owed.delete("hello");
 					if (this.inflight.length === 0) this.nextSeq = f.lastSeq + 1;
 					for (const op of this.inflight) this.ask(`op:${op.seq}`, op); // retransmit in order
+					this.write({ t: "run", running: this.running }); // the broker keeps it per connection
 					clearInterval(this.hb);
 					this.hb = setInterval(() => this.write({ t: "hb", usage: this.usage() }), TIMING.heartbeatMs);
 					this.hb.unref();
@@ -308,6 +311,12 @@ export class Client extends EventEmitter {
 			this.on("welcome", done);
 			signal?.addEventListener("abort", done, { once: true });
 		});
+	}
+
+	/** Whether the agent is executing a run; restated on every reconnect. */
+	setRunning(running: boolean) {
+		this.running = running;
+		if (this.connected) this.write({ t: "run", running });
 	}
 
 	stopTree() {

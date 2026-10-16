@@ -37,7 +37,7 @@ A typical pattern: start a few children, end the turn, and act on their reports 
 
 ## The agents panel
 
-While children run, a line under the editor says so: `pi-actors · 2 running — ↓ to open`. Press **↓ on an empty editor**, or run `/actors`, to open the panel. It takes the editor's place, like pi's own selectors.
+While subagents are working (not idle), a line under the editor says how many: `pi-actors · 2 subagents running`. Press **↓ on an empty editor**, or run `/actors`, to open the panel. It takes the editor's place, like pi's own selectors.
 
 - **Running agents come first**, in tree order, with their status, model and placement.
 - **Ended agents fold into one row**, `▸ 5 ended`. Enter unfolds it. Their transcripts stay readable until you clear them.

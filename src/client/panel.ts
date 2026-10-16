@@ -129,9 +129,11 @@ export function editorFocused(tui: { getFocusedComponent?(): unknown } | undefin
 
 export function summary(snap: Snapshot | undefined): string | undefined {
 	if (!snap) return undefined;
-	const running = snap.agents.filter((a) => a.id !== "root" && isActive(a.status)).length;
+	// This agent's subtree, as the panel shows it.
+	const count = (parent: string): number => snap.agents.filter((a) => a.parent === parent).reduce((n, a) => n + (a.running ? 1 : 0) + count(a.id), 0);
+	const running = count(snap.self);
 	if (running === 0) return undefined;
-	return `pi-actors · ${running} running — ↓ to open`;
+	return `pi-actors · ${running} subagent${running === 1 ? "" : "s"} running`;
 }
 
 // ---------------------------------------------------------------- labels

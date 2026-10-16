@@ -116,6 +116,7 @@ export default function piActors(pi: ExtensionAPI) {
 	async function open(ctx: ExtensionContext, identity: ConstructorParameters<typeof Client>[0], grace: number, redial?: () => Promise<void>): Promise<Client> {
 		const c = new Client(identity, grace, redial);
 		c.usage = () => usage;
+		c.setRunning(!idle); // the root connects mid-run, on its first spawn
 		const room = new Mailroom(identity.id);
 		room.restore(ctx.sessionManager.getEntries());
 		const current = () => client === c;
@@ -552,6 +553,7 @@ export default function piActors(pi: ExtensionAPI) {
 	});
 	pi.on("agent_start", async () => {
 		idle = false;
+		client?.setRunning(true);
 	});
 	pi.on("message_end", async (event) => {
 		const m = event.message as { role?: string; content?: unknown; usage?: { input?: number; output?: number; cacheWrite?: number; cost?: { total?: number } } };
@@ -568,6 +570,7 @@ export default function piActors(pi: ExtensionAPI) {
 	});
 	pi.on("agent_settled", async (_e, ctx) => {
 		idle = true;
+		client?.setRunning(false);
 		ackPersisted(ctx);
 		// Pushes pi dropped (its queues are cleared on Esc) never reached the session: release their
 		// leases and deliver them again (F4).

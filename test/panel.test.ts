@@ -49,10 +49,14 @@ test("labels read as words; models are shortened; ended agents drop pane and que
 	assert.match(text, /○ old {2}stopped, exit unconfirmed$/m);
 });
 
-test("summary counts running agents only", () => {
-	assert.equal(summary(snap()), "pi-actors · 2 running — ↓ to open");
-	assert.equal(summary(snap([agent("root", null as never), agent("x", "root", "down")])), undefined);
+test("summary counts subagents executing a run: idle and ended agents and the root are left out; none hides it", () => {
+	assert.equal(summary(snap()), undefined, "live but idle agents are not running");
+	assert.equal(summary(snap([agent("root", null as never, "live", { running: true }), agent("a", "root", "live", { running: true }), agent("b", "root"), agent("x", "root", "down")])), "pi-actors · 1 subagent running");
+	assert.equal(summary(snap([agent("root", null as never), agent("a", "root", "live", { running: true }), agent("a.k", "a", "live", { running: true })])), "pi-actors · 2 subagents running");
 	assert.equal(summary(undefined), undefined);
+	const pane = (kid: boolean) => ({ ...snap([agent("root", null as never, "live", { running: true }), agent("me", "root", "live", { running: true }), agent("sib", "root", "live", { running: true }), agent("me.k", "me", "live", { running: kid })]), self: "me" });
+	assert.equal(summary(pane(false)), undefined, "a pane child counts neither itself nor agents outside its subtree");
+	assert.equal(summary(pane(true)), "pi-actors · 1 subagent running");
 });
 
 test("enter toggles the ended row and opens a transcript; esc backs out, then closes", () => {

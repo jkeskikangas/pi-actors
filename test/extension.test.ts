@@ -231,13 +231,43 @@ test("a delivery renders as one collapsed line; expanded shows what the model re
 	assert.match(expanded, /echo:echo/);
 });
 
-test("in tui, the widget counts running agents and clears when the tree stops", async () => {
+test("in tui, the widget counts subagents executing a run, hides when none is, and clears when the tree stops", async () => {
 	const h = root({ mode: "tui" });
 	await h.fire("session_start", { reason: "startup" });
+	const widget = () => h.widgets["pi-actors"]?.[0];
 	await h.tool("spawn", { task: "serve", name: "w1" });
-	await h.waitFor(() => /1 running/.test(h.widgets["pi-actors"]?.[0] ?? ""), 8000);
+	await h.tool("spawn", { task: "serve", name: "w2" });
+	await h.tool("send", { to: "w1", text: "hi" });
+	await h.waitFor(() => /echo:hi/.test(h.inbox()));
+	await new Promise((r) => setTimeout(r, 5500)); // one widget refresh with both children idle
+	assert.equal(widget(), undefined, "idle children are not running");
+	await h.tool("send", { to: "w1", text: "busy" });
+	await h.waitFor(() => widget() === "pi-actors · 1 subagent running", 8000);
+	await h.tool("send", { to: "w2", text: "busy" });
+	await h.waitFor(() => widget() === "pi-actors · 2 subagents running", 8000);
+	await h.tool("send", { to: "w2", text: "idle" });
+	await h.waitFor(() => widget() === "pi-actors · 1 subagent running", 8000);
+	await h.tool("stop", { id: "w1" });
+	await h.waitFor(() => widget() === undefined, 8000);
 	await h.command("actors", "stop");
 	await h.waitFor(() => h.widgets["pi-actors"] === undefined, 8000);
+});
+
+test("an agent's run state follows agent_start and agent_settled, and is reported by the broker", async () => {
+	const h = root();
+	await h.tool("spawn", { task: "serve", name: "rs" });
+	const status = () => {
+		try {
+			return JSON.parse(readFileSync(join(home, "h", "trees", treeOf(h), "status.json"), "utf8"));
+		} catch {
+			return undefined;
+		}
+	};
+	const rootRunning = () => status()?.agents.find((a: { id: string }) => a.id === "root")?.running;
+	await h.fire("agent_start");
+	await h.waitFor(() => rootRunning() === true, 5000);
+	await h.fire("agent_settled");
+	await h.waitFor(() => rootRunning() === false, 5000);
 });
 
 test("a session switch keeps the tree even when the process uptime clock jumped (system sleep)", async () => {

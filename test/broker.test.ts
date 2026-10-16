@@ -134,6 +134,34 @@ test("broker SIGKILL: the child survives under its Keeper, everyone reconnects, 
 	root.close();
 });
 
+test("run state: the broker reports a child running while it says so, again after a broker crash, never once it is down", async () => {
+	const { treeId, root } = await tree();
+	const r = (await root.op("spawn", spawnReq("serve"))) as { id: string };
+	const running = async () => (await root.inspect())?.agents.find((a) => a.id === r.id)?.running;
+	const ask = async (body: string) => {
+		const sent = (await root.op("send", { to: r.id, kind: "mail", body })) as { msgId: string };
+		await receive(root, { ref: sent.msgId });
+	};
+	await ask("hello");
+	assert.equal(await running(), false, "a live child that has not started a run");
+	await ask("busy");
+	assert.equal(await running(), true);
+	await ask("idle");
+	assert.equal(await running(), false);
+	await ask("busy");
+	const lock = JSON.parse(readFileSync(join(treeDir(treeId), "broker.lock"), "utf8"));
+	process.kill(lock.pid, "SIGKILL");
+	await new Promise<void>((res) => root.once("welcome", () => res()));
+	const end = Date.now() + 15_000;
+	while ((await running()) !== true && Date.now() < end) await new Promise((res) => setTimeout(res, 200));
+	assert.equal(await running(), true, "the reconnected child restates its run");
+	assert.equal((await root.op("kill", { target: r.id })).ok, true);
+	await receive(root, { kind: "down" });
+	assert.equal(await running(), false);
+	root.stopTree();
+	root.close();
+});
+
 test("F1: a child that cannot start (missing cwd) ends at once with error:start_failed; the broker survives", async () => {
 	const { root } = await tree();
 	await root.op("spawn", { req: { task: "echo", context: "fresh", placement: "headless", cwd: join(home, "no", "such", "dir") } });

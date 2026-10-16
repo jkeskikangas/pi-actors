@@ -21,6 +21,8 @@ interface Conn {
 	/** Tree connection generation (agents only). */
 	gen?: number;
 	inc?: number;
+	/** The agent says it is executing a run (memory only: every connection restates it). */
+	running?: boolean;
 	lastSeen: number;
 	buf: string;
 }
@@ -334,6 +336,9 @@ export async function startBroker(dir: string, sock: string, config: Config): Pr
 			case "release":
 				run({ type: "release", id, msgId: String(f.msgId) });
 				return;
+			case "run":
+				c.running = !!f.running;
+				return writeStatus();
 			case "bye":
 				return; // the close that follows disconnects; the reason is informational
 			case "inspect":
@@ -355,7 +360,7 @@ export async function startBroker(dir: string, sock: string, config: Config): Pr
 		treeId: st.treeId,
 		self: forId,
 		agents: Object.values(st.agents).map((a) => ({
-			id: a.id, parent: a.parent, status: a.status, inc: a.inc, reason: a.reason, connected: a.connected,
+			id: a.id, parent: a.parent, status: a.status, inc: a.inc, reason: a.reason, connected: a.connected, running: a.status === "live" && !!agentConn.get(a.id)?.running,
 			placement: a.spec?.placement, paneId: a.paneId, model: a.spec?.model, mailbox: (st.mailbox[a.id] ?? []).length, spawns: a.spawns, limits: a.limits, sessionFile: a.sessionFile, task: a.spec?.task?.slice(0, 200),
 		})),
 		liveChildren: Object.values(st.agents).filter((a) => a.parent === forId && a.status !== "down").length,

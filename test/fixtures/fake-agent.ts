@@ -1,6 +1,7 @@
 // A fake child agent: speaks the pi-actors protocol without pi or a model.
 // Behaviour comes from its task: "echo" (reply to the parent, then exit), "serve" (answer
-// mail with reply_to until told "bye"), "crash" (exit 3 without the exit op).
+// mail with reply_to until told "bye"; "busy" and "idle" set its run state first), "crash"
+// (exit 3 without the exit op).
 import { Client } from "../../src/client/connection.ts";
 import type { Message } from "../../src/protocol.ts";
 
@@ -35,5 +36,6 @@ for (;;) {
 		await c.op("exit", { result: "served" });
 		await new Promise(() => {});
 	}
+	if (m.body === "busy" || m.body === "idle") c.setRunning(m.body === "busy");
 	await c.op("send", { to: m.from, kind: "mail", body: `echo:${m.body}`, ref: m.id });
 }
