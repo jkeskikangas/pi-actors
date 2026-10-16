@@ -53,6 +53,16 @@ test("F1: a missing cwd is rejected by the tool; relative paths resolve against 
 	assert.match((await h.tool("spawn", { task: "echo", cwd: "." })).content[0].text, /Started/);
 });
 
+test("fast: a resolved model without fast mode is rejected at spawn; a resolved Anthropic model is accepted", async () => {
+	const h = root();
+	const models: Record<string, any> = { "x/slow": { provider: "x", id: "slow", api: "google-generative-ai" }, "anthropic/opus": { provider: "anthropic", id: "opus", api: "anthropic-messages" } };
+	h.ctx.modelRegistry = { find: (p: string, id: string) => models[`${p}/${id}`] };
+	await assert.rejects(h.tool("spawn", { task: "echo", model: "x/slow", fast: true }), /Anthropic or OpenAI/);
+	h.ctx.model = models["x/slow"];
+	await assert.rejects(h.tool("spawn", { task: "echo", fast: true }), /Anthropic or OpenAI/);
+	assert.match((await h.tool("spawn", { task: "echo", model: "anthropic/opus", fast: true })).content[0].text, /Started/);
+});
+
 test("F4: a push that pi dropped (queue cleared) is redelivered after the agent settles", async () => {
 	const h = root();
 	h.setPush("drop");

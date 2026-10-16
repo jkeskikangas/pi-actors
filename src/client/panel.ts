@@ -12,6 +12,7 @@ export type AgentItem = {
 	status: string;
 	reason?: string;
 	model?: string;
+	fast?: boolean;
 	placement?: string;
 	mailbox: number;
 	sessionFile?: string;
@@ -106,7 +107,7 @@ function sections(snap: Snapshot): { running: AgentItem[]; ended: AgentItem[] } 
 }
 
 const item = (a: SnapAgent, depth: number, clearable: boolean): AgentItem => ({
-	kind: "agent", id: a.id, status: a.status, reason: a.reason, model: a.model, placement: a.placement, mailbox: a.mailbox, sessionFile: a.sessionFile, depth, ended: !isActive(a.status), clearable,
+	kind: "agent", id: a.id, status: a.status, reason: a.reason, model: a.model, fast: a.fast, placement: a.placement, mailbox: a.mailbox, sessionFile: a.sessionFile, depth, ended: !isActive(a.status), clearable,
 });
 
 /** The tops of the ended subtrees: forgetting these clears every ended row. */
@@ -160,6 +161,7 @@ export function agentLine(it: AgentItem): string {
 	const parts = [statusLabel(it.status, it.reason)];
 	const model = shortModel(it.model);
 	if (model) parts.push(model);
+	if (it.fast) parts.push("fast");
 	if (it.placement === "pane" && !it.ended) parts.push("pane");
 	if (it.mailbox && !it.ended) parts.push(`${it.mailbox} queued`);
 	return `${it.ended ? "○" : "●"} ${it.id}  ${parts.join(" · ")}`;

@@ -21,9 +21,11 @@ Running agents in the background goes wrong in predictable ways: messages get lo
 
 | Tool | What it does |
 |---|---|
-| `spawn{task, name?, model?, thinking?, fork?, cwd?, pane?, timeout_minutes?, resume?}` | Starts a child and returns its id immediately. `fork: true` gives the child a copy of this conversation. `model` can be any provider's model, and `cwd` can point to, say, a git worktree. `pane: true` runs the child in a visible pane when pi runs inside [herdr](https://herdr.dev) or tmux. |
+| `spawn{task, name?, model?, thinking?, fast?, fork?, cwd?, pane?, timeout_minutes?, resume?}` | Starts a child and returns its id immediately. `fork: true` gives the child a copy of this conversation. `model` can be any provider's model, and `cwd` can point to, say, a git worktree. `pane: true` runs the child in a visible pane when pi runs inside [herdr](https://herdr.dev) or tmux. |
 | `send{to, text, reply_to?, urgent?}` | Sends a message to any agent in the tree that has not ended (by id), or to `"parent"`. It doesn't wait for a reply. A message over 16K characters arrives cut. `reply_to` answers a message. |
 | `stop{id}` | Stops a descendant, together with its own children. |
+
+`fast: true` runs the child in its provider's fast mode, which costs more: Anthropic Messages API requests get `speed: "fast"` (beta `fast-mode-2026-02-01`), OpenAI requests (Responses, Codex Responses, Chat Completions) get `service_tier: "priority"`. When the model can be resolved at spawn, an unsupported one is rejected; providers such as `claude-sdk` (Claude Agent SDK) are not supported. A resume keeps fast mode unless it sets `fast` itself.
 
 What arrives by itself:
 

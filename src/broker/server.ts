@@ -190,6 +190,7 @@ export async function startBroker(dir: string, sock: string, config: Config): Pr
 		// Built-in pi options take the value as a separate argument; only extension flags accept --name=value.
 		if (spec.model) args.push("--model", spec.model);
 		if (spec.thinking) args.push("--thinking", spec.thinking);
+		if (spec.fast) args.push("--actors-fast=1");
 		args.push(...(config.childArgs ?? []));
 		return args;
 	};
@@ -361,7 +362,7 @@ export async function startBroker(dir: string, sock: string, config: Config): Pr
 		self: forId,
 		agents: Object.values(st.agents).map((a) => ({
 			id: a.id, parent: a.parent, status: a.status, inc: a.inc, reason: a.reason, connected: a.connected, running: a.status === "live" && !!agentConn.get(a.id)?.running,
-			placement: a.spec?.placement, paneId: a.paneId, model: a.spec?.model, mailbox: (st.mailbox[a.id] ?? []).length, spawns: a.spawns, limits: a.limits, sessionFile: a.sessionFile, task: a.spec?.task?.slice(0, 200),
+			placement: a.spec?.placement, paneId: a.paneId, model: a.spec?.model, fast: a.spec?.fast, mailbox: (st.mailbox[a.id] ?? []).length, spawns: a.spawns, limits: a.limits, sessionFile: a.sessionFile, task: a.spec?.task?.slice(0, 200),
 		})),
 		liveChildren: Object.values(st.agents).filter((a) => a.parent === forId && a.status !== "down").length,
 	});

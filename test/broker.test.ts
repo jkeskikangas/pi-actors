@@ -84,6 +84,15 @@ test("spawn → child mail → exit → DOWN normal with result", async () => {
 	root.close();
 });
 
+test("a fast spawn starts the child with --actors-fast=1 and shows fast in the snapshot", async () => {
+	const { root } = await tree();
+	const r = (await root.op("spawn", { req: { task: "argv", context: "fresh", placement: "headless", fast: true } })) as { id: string };
+	assert.ok(JSON.parse((await receive(root, { kind: "mail" })).body).includes("--actors-fast=1"));
+	assert.equal((await root.inspect())?.agents.find((a) => a.id === r.id)?.fast, true);
+	root.stopTree();
+	root.close();
+});
+
 test("a served child answers mail with reply_to; its end carries its result", async () => {
 	const { root } = await tree();
 	const r = (await root.op("spawn", spawnReq("serve"))) as { id: string };

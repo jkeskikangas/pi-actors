@@ -323,6 +323,20 @@ test("resume: only by the parent, only after the process is gone, same id with i
 	assert.equal(d.st.agents.a.spec?.model, "other/model");
 });
 
+test("resume keeps fast mode unless the request sets it", () => {
+	const d = driver();
+	d.hello(ROOT, 1);
+	d.spawn(ROOT, { name: "a", fast: true });
+	d.start("a", 200);
+	d.run({ type: "procExit", now: 0, id: "a", inc: 1, code: 1, signal: null });
+	d.spawn(ROOT, { resume: "a" });
+	assert.equal(d.st.agents.a.spec?.fast, true);
+	d.start("a", 201);
+	d.run({ type: "procExit", now: 0, id: "a", inc: 2, code: 1, signal: null });
+	d.spawn(ROOT, { resume: "a", fast: false });
+	assert.equal(d.st.agents.a.spec?.fast, false);
+});
+
 test("idempotency: a retransmitted frame returns the cached response; a gap is rejected", () => {
 	const d = withChild();
 	const seq = d.nextSeq(ROOT);
