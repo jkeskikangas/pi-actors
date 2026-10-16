@@ -113,7 +113,7 @@ export function fakeHost(opts: HostOptions) {
 		for (const k of ks) overlay?.component.handleInput(keys[k] ?? k);
 	};
 	return {
-		pi, ctx, tools, entries, pushed, notes, events, widgets, inputs, renderers, fire, tool, command, inbox, waitFor, context, press,
+		pi, ctx, handlers, tools, entries, pushed, notes, events, widgets, inputs, renderers, fire, tool, command, inbox, waitFor, context, press,
 		overlayLines: (width = 120) => overlay?.component.render(width) ?? [],
 		overlayOpen: () => !!overlay,
 		setPush: (p: "persist" | "drop" | "keep") => (push = p),

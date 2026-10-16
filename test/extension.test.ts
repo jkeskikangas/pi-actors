@@ -63,6 +63,18 @@ test("fast: a resolved model without fast mode is rejected at spawn; a resolved 
 	assert.match((await h.tool("spawn", { task: "echo", model: "anthropic/opus", fast: true })).content[0].text, /Started/);
 });
 
+test("fast: the payload rewrite reads actors-fast per request, set after the extension loads", async () => {
+	const flags: Record<string, string> = {};
+	const h = root({ flags });
+	h.ctx.model = { provider: "openai", id: "gpt", api: "openai-responses" };
+	const req = (payload: unknown) => h.handlers.before_provider_request[0]({ type: "before_provider_request", payload }, h.ctx);
+	assert.equal(await req({ model: "m" }), undefined);
+	flags["actors-fast"] = "1";
+	assert.deepEqual(await req({ model: "m" }), { model: "m", service_tier: "priority" });
+	h.ctx.model = { provider: "anthropic", id: "opus", api: "anthropic-messages" };
+	assert.deepEqual(await req({ model: "m" }), { model: "m", speed: "fast", betas: ["fast-mode-2026-02-01"] });
+});
+
 test("F4: a push that pi dropped (queue cleared) is redelivered after the agent settles", async () => {
 	const h = root();
 	h.setPush("drop");

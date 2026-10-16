@@ -36,7 +36,8 @@ export default function piActors(pi: ExtensionAPI) {
 	if (isInertCopy()) return;
 	captureRunner();
 	for (const name of ["runtime", "socket", "tree", "id", "inc", "pane", "fast"]) pi.registerFlag(`actors-${name}`, { type: "string", description: `pi-actors internal (${name})` });
-	if (pi.getFlag("actors-fast")) pi.on("before_provider_request", (event, ctx) => fastPayload(event.payload, ctx.model));
+	// pi sets flag values only after every extension has loaded: read actors-fast per request.
+	pi.on("before_provider_request", (event, ctx) => (pi.getFlag("actors-fast") ? fastPayload(event.payload, ctx.model) : undefined));
 
 	let client: Client | undefined;
 	let mailroom: Mailroom | undefined;
