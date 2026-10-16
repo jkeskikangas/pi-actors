@@ -8,7 +8,7 @@ const snap = (agents = [
 	agent("root", null as never),
 	agent("fe", "root"),
 	agent("fe.rev", "fe", "down", { reason: "normal" }),
-	agent("be", "root", "live", { placement: "pane", model: "claude-sdk/claude-opus-5-5" }),
+	agent("be", "root", "live", { placement: "pane", model: "claude-sdk/claude-opus-5-5", fast: true }),
 	agent("old", "root", "down", { reason: "killed:unconfirmed", mailbox: 3 }),
 	agent("old.kid", "old", "down", { reason: "killed:parent_down" }),
 	agent("gone", "root", "down", { reason: "killed", placement: "pane" }),
@@ -45,7 +45,7 @@ test("labels read as words; models are shortened; ended agents drop pane and que
 	assert.equal(shortModel("claude-sdk/claude-opus-5-5"), "opus-5-5");
 	const st = { ...initialState(snap()), showEnded: true };
 	const text = view(st, 200, 30, () => []).body.map((l) => l.text).join("\n");
-	assert.match(text, /● be {2}running · opus-5-5 · pane/);
+	assert.match(text, /● be {2}running · opus-5-5 · fast · pane/);
 	assert.match(text, /○ old {2}stopped, exit unconfirmed$/m);
 });
 

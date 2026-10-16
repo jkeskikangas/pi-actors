@@ -19,6 +19,7 @@ import { cutReport, dedupeContext, ENTRY_TYPE, endNotice, formatDelivery, Mailro
 import { type AgentItem, agentLine, editorFocused, endedRoots, initialState, items, type Line, type PanelAction, type PanelKey, type PanelState, press, summary, view, withSnapshot } from "./client/panel.ts";
 import { captureRunner, readSession, renderDelivery, Transcript } from "./client/transcript.ts";
 import type { Snapshot } from "./client/connection.ts";
+import { fastPayload, supportsFast } from "./client/fast.ts";
 import { closeOwnPaneOnExit, detectMux, paneAgentName, stateRoot } from "./runtime.ts";
 import { type Limits, type Message, TIMING } from "./protocol.ts";
 
@@ -34,7 +35,9 @@ function isInertCopy(argv: string[] = process.argv): boolean {
 export default function piActors(pi: ExtensionAPI) {
 	if (isInertCopy()) return;
 	captureRunner();
-	for (const name of ["runtime", "socket", "tree", "id", "inc", "pane"]) pi.registerFlag(`actors-${name}`, { type: "string", description: `pi-actors internal (${name})` });
+	for (const name of ["runtime", "socket", "tree", "id", "inc", "pane", "fast"]) pi.registerFlag(`actors-${name}`, { type: "string", description: `pi-actors internal (${name})` });
+	// pi sets flag values only after every extension has loaded: read actors-fast per request.
+	pi.on("before_provider_request", (event, ctx) => (pi.getFlag("actors-fast") ? fastPayload(event.payload, ctx.model) : undefined));
 
 	let client: Client | undefined;
 	let mailroom: Mailroom | undefined;
@@ -615,6 +618,7 @@ export default function piActors(pi: ExtensionAPI) {
 			name: Type.Optional(Type.String({ description: "Short readable name, e.g. 'backend'." })),
 			model: Type.Optional(Type.String({ description: "provider/model; default: yours." })),
 			thinking: Type.Optional(Type.String({ description: "Thinking level, e.g. low, medium, high." })),
+			fast: Type.Optional(Type.Boolean({ description: "Run the child in the model's fast mode where available (Anthropic and OpenAI models); costs more." })),
 			fork: Type.Optional(Type.Boolean({ description: "Start from a copy of this conversation instead of a fresh context." })),
 			cwd: Type.Optional(Type.String({ description: "Working directory, e.g. a git worktree." })),
 			pane: Type.Optional(Type.Boolean({ description: "Run in a visible pane the user can watch and talk to; runs the user starts there are not reported (only when pi runs inside herdr or tmux)." })),
@@ -628,9 +632,15 @@ export default function piActors(pi: ExtensionAPI) {
 			const cwd = p.cwd ? resolve(ctx.cwd, p.cwd) : ctx.cwd;
 			if (!isDir(cwd)) throw new Error(`cwd ${cwd} is not a directory`);
 			// herdr is optional: without it, pane children are unavailable and headless is the default.
+			if (p.fast) {
+				// An unresolvable pattern goes through: pi resolves or rejects it at child start, and the rewrite is a no-op for other APIs.
+				const slash = p.model?.indexOf("/") ?? -1;
+				const model = p.model ? (slash > 0 ? ctx.modelRegistry.find(p.model.slice(0, slash), p.model.slice(slash + 1)) : undefined) : ctx.model;
+				if (model && !supportsFast(model)) throw new Error(`fast: ${model.provider}/${model.id} has no fast mode; use an Anthropic or OpenAI model, or omit fast.`);
+			}
 			if (p.pane && !detectMux()) throw new Error("pane: true needs pi to run inside herdr or tmux; omit pane to run the child headless.");
 			const r = await op(ctx, "spawn", {
-				req: { name: p.name, task: p.task, model: p.model, thinking: p.thinking, context: p.fork ? "fork" : "fresh", cwd, placement: p.pane ? "pane" : "headless", timeoutS: p.timeout_minutes ? p.timeout_minutes * 60 : undefined, resume: p.resume },
+				req: { name: p.name, task: p.task, model: p.model, thinking: p.thinking, fast: p.fast, context: p.fork ? "fork" : "fresh", cwd, placement: p.pane ? "pane" : "headless", timeoutS: p.timeout_minutes ? p.timeout_minutes * 60 : undefined, resume: p.resume },
 			}, signal);
 			if (!r.ok) throw new Error(r.error === "limit_depth" ? "limit_depth: do this work yourself; this agent may not spawn deeper." : failText(r));
 			const id = (r as { id: string }).id;

@@ -29,7 +29,7 @@ export interface Snapshot {
 	treeId: string;
 	self: string;
 	/** `running`: executing a run (not idle) on its current connection; absent from older brokers. */
-	agents: { id: string; parent: string | null; status: string; inc: number; reason?: string; connected: boolean; running?: boolean; placement?: string; paneId?: string; model?: string; mailbox: number; spawns: number; sessionFile?: string; task?: string }[];
+	agents: { id: string; parent: string | null; status: string; inc: number; reason?: string; connected: boolean; running?: boolean; placement?: string; paneId?: string; model?: string; fast?: boolean; mailbox: number; spawns: number; sessionFile?: string; task?: string }[];
 	liveChildren: number;
 }
 

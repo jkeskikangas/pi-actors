@@ -116,7 +116,7 @@ graph TD
 
 **Operation fields:**
 
-- `spawn{name?, task, model?, thinking?, context, cwd?, placement, limits?, timeout_s?, resume?}` → `spawned{id, inc}`
+- `spawn{name?, task, model?, thinking?, fast?, context, cwd?, placement, limits?, timeout_s?, resume?}` → `spawned{id, inc}`
 - `send{to, kind: mail, body, tag?, ref?, urgent?}` → `accepted{msg_id}`; `ref` is the message being answered (`reply_to`)
 - `exit{result, truncated}` → `ok`
 - `kill{id, reason?}` → `ok`
@@ -174,7 +174,7 @@ Three single-purpose tools. Everything the model needs to *know* arrives by push
 
 | Tool    | Params                                                                                          | Result                                                                                      |
 | ------- | ----------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------- |
-| `spawn` | `task, name?, model?, thinking?, fork?: bool, cwd?, pane?: bool, timeout_minutes?, resume?: id` | `{id}` immediately; never blocks. The child's reports arrive later by push                  |
+| `spawn` | `task, name?, model?, thinking?, fast?: bool, fork?: bool, cwd?, pane?: bool, timeout_minutes?, resume?: id` | `{id}` immediately; never blocks. The child's reports arrive later by push                  |
 | `send`  | `to: id \| "parent", text, reply_to?, urgent?`                                                  | `{msg_id}` once durably accepted. `reply_to` marks the message as an answer to that message |
 | `stop`  | `id`                                                                                            | Descendants only. Returns once the stop has begun; the agent's own children go down with it |
 
@@ -199,7 +199,7 @@ Delivery: idle agent → `sendMessage(..., {triggerTurn: true})`; busy agent →
 | Spec element         | Owning component                                                                                                                                                             | Notes (what breaks if removed)                                                                                                                     |
 | -------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
 | UC-1 fresh spawn     | Tree                                                                                                                                                                         | Limits and identity are bypassed                                                                                                                   |
-| UC-2 fork spawn      | Placement                                                                                                                                                                    | Runs `pi --mode rpc --fork <session_file> -e <snap>/index.ts --actors-… --model … --thinking …` in `cwd`; `no_session_file` if the parent has none |
+| UC-2 fork spawn      | Placement                                                                                                                                                                    | Runs `pi --mode rpc --fork <session_file> -e <snap>/index.ts --actors-… --model … --thinking … --actors-fast=1` in `cwd`; `no_session_file` if the parent has none |
 | UC-3 send/reply      | Tree                                                                                                                                                                         | No routing, correlation or authorization                                                                                                           |
 | UC-4 receive + wake  | Client                                                                                                                                                                       | No consumption; idle agents never wake                                                                                                             |
 | UC-5 exit → DOWN     | Tree                                                                                                                                                                         | Results and failures are invisible                                                                                                                 |

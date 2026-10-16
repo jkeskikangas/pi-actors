@@ -25,6 +25,7 @@ export interface SpawnRequest {
 	task: string;
 	model?: string;
 	thinking?: string;
+	fast?: boolean;
 	context: Context;
 	cwd?: string;
 	placement: Placement;
@@ -391,7 +392,8 @@ function spawn(st: TreeState, parent: Agent, ev: Extract<Event, { type: "spawn" 
 	child.procStarted = false;
 	child.procGone = false;
 	child.pid = undefined;
-	child.spec = { ...req, resume: undefined };
+	// A resume keeps fast mode unless the request says otherwise.
+	child.spec = { ...req, fast: req.fast ?? (req.resume ? child.spec?.fast : undefined), resume: undefined };
 	child.deadline = ev.now + TIMING.startMs;
 	child.timeoutAt = req.timeoutS ? ev.now + req.timeoutS * 1000 : undefined;
 	for (const x of chain) x.spawns += 1;

@@ -23,6 +23,11 @@ const task = await next();
 c.ack(task.id);
 const parent = task.from;
 if (task.body === "crash") process.exit(3);
+if (task.body === "argv") {
+	await c.op("send", { to: parent, kind: "mail", body: JSON.stringify(process.argv.slice(2)) });
+	await c.op("exit", { result: "argv" });
+	await new Promise(() => {});
+}
 if (task.body === "echo") {
 	await c.op("send", { to: parent, kind: "mail", body: `echo:${task.body}` });
 	await c.op("exit", { result: "echoed" });
