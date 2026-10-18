@@ -194,6 +194,59 @@ test("mail that arrives during a run waits in the broker and reaches pi as one b
 	await h.fire("agent_settled", { aborted: false });
 });
 
+test("review: no ack before turn_end/settle; a lagging idle flag steers; Esc then a quick new run does not stall delivery; an old incarnation's end keeps waiting", async () => {
+	const h = root();
+	await h.tool("spawn", { task: "serve", name: "rv" });
+	const agent = (id: string) => {
+		try {
+			return JSON.parse(readFileSync(join(home, "h", "trees", treeOf(h), "status.json"), "utf8")).agents.find((a: { id: string }) => a.id === id);
+		} catch {
+			return undefined;
+		}
+	};
+	// In the session (persist) but no turn_end yet: the next delivery goes, yet nothing is acked.
+	await h.tool("send", { to: "rv", text: "one" });
+	await h.waitFor(() => /echo:one/.test(h.inbox()));
+	await h.tool("send", { to: "rv", text: "two" });
+	await h.waitFor(() => /echo:two/.test(h.inbox()));
+	await new Promise((r) => setTimeout(r, 1300));
+	assert.equal(agent("root")?.mailbox, 2, "acks wait for turn_end or agent_settled");
+	await h.fire("turn_end", { message: { role: "assistant", stopReason: "stop", content: [] }, toolResults: [] });
+	await h.waitFor(() => agent("root")?.mailbox === 0, 5000);
+
+	// pi already runs a turn our idle flag has not seen: the delivery is a steer, never a follow-up that waits out the run.
+	h.setPush("keep");
+	await h.tool("send", { to: "rv", text: "lag" });
+	await h.waitFor(() => /echo:lag/.test(h.inbox()));
+	assert.equal(h.pushed.at(-1)!.options.deliverAs, "steer");
+
+	// Esc clears pi's queue and the user starts a run at once: the next urgent mail is not held up.
+	await h.fire("agent_start");
+	h.clearQueue();
+	await h.fire("agent_settled", { aborted: true });
+	await h.fire("agent_start");
+	const n = h.pushed.length;
+	await h.tool("send", { to: "rv", text: "urgent:after-esc" });
+	await h.waitFor(() => h.pushed.length > n && /echo:lag[\s\S]*echo:urgent:after-esc/.test(h.pushed.at(-1)!.content));
+	h.setPush("persist");
+	h.drainQueue();
+	await h.fire("agent_settled", { aborted: false });
+
+	// Stop then resume while busy: the old incarnation's end arrives later and is quiet, and the
+	// resumed child still owes its report.
+	await h.fire("agent_start");
+	await h.tool("stop", { id: "rv" });
+	for (let t = 0; !(await h.tool("spawn", { task: "serve", resume: "rv" }).then(() => true, () => false)); t++) {
+		assert.ok(t < 100, "rv could not be resumed");
+		await new Promise((r) => setTimeout(r, 100));
+	}
+	await h.fire("turn_end", { message: { role: "assistant", stopReason: "stop", content: [] }, toolResults: [] });
+	await h.fire("agent_settled", { aborted: false });
+	await h.waitFor(() => agent("root")?.mailbox === 0, 5000);
+	assert.doesNotMatch(JSON.stringify(await h.context()), /rv ended/);
+	assert.equal(h.events.filter((e) => e.name === "actors:waiting").at(-1)?.data.waiting, true, "the resumed child still owes a report");
+});
+
 test("INV-4: an urgent message to a busy agent never overtakes older mail from the same sender", async () => {
 	// Incident 2026-10-18: bpe-finish's urgent 2:66 reached the root model before its 2:54..2:65.
 	const h = root();

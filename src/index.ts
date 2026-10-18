@@ -52,9 +52,12 @@ export default function piActors(pi: ExtensionAPI) {
 	/** Children that owe a report. */
 	const awaitingReport = new Set<string>();
 	const myChildren = new Set<string>();
-	/** Agents this one stopped: their end notice tells it nothing new. */
-	/** Agents this one stopped: id -> the newest incarnation the stop covers. */
+	/** Agents this one stopped (their end notice tells it nothing new): id -> the newest incarnation the stop covers. */
 	const stoppedByMe = new Map<string, number>();
+	/** The incarnation of each child this agent last started: an older one's end or report does not settle what it owes. */
+	const childInc = new Map<string, number>();
+	/** When the last run settled aborted (Esc): what pi had queued then is gone. */
+	let abortedAt: number | undefined;
 	let lastSnap: Snapshot | undefined;
 	let panelOpen = false;
 	let uiTimer: NodeJS.Timeout | undefined;
@@ -269,28 +272,40 @@ export default function piActors(pi: ExtensionAPI) {
 		if (idle || urgent) void deliver();
 	}
 
-	async function deliver() {
+	/** `lastTurn`: called at a run's last turn, where pi takes a follow-up at once; anywhere else a follow-up could wait out the run. */
+	async function deliver(lastTurn = false) {
 		const c = client;
 		const room = mailroom;
 		if (!c || !room) return;
-		// At most one delivery waits in pi's queues: the next one goes once it is persisted, whole and in order.
-		if (ctxRef) ackPersisted(ctxRef);
-		if (room.waiting) return;
+		// At most one delivery waits in pi's queues: the next one goes once it is in the session, whole and in order.
+		if (room.waiting(ctxRef?.sessionManager.getEntries() ?? [])) return;
 		const urgent = urgentOwed;
 		mailOwed = urgentOwed = false;
-		const batch = await room.drain(c);
+		const max = 50;
+		const batch = await room.drain(c, max);
+		if (batch.length >= max) {
+			// More may wait in the broker: the next delivery point takes it.
+			mailOwed = true;
+			urgentOwed ||= urgent;
+		}
 		if (batch.length === 0) return;
 		const shown: Message[] = [];
 		for (const m of batch) {
-			if (m.kind === "down" || m.tag === "report") awaitingReport.delete(m.kind === "down" ? safeId(m.body) : m.from);
+			if (m.kind === "down" || m.tag === "report") {
+				const who = m.kind === "down" ? endNotice(m) : { id: m.from, inc: Number(m.id.split(":").at(-2)) };
+				const current = childInc.get(who.id);
+				if (current === undefined || who.inc === undefined || Number.isNaN(who.inc) || who.inc >= current) awaitingReport.delete(who.id);
+			}
 			if (m.kind === "down" && selfInflicted(m)) room.discard(m, c);
 			else shown.push(m);
 		}
 		updateWaiting();
 		if (shown.length === 0) return;
 		// Always ask for a turn: pi queues it while a run is active and starts one when idle. Our own idle
-		// flag lags pi's at settle time, which lost wake-ups (F9).
-		const options = { triggerTurn: true, deliverAs: (urgent || shown.some((m) => m.urgent) ? "steer" : "followUp") as "steer" | "followUp" };
+		// flag lags pi's at settle time, which lost wake-ups (F9). Idle, either kind starts a run; busy
+		// (our flag may lag), only a steer is taken before the run ends.
+		const followUp = lastTurn && !urgent && !shown.some((m) => m.urgent);
+		const options = { triggerTurn: true, deliverAs: (followUp ? "followUp" : "steer") as "steer" | "followUp" };
 		pi.sendMessage({ customType: ENTRY_TYPE, content: formatDelivery(shown), display: true, details: { actors: room.stamp(shown) } }, options);
 	}
 
@@ -305,14 +320,6 @@ export default function piActors(pi: ExtensionAPI) {
 		const mine = covers !== undefined && (d.inc === undefined || d.inc <= covers);
 		return base === "killed:tree_stopped" || (base === "killed" && mine);
 	}
-
-	const safeId = (body: string) => {
-		try {
-			return String(JSON.parse(body).id);
-		} catch {
-			return "";
-		}
-	};
 
 	function ackPersisted(ctx: ExtensionContext) {
 		if (client && mailroom) mailroom.settle(ctx.sessionManager.getEntries(), client);
@@ -578,11 +585,20 @@ export default function piActors(pi: ExtensionAPI) {
 	pi.on("input", async (event) => {
 		lastRunInteractive = (event as { source?: string }).source === "interactive";
 	});
-	pi.on("agent_start", async () => {
+	pi.on("agent_start", async (_e, ctx) => {
 		lastAssistantText = "";
 		lastAssistantError = undefined;
 		idle = false;
 		client?.setRunning(true);
+		// A run started right after Esc: what was injected before it is gone (too young for the reclaim
+		// at settle) and would hold every later delivery. If pi kept it after all, the context hook (N1)
+		// shows it once.
+		if (abortedAt !== undefined && client && mailroom) {
+			const lost = mailroom.reclaim(ctx.sessionManager.getEntries(), Date.now() - abortedAt);
+			for (const id of lost) client.release(id);
+			if (lost.length) mailOwed = urgentOwed = true;
+		}
+		abortedAt = undefined;
 	});
 	pi.on("message_end", async (event) => {
 		const m = event.message as { role?: string; content?: unknown; stopReason?: string; errorMessage?: string; usage?: { input?: number; output?: number; cacheWrite?: number; cost?: { total?: number } } };
@@ -598,16 +614,19 @@ export default function piActors(pi: ExtensionAPI) {
 		// pi polls its queues right after turn_end: urgent mail goes before the next turn, the rest
 		// after the last one (no tool calls), so the run takes it instead of ending.
 		const m = (event as { message?: { stopReason?: string; content?: unknown } }).message;
-		const last = !!m && m.stopReason !== "error" && m.stopReason !== "aborted" && Array.isArray(m.content) && !m.content.some((b: { type?: string }) => b?.type === "toolCall");
-		if (urgentOwed || (last && mailOwed)) await deliver();
+		// A failed or aborted turn ends the run: settle delivers.
+		if (!m || m.stopReason === "error" || m.stopReason === "aborted") return;
+		const last = Array.isArray(m.content) && !m.content.some((b: { type?: string }) => b?.type === "toolCall");
+		if (urgentOwed || (last && mailOwed)) await deliver(last);
 	});
 	// Exactly-once as the model sees it, whatever pi did with its queues (N1).
 	pi.on("context", async (event) => {
 		const messages = dedupeContext(self, event.messages);
 		return messages ? { messages } : undefined;
 	});
-	pi.on("agent_settled", async (_e, ctx) => {
+	pi.on("agent_settled", async (e, ctx) => {
 		idle = true;
+		abortedAt = (e as { aborted?: boolean } | undefined)?.aborted ? Date.now() : undefined;
 		client?.setRunning(false);
 		ackPersisted(ctx);
 		// Pushes pi dropped (its queues are cleared on Esc) never reached the session: release their
@@ -684,9 +703,10 @@ export default function piActors(pi: ExtensionAPI) {
 			const { id, inc } = r as { id: string; inc?: number };
 			// A resumed child is a new incarnation: a stop covers only the older ones.
 			if (stoppedByMe.has(id)) {
-				if (typeof inc === "number") stoppedByMe.set(id, inc - 1);
+				if (typeof inc === "number") stoppedByMe.set(id, Math.min(stoppedByMe.get(id)!, inc - 1));
 				else stoppedByMe.delete(id);
 			}
+			if (typeof inc === "number") childInc.set(id, inc);
 			myChildren.add(id);
 			awaitingReport.add(id);
 			updateWaiting();

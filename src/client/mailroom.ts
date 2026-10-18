@@ -109,9 +109,18 @@ export class Mailroom {
 		return lost;
 	}
 
-	/** Whether an injection still waits to be persisted (pi has it queued). */
-	get waiting(): boolean {
-		return this.inFlight.size > 0;
+	/**
+	 * Whether an injection is not in the session yet (pi still has it queued). Only reads the
+	 * entries: acks stay at turn_end and agent_settled, once the session is on disk (S1).
+	 */
+	waiting(entries: readonly unknown[]): boolean {
+		if (this.inFlight.size === 0) return false;
+		const saved = new Set<string>();
+		for (const e of entries) {
+			const stamp = stampOf(e);
+			if (stamp?.id === this.self) for (const id of stamp.consumed) saved.add(id);
+		}
+		return [...this.inFlight.keys()].some((id) => !saved.has(id));
 	}
 
 	/** A reload loses everything injected but not persisted: it will be redelivered. */
