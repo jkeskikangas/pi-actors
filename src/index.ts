@@ -57,6 +57,9 @@ export default function piActors(pi: ExtensionAPI) {
 	let panelOpen = false;
 	let uiTimer: NodeJS.Timeout | undefined;
 	let wasWaiting = false;
+	/** Mail the broker announced that waits there for the next delivery point; urgent mail among it. */
+	let mailOwed = false;
+	let urgentOwed = false;
 
 	const isChild = () => !!pi.getFlag("actors-id");
 
@@ -126,11 +129,11 @@ export default function piActors(pi: ExtensionAPI) {
 		c.on("welcome", (w: { parent?: string | null; mailbox?: number }) => {
 			if (!current()) return;
 			parent = w.parent ?? null;
-			if ((w.mailbox ?? 0) > 0) void deliver();
+			if ((w.mailbox ?? 0) > 0) onMail(false);
 		});
 		c.on("mail", (urgent: boolean) => {
 			if (!current()) return;
-			void deliver(urgent);
+			onMail(urgent);
 			void refreshUi();
 		});
 		c.on("terminate", () => current() && terminate());
@@ -252,10 +255,27 @@ export default function piActors(pi: ExtensionAPI) {
 
 	// ------------------------------------------------------------ push delivery
 
-	async function deliver(urgent = false) {
+	/**
+	 * pi hands its queued messages to the model one per turn ("one-at-a-time" queues), so one
+	 * injection per message let a busy agent fall ever further behind, and an urgent steer overtook
+	 * older mail that then arrived stale. Mail for a busy agent waits in the broker: urgent mail goes
+	 * at once, the rest at the run's last turn or when it settles, all of it in one batch.
+	 */
+	function onMail(urgent: boolean) {
+		mailOwed = true;
+		if (urgent) urgentOwed = true;
+		if (idle || urgent) void deliver();
+	}
+
+	async function deliver() {
 		const c = client;
 		const room = mailroom;
 		if (!c || !room) return;
+		// At most one delivery waits in pi's queues: the next one goes once it is persisted, whole and in order.
+		if (ctxRef) ackPersisted(ctxRef);
+		if (room.waiting) return;
+		const urgent = urgentOwed;
+		mailOwed = urgentOwed = false;
 		const batch = await room.drain(c);
 		if (batch.length === 0) return;
 		const shown: Message[] = [];
@@ -327,7 +347,7 @@ export default function piActors(pi: ExtensionAPI) {
 			if (!idle || !client || !mailroom) return;
 			const lost = mailroom.reclaim(ctx.sessionManager.getEntries());
 			for (const id of lost) client.release(id);
-			if (lost.length) void deliver();
+			if (lost.length || mailOwed) void deliver();
 		}, 10_000);
 		reclaimTimer.unref();
 	}
@@ -565,7 +585,14 @@ export default function piActors(pi: ExtensionAPI) {
 		if (text.trim()) lastAssistantText = text;
 		usage = { input: usage.input + (m.usage?.input ?? 0), output: usage.output + (m.usage?.output ?? 0), cacheWrite: usage.cacheWrite + (m.usage?.cacheWrite ?? 0), cost: usage.cost + (m.usage?.cost?.total ?? 0) };
 	});
-	pi.on("turn_end", async (_e, ctx) => ackPersisted(ctx));
+	pi.on("turn_end", async (event, ctx) => {
+		ackPersisted(ctx);
+		// pi polls its queues right after turn_end: urgent mail goes before the next turn, the rest
+		// after the last one (no tool calls), so the run takes it instead of ending.
+		const m = (event as { message?: { stopReason?: string; content?: unknown } }).message;
+		const last = !!m && m.stopReason !== "error" && m.stopReason !== "aborted" && Array.isArray(m.content) && !m.content.some((b: { type?: string }) => b?.type === "toolCall");
+		if (urgentOwed || (last && mailOwed)) await deliver();
+	});
 	// Exactly-once as the model sees it, whatever pi did with its queues (N1).
 	pi.on("context", async (event) => {
 		const messages = dedupeContext(self, event.messages);

@@ -109,6 +109,11 @@ export class Mailroom {
 		return lost;
 	}
 
+	/** Whether an injection still waits to be persisted (pi has it queued). */
+	get waiting(): boolean {
+		return this.inFlight.size > 0;
+	}
+
 	/** A reload loses everything injected but not persisted: it will be redelivered. */
 	forgetInFlight(): void {
 		this.inFlight.clear();

@@ -88,6 +88,60 @@ test("F4: a push that pi dropped (queue cleared) is redelivered after the agent 
 	await h.waitFor(() => h.pushed.length > before && /echo:ping/.test(h.pushed.at(-1)!.content));
 });
 
+test("mail that arrives during a run waits in the broker and reaches pi as one batch, in order, at the run's last turn", async () => {
+	// pi hands queued deliveries to the model one per turn (followUpMode/steeringMode "one-at-a-time"):
+	// one injection per message let a busy agent's queue grow without bound and surface stale
+	// messages after newer urgent ones (incident 2026-10-18).
+	const h = root();
+	await h.tool("spawn", { task: "serve", name: "busy-q" });
+	const mailbox = () => {
+		try {
+			return JSON.parse(readFileSync(join(home, "h", "trees", treeOf(h), "status.json"), "utf8")).agents.find((a: { id: string }) => a.id === "root")?.mailbox;
+		} catch {
+			return undefined;
+		}
+	};
+	await h.fire("agent_start");
+	h.setPush("keep"); // a busy pi queues injections instead of persisting them
+	const before = h.pushed.length;
+	for (const n of [1, 2, 3, 4, 5]) await h.tool("send", { to: "busy-q", text: `m${n}` });
+	await h.waitFor(() => mailbox() === 5);
+	assert.equal(h.pushed.length, before, "nothing is queued in pi mid-run");
+	// A turn that called tools is not the last one: the mail keeps waiting.
+	await h.fire("turn_end", { message: { role: "assistant", stopReason: "toolUse", content: [{ type: "toolCall", id: "t", name: "bash", arguments: {} }] }, toolResults: [] });
+	assert.equal(h.pushed.length, before);
+	await h.fire("turn_end", { message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "done" }] }, toolResults: [] });
+	assert.equal(h.pushed.length, before + 1, "one injection for the whole backlog");
+	const batch = h.pushed.at(-1)!;
+	assert.equal(batch.options.deliverAs, "followUp");
+	assert.match(batch.content, /echo:m1[\s\S]*echo:m2[\s\S]*echo:m3[\s\S]*echo:m4[\s\S]*echo:m5/);
+
+	// While that batch is still in pi's queue, newer mail (urgent too) waits behind it, then goes
+	// as one steer that keeps the older message first.
+	await h.tool("send", { to: "busy-q", text: "older" });
+	await h.tool("send", { to: "busy-q", text: "urgent:grant" });
+	await h.waitFor(() => mailbox() === 7);
+	assert.equal(h.pushed.length, before + 1, "never a second delivery queued behind an unconsumed one");
+	h.drainQueue(); // pi hands the batch to the model
+	await h.fire("turn_end", { message: { role: "assistant", stopReason: "toolUse", content: [{ type: "toolCall", id: "t2", name: "bash", arguments: {} }] }, toolResults: [] });
+	assert.equal(h.pushed.length, before + 2);
+	const urgent = h.pushed.at(-1)!;
+	assert.equal(urgent.options.deliverAs, "steer");
+	assert.match(urgent.content, /echo:older[\s\S]*echo:urgent:grant/);
+	assert.doesNotMatch(urgent.content, /echo:m\d/, "nothing delivered twice");
+	h.drainQueue();
+	h.setPush("persist");
+	await h.fire("agent_settled", { aborted: false });
+	await h.waitFor(() => mailbox() === 0, 5000);
+
+	// An urgent message to a busy agent with nothing queued goes at once, as a steer.
+	await h.fire("agent_start");
+	await h.tool("send", { to: "busy-q", text: "urgent:now" });
+	await h.waitFor(() => /echo:urgent:now/.test(h.inbox()));
+	assert.equal(h.pushed.at(-1)!.options.deliverAs, "steer");
+	await h.fire("agent_settled", { aborted: false });
+});
+
 test("F8: an oversized message is refused up front and does not break later sends", async () => {
 	const h = root();
 	await h.tool("spawn", { task: "serve", name: "big" });
