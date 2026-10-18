@@ -46,17 +46,25 @@ export default function piActors(pi: ExtensionAPI) {
 	let ctxRef: ExtensionContext | undefined;
 	let idle = true;
 	let lastAssistantText = "";
+	let lastAssistantError: string | undefined;
 	let lastRunInteractive = false;
 	let usage = { input: 0, output: 0, cacheWrite: 0, cost: 0 };
 	/** Children that owe a report. */
 	const awaitingReport = new Set<string>();
 	const myChildren = new Set<string>();
-	/** Agents this one stopped: their end notice tells it nothing new. */
-	const stoppedByMe = new Set<string>();
+	/** Agents this one stopped (their end notice tells it nothing new): id -> the newest incarnation the stop covers. */
+	const stoppedByMe = new Map<string, number>();
+	/** The incarnation of each child this agent last started: an older one's end or report does not settle what it owes. */
+	const childInc = new Map<string, number>();
+	/** When the last run settled aborted (Esc): what pi had queued then is gone. */
+	let abortedAt: number | undefined;
 	let lastSnap: Snapshot | undefined;
 	let panelOpen = false;
 	let uiTimer: NodeJS.Timeout | undefined;
 	let wasWaiting = false;
+	/** Mail the broker announced that waits there for the next delivery point; urgent mail among it. */
+	let mailOwed = false;
+	let urgentOwed = false;
 
 	const isChild = () => !!pi.getFlag("actors-id");
 
@@ -126,11 +134,11 @@ export default function piActors(pi: ExtensionAPI) {
 		c.on("welcome", (w: { parent?: string | null; mailbox?: number }) => {
 			if (!current()) return;
 			parent = w.parent ?? null;
-			if ((w.mailbox ?? 0) > 0) void deliver();
+			if ((w.mailbox ?? 0) > 0) onMail(false);
 		});
 		c.on("mail", (urgent: boolean) => {
 			if (!current()) return;
-			void deliver(urgent);
+			onMail(urgent);
 			void refreshUi();
 		});
 		c.on("terminate", () => current() && terminate());
@@ -252,23 +260,52 @@ export default function piActors(pi: ExtensionAPI) {
 
 	// ------------------------------------------------------------ push delivery
 
-	async function deliver(urgent = false) {
+	/**
+	 * pi hands its queued messages to the model one per turn ("one-at-a-time" queues), so one
+	 * injection per message let a busy agent fall ever further behind, and an urgent steer overtook
+	 * older mail that then arrived stale. Mail for a busy agent waits in the broker: urgent mail goes
+	 * at once, the rest at the run's last turn or when it settles, all of it in one batch.
+	 */
+	function onMail(urgent: boolean) {
+		mailOwed = true;
+		if (urgent) urgentOwed = true;
+		if (idle || urgent) void deliver();
+	}
+
+	/** `lastTurn`: called at a run's last turn, where pi takes a follow-up at once; anywhere else a follow-up could wait out the run. */
+	async function deliver(lastTurn = false) {
 		const c = client;
 		const room = mailroom;
 		if (!c || !room) return;
-		const batch = await room.drain(c);
+		// At most one delivery waits in pi's queues: the next one goes once it is in the session, whole and in order.
+		if (room.waiting(ctxRef?.sessionManager.getEntries() ?? [])) return;
+		const urgent = urgentOwed;
+		mailOwed = urgentOwed = false;
+		const max = 50;
+		const batch = await room.drain(c, max);
+		if (batch.length >= max) {
+			// More may wait in the broker: the next delivery point takes it.
+			mailOwed = true;
+			urgentOwed ||= urgent;
+		}
 		if (batch.length === 0) return;
 		const shown: Message[] = [];
 		for (const m of batch) {
-			if (m.kind === "down" || m.tag === "report") awaitingReport.delete(m.kind === "down" ? safeId(m.body) : m.from);
+			if (m.kind === "down" || m.tag === "report") {
+				const who = m.kind === "down" ? endNotice(m) : { id: m.from, inc: Number(m.id.split(":").at(-2)) };
+				const current = childInc.get(who.id);
+				if (current === undefined || who.inc === undefined || Number.isNaN(who.inc) || who.inc >= current) awaitingReport.delete(who.id);
+			}
 			if (m.kind === "down" && selfInflicted(m)) room.discard(m, c);
 			else shown.push(m);
 		}
 		updateWaiting();
 		if (shown.length === 0) return;
 		// Always ask for a turn: pi queues it while a run is active and starts one when idle. Our own idle
-		// flag lags pi's at settle time, which lost wake-ups (F9).
-		const options = { triggerTurn: true, deliverAs: (urgent || shown.some((m) => m.urgent) ? "steer" : "followUp") as "steer" | "followUp" };
+		// flag lags pi's at settle time, which lost wake-ups (F9). Idle, either kind starts a run; busy
+		// (our flag may lag), only a steer is taken before the run ends.
+		const followUp = lastTurn && !urgent && !shown.some((m) => m.urgent);
+		const options = { triggerTurn: true, deliverAs: (followUp ? "followUp" : "steer") as "steer" | "followUp" };
 		pi.sendMessage({ customType: ENTRY_TYPE, content: formatDelivery(shown), display: true, details: { actors: room.stamp(shown) } }, options);
 	}
 
@@ -277,18 +314,12 @@ export default function piActors(pi: ExtensionAPI) {
 		const d = endNotice(m);
 		const base = d.reason.replace(/:unconfirmed$/, "");
 		// Any end settles a stop: a stop that came too late (the child was already finishing) must
-		// not hide a later incarnation's end.
-		const mine = stoppedByMe.delete(d.id);
+		// not hide a later incarnation's end. The stopped incarnation's end can arrive after a resume.
+		const covers = stoppedByMe.get(d.id);
+		stoppedByMe.delete(d.id);
+		const mine = covers !== undefined && (d.inc === undefined || d.inc <= covers);
 		return base === "killed:tree_stopped" || (base === "killed" && mine);
 	}
-
-	const safeId = (body: string) => {
-		try {
-			return String(JSON.parse(body).id);
-		} catch {
-			return "";
-		}
-	};
 
 	function ackPersisted(ctx: ExtensionContext) {
 		if (client && mailroom) mailroom.settle(ctx.sessionManager.getEntries(), client);
@@ -327,7 +358,7 @@ export default function piActors(pi: ExtensionAPI) {
 			if (!idle || !client || !mailroom) return;
 			const lost = mailroom.reclaim(ctx.sessionManager.getEntries());
 			for (const id of lost) client.release(id);
-			if (lost.length) void deliver();
+			if (lost.length || mailOwed) void deliver();
 		}, 10_000);
 		reclaimTimer.unref();
 	}
@@ -554,34 +585,60 @@ export default function piActors(pi: ExtensionAPI) {
 	pi.on("input", async (event) => {
 		lastRunInteractive = (event as { source?: string }).source === "interactive";
 	});
-	pi.on("agent_start", async () => {
+	pi.on("agent_start", async (_e, ctx) => {
+		lastAssistantText = "";
+		lastAssistantError = undefined;
 		idle = false;
 		client?.setRunning(true);
+		// A run started right after Esc: what was injected before it is gone (too young for the reclaim
+		// at settle) and would hold every later delivery. If pi kept it after all, the context hook (N1)
+		// shows it once.
+		if (abortedAt !== undefined && client && mailroom) {
+			const lost = mailroom.reclaim(ctx.sessionManager.getEntries(), Date.now() - abortedAt);
+			for (const id of lost) client.release(id);
+			if (lost.length) mailOwed = urgentOwed = true;
+		}
+		abortedAt = undefined;
 	});
 	pi.on("message_end", async (event) => {
-		const m = event.message as { role?: string; content?: unknown; usage?: { input?: number; output?: number; cacheWrite?: number; cost?: { total?: number } } };
+		const m = event.message as { role?: string; content?: unknown; stopReason?: string; errorMessage?: string; usage?: { input?: number; output?: number; cacheWrite?: number; cost?: { total?: number } } };
 		if (m.role !== "assistant") return;
+		// Wait for settlement: an automatic retry can replace this failure with a successful answer.
+		lastAssistantError = m.stopReason === "error" ? (m.errorMessage?.trim() || "Unknown provider error") : undefined;
 		const text = Array.isArray(m.content) ? m.content.filter((b: { type?: string }) => b?.type === "text").map((b: { text?: string }) => b.text ?? "").join("") : "";
 		if (text.trim()) lastAssistantText = text;
 		usage = { input: usage.input + (m.usage?.input ?? 0), output: usage.output + (m.usage?.output ?? 0), cacheWrite: usage.cacheWrite + (m.usage?.cacheWrite ?? 0), cost: usage.cost + (m.usage?.cost?.total ?? 0) };
 	});
-	pi.on("turn_end", async (_e, ctx) => ackPersisted(ctx));
+	pi.on("turn_end", async (event, ctx) => {
+		ackPersisted(ctx);
+		// pi polls its queues right after turn_end: urgent mail goes before the next turn, the rest
+		// after the last one (no tool calls), so the run takes it instead of ending.
+		const m = (event as { message?: { stopReason?: string; content?: unknown } }).message;
+		// A failed or aborted turn ends the run: settle delivers.
+		if (!m || m.stopReason === "error" || m.stopReason === "aborted") return;
+		const last = Array.isArray(m.content) && !m.content.some((b: { type?: string }) => b?.type === "toolCall");
+		if (urgentOwed || (last && mailOwed)) await deliver(last);
+	});
 	// Exactly-once as the model sees it, whatever pi did with its queues (N1).
 	pi.on("context", async (event) => {
 		const messages = dedupeContext(self, event.messages);
 		return messages ? { messages } : undefined;
 	});
-	pi.on("agent_settled", async (_e, ctx) => {
+	pi.on("agent_settled", async (e, ctx) => {
 		idle = true;
+		abortedAt = (e as { aborted?: boolean } | undefined)?.aborted ? Date.now() : undefined;
 		client?.setRunning(false);
 		ackPersisted(ctx);
 		// Pushes pi dropped (its queues are cleared on Esc) never reached the session: release their
 		// leases and deliver them again (F4).
 		if (client && mailroom) for (const id of mailroom.reclaim(ctx.sessionManager.getEntries())) client.release(id);
-		// A child's final answer is its report (no exit tool to forget).
-		if (isChild() && client && parent && lastAssistantText.trim() && !lastRunInteractive) {
-			const body = cutReport(lastAssistantText, ctx.sessionManager.getSessionFile());
-			lastAssistantText = "";
+		// A child's final answer is its report (no exit tool to forget). A failed provider request can
+		// have no text, or leave an earlier partial answer behind: the failure is the report.
+		const report = lastAssistantError ? `Run failed: ${lastAssistantError}` : lastAssistantText;
+		lastAssistantText = "";
+		lastAssistantError = undefined;
+		if (isChild() && client && parent && report.trim() && !lastRunInteractive) {
+			const body = cutReport(report, ctx.sessionManager.getSessionFile());
 			await client.op("send", { to: parent, kind: "mail", tag: "report", body });
 		}
 		lastRunInteractive = false;
@@ -643,8 +700,13 @@ export default function piActors(pi: ExtensionAPI) {
 				req: { name: p.name, task: p.task, model: p.model, thinking: p.thinking, fast: p.fast, context: p.fork ? "fork" : "fresh", cwd, placement: p.pane ? "pane" : "headless", timeoutS: p.timeout_minutes ? p.timeout_minutes * 60 : undefined, resume: p.resume },
 			}, signal);
 			if (!r.ok) throw new Error(r.error === "limit_depth" ? "limit_depth: do this work yourself; this agent may not spawn deeper." : failText(r));
-			const id = (r as { id: string }).id;
-			stoppedByMe.delete(id); // a resumed child is a new incarnation
+			const { id, inc } = r as { id: string; inc?: number };
+			// A resumed child is a new incarnation: a stop covers only the older ones.
+			if (stoppedByMe.has(id)) {
+				if (typeof inc === "number") stoppedByMe.set(id, Math.min(stoppedByMe.get(id)!, inc - 1));
+				else stoppedByMe.delete(id);
+			}
+			if (typeof inc === "number") childInc.set(id, inc);
 			myChildren.add(id);
 			awaitingReport.add(id);
 			updateWaiting();
@@ -689,7 +751,7 @@ export default function piActors(pi: ExtensionAPI) {
 			const r = await op(ctx, "kill", { target: p.id }, signal);
 			if (!r.ok) throw new Error(failText(r));
 			awaitingReport.delete(p.id);
-			stoppedByMe.add(p.id);
+			stoppedByMe.set(p.id, Infinity);
 			updateWaiting();
 			return text(`Stopping ${p.id}.`);
 		},
@@ -707,7 +769,7 @@ export default function piActors(pi: ExtensionAPI) {
 			if (sub === "stop") {
 				if (target) {
 					const r = await c.op("kill", { target });
-					if (r.ok) stoppedByMe.add(target);
+					if (r.ok) stoppedByMe.set(target, Infinity);
 					return ctx.ui.notify(r.ok ? `Stopping ${target}.` : failText(r as { ok: false; error: string }), r.ok ? "info" : "warning");
 				}
 				if (self !== "root") return ctx.ui.notify("Only the root can stop the whole tree.", "warning");

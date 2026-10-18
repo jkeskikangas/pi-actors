@@ -14,7 +14,7 @@ MUTANTS = [
     # breaks an earlier guard also removes the context hook, or the hook would mask it.
     ("no-lease and no in-flight dedupe: parallel receives consume the same message (S2)",
      [(".select(m => not(s.leases.get(id).contains(m.uid)))", ".select(m => true)"),
-      ("if (seen or inFlight) s.fetched", "if (seen) s.fetched"), ("if (seen or inFlight) s.injected", "if (seen) s.injected"),
+      ("if (seen or inFlight) s.batch", "if (seen) s.batch"), ("if (seen or inFlight) s.injected", "if (seen) s.injected"),
       ("val hidden = st.persisted.get(id).contains(m.uid)", "val hidden = false")], None),
     ("no-link: parent DOWN does not kill children (INV-1)",
      "    killChildren(st2, id)\n", "    st2\n"),
@@ -36,11 +36,15 @@ MUTANTS = [
     ("no-client-dedupe: redelivery after reload is consumed again (INV-3)",
      [("val seen = s.persisted.get(id).contains(m.uid)", "val seen = false"), ("val hidden = st.persisted.get(id).contains(m.uid)", "val hidden = false")], None),
     ("reclaim-too-early: reclaiming an injection that pi still holds delivers it twice (F4)",
-     [("val gone = s.injected.get(id).filter(u => s.fetched.get(id).select(m => m.uid == u).length() == 0)",
+     [("val gone = s.injected.get(id).filter(u => not(inPi(s, id, u)))",
        "val gone = s.injected.get(id)"), ("val hidden = st.persisted.get(id).contains(m.uid)", "val hidden = false")], None),
     ("no-in-flight-dedupe: a delivery in flight across a broker restart is consumed twice",
-     [("if (seen or inFlight) s.fetched", "if (seen) s.fetched"), ("if (seen or inFlight) s.injected", "if (seen) s.injected"),
+     [("if (seen or inFlight) s.batch", "if (seen) s.batch"), ("if (seen or inFlight) s.injected", "if (seen) s.injected"),
       ("val hidden = st.persisted.get(id).contains(m.uid)", "val hidden = false")], None),
+    # The 0.2.8 incident: every notification its own injection, so an urgent steer overtook the
+    # same sender's older mail still queued in pi as a follow-up (INV-4, fifo).
+    ("client injects each notification separately (0.2.8): an urgent steer overtakes queued older mail",
+     "    not(waiting(st, id)),\n", "    true,\n"),
     ("no-context-dedupe: pi keeps an injection that reclaim also redelivered; the model sees it twice (N1)",
      "val hidden = st.persisted.get(id).contains(m.uid)", "val hidden = false"),
     ("forget while a descendant is still ending: an active agent loses its parent's record",
@@ -87,12 +91,18 @@ for model, mutants, samples in [
         with tempfile.NamedTemporaryFile("w", suffix=".qnt", dir=here, delete=False) as f:
             f.write(mutated); path = f.name
         try:
-            caught = subprocess.run(["npx", "quint", "test", path], capture_output=True, text=True).returncode != 0
-            if not caught:
-                r = subprocess.run(["npx", "quint", "run", path, "--invariant=all_invariants",
+            by = "scenario" if subprocess.run(["npx", "quint", "test", path], capture_output=True, text=True).returncode != 0 else None
+            # Random simulation; for pi_actors.qnt also the focused delivery simulation.
+            sims = [("simulation", [])] + ([("delivery simulation", ["--init=initDelivery", "--step=deliveryStep"])] if model == "pi_actors.qnt" else [])
+            for label, extra in sims:
+                if by:
+                    break
+                r = subprocess.run(["npx", "quint", "run", path, "--invariant=all_invariants", *extra,
                                     f"--max-samples={samples}", "--max-steps=40"], capture_output=True, text=True)
-                caught = r.returncode != 0 and "violation" in (r.stdout + r.stderr).lower()
-            print(("caught   " if caught else "SURVIVED ") + f"{model}: {name}")
+                if r.returncode != 0 and "violation" in (r.stdout + r.stderr).lower():
+                    by = label
+            caught = by is not None
+            print((f"caught   ({by}) " if caught else "SURVIVED ") + f"{model}: {name}")
             survivors += not caught
         finally:
             os.unlink(path)

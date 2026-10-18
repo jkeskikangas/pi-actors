@@ -80,6 +80,15 @@ test("fork: the child inherits the parent's conversation and runs on another mod
 	assert.ok(texts.some((t) => t.includes("FORK DONE: saw secret")), texts.join("\n"));
 });
 
+test("reports that arrive while the root runs tools reach it batched after its last busy turn, not one per turn (pi's one-at-a-time queues)", { timeout: 120_000 }, async () => {
+	const texts = await runRoot("./fixtures/faux-root-busy.ts", "start", "ALL REPORTS");
+	const deliveries = texts.filter((t) => t.startsWith("custom:pi-actors") && /Report from k\d/.test(t));
+	assert.ok(deliveries.some((t) => (t.match(/Report from k\d/g) ?? []).length >= 2), `reports are batched:\n${texts.join("\n")}`);
+	const busyDone = texts.findIndex((t) => t.startsWith("assistant") && t.includes("BUSY DONE"));
+	const first = texts.findIndex((t) => t.startsWith("custom:pi-actors") && /Report from k\d/.test(t));
+	assert.ok(busyDone >= 0 && first > busyDone, `nothing was queued mid-run:\n${texts.join("\n")}`);
+});
+
 test("root ⇄ child round trip through real pi with push delivery", { timeout: 120_000 }, async () => {
 	const env = {
 		...process.env,

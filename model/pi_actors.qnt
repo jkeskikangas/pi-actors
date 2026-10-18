@@ -11,7 +11,8 @@ module pi_actors {
   // Gone: forgotten (removed from the tree); the id is never used again.
   type Status = Unborn | Starting | Live | Disconnected | Exiting | Killing | Down | Gone
   // uid: unique message identity (the design's "<sender>:<inc>:<seq>"); seq: sender order.
-  type Msg = { uid: int, src: str, dst: str, seq: int, kind: str }
+  // urgent: the sender asked for it to interrupt the receiver's run (pi steer).
+  type Msg = { uid: int, src: str, dst: str, seq: int, kind: str, urgent: bool }
   type Agent = { status: Status, parent: str, depth: int }
 
   type State = {
@@ -32,7 +33,13 @@ module pi_actors {
     // --- client memory (lost on reload or process death) ---
     nextSeq: str -> int,
     inflight: str -> List[Msg],
+    // Fetched (leased) by the current drain and not yet injected into pi: one batch.
+    batch: str -> List[Msg],
+    // pi's queues, in the order pi hands them to the model, one message per turn: the first
+    // steerLen are steers (FIFO among themselves), then the follow-ups. A steer injected later
+    // goes after the queued steers but ahead of every queued follow-up.
     fetched: str -> List[Msg],
+    steerLen: str -> int,
     // The client's in-flight ids: injected but not yet consumed. pi may drop an injection (it
     // clears its queues on Esc); such ids stay here until reclaim releases them (fix F4).
     injected: str -> Set[int],
@@ -47,6 +54,7 @@ module pi_actors {
     acceptedBySender: Set[Msg],
     lastSeen: str -> (str -> int),
     dupConsumed: bool,
+    urgentConsumed: bool,
     ackedUnpersisted: bool,
     fifoViolated: bool,
     forgotLive: bool,
@@ -115,7 +123,9 @@ module pi_actors {
     exitPending: emptyMap(false),
     nextSeq: emptyMap(1),
     inflight: emptyMap(List()),
+    batch: emptyMap(List()),
     fetched: emptyMap(List()),
+    steerLen: emptyMap(0),
     injected: emptyMap(Set()),
     held: emptyMap(List()),
     pendingAck: emptyMap(Set()),
@@ -124,6 +134,7 @@ module pi_actors {
     acceptedBySender: Set(),
     lastSeen: AGENTS.mapBy(_ => emptyMap(0)),
     dupConsumed: false,
+    urgentConsumed: false,
     ackedUnpersisted: false,
     fifoViolated: false,
     forgotLive: false,
@@ -166,7 +177,7 @@ module pi_actors {
   // Entering `down`: exactly one DOWN notice to the parent, then the link rule.
   pure def goDown(st: State, id: str): State = {
     val p = st.agents.get(id).parent
-    val notice = { uid: DOWN_UID.get(id), src: "broker", dst: p, seq: 0, kind: "down" }
+    val notice = { uid: DOWN_UID.get(id), src: "broker", dst: p, seq: 0, kind: "down", urgent: false }
     val st1 = setStatus(st, id, Down)
     val st2 = { ...st1,
       downCount: st1.downCount.setBy(id, n => n + 1),
@@ -182,7 +193,9 @@ module pi_actors {
     lostWithClient: st.lostWithClient.union(st.inflight.get(id).foldl(Set(), (acc, m) => acc.union(Set(m.uid)))),
     gapped: st.gapped.set(id, Set()),
     inflight: st.inflight.set(id, List()),
+    batch: st.batch.set(id, List()),
     fetched: st.fetched.set(id, List()),
+    steerLen: st.steerLen.set(id, 0),
     injected: st.injected.set(id, Set()),
     held: st.held.set(id, List()),
     pendingAck: st.pendingAck.set(id, Set()),
@@ -248,12 +261,17 @@ module pi_actors {
     },
   }
 
-  action send(src: str, dst: str): bool = all {
+  action send(src: str, dst: str): bool = {
+    nondet urgent = Set(false, true).oneOf()
+    sendWith(src, dst, urgent)
+  }
+
+  action sendWith(src: str, dst: str, urgent: bool): bool = all {
     canAct(s, src),
     src != dst,
     s.uidCounter < MAX_SENT,
     val n = s.nextSeq.get(src)
-    val m = { uid: s.uidCounter, src: src, dst: dst, seq: n, kind: "mail" }
+    val m = { uid: s.uidCounter, src: src, dst: dst, seq: n, kind: "mail", urgent: urgent }
     s' = { ...s,
       inflight: s.inflight.setBy(src, l => l.append(m)),
       nextSeq: s.nextSeq.set(src, n + 1),
@@ -338,11 +356,23 @@ module pi_actors {
     },
   }
 
-  // receive -> fetch: the oldest unleased message is leased to this connection. The client
-  // skips (and queues an ack for) anything its session already consumed.
+  // mailroom.waiting: an injection is in pi and not yet consumed (persisted) or reclaimed.
+  pure def waiting(st: State, id: str): bool =
+    st.injected.get(id).exists(u => st.batch.get(id).select(m => m.uid == u).length() == 0)
+
+  // At most one injection waits in pi: mail that arrives meanwhile stays in the broker,
+  // unleased, until the next delivery drains it.
+  pure def mayFetch(st: State, id: str): bool = all {
+    canAct(st, id),
+    st.batch.get(id).length() + st.fetched.get(id).length() < MAX_FETCHED,
+    not(waiting(st, id)),
+  }
+
+  // drain -> fetch, one message per step: the oldest unleased message is leased to this
+  // connection and joins the batch. The client skips (and queues an ack for) anything its session
+  // already consumed, and anything it is still delivering.
   action fetch(id: str): bool = all {
-    canAct(s, id),
-    s.fetched.get(id).length() < MAX_FETCHED,
+    mayFetch(s, id),
     val avail = s.mailbox.get(id).select(m => not(s.leases.get(id).contains(m.uid)))
     all {
       avail.length() > 0,
@@ -352,12 +382,40 @@ module pi_actors {
       val inFlight = s.injected.get(id).contains(m.uid)
       s' = { ...s,
         leases: s.leases.setBy(id, x => x.union(Set(m.uid))),
-        fetched: if (seen or inFlight) s.fetched else s.fetched.setBy(id, l => l.append(m)),
+        batch: if (seen or inFlight) s.batch else s.batch.setBy(id, l => l.append(m)),
         injected: if (seen or inFlight) s.injected else s.injected.setBy(id, x => x.union(Set(m.uid))),
         pendingAck: if (seen) s.pendingAck.setBy(id, x => x.union(Set(m.uid))) else s.pendingAck,
         redeliveries: if (seen) s.redeliveries + 1 else s.redeliveries,
       },
     },
+  }
+
+  // The drain ends: the batch goes to pi as one injection, a steer if it holds urgent mail (or
+  // urgent mail was announced: urgentOwed), else a follow-up.
+  pure def insertAt(l: List[Msg], k: int, b: List[Msg]): List[Msg] =
+    l.slice(0, k).concat(b).concat(l.slice(k, l.length()))
+
+  action inject(id: str): bool = {
+    nondet owed = Set(false, true).oneOf()
+    injectAs(id, owed)
+  }
+
+  action injectAs(id: str, owed: bool): bool = all {
+    s.procAlive.get(id),
+    s.batch.get(id).length() > 0,
+    val b = s.batch.get(id)
+    val steer = owed or b.select(m => m.urgent).length() > 0
+    s' = { ...s,
+      batch: s.batch.set(id, List()),
+      fetched: s.fetched.setBy(id, l => if (steer) insertAt(l, s.steerLen.get(id), b) else l.concat(b)),
+      steerLen: if (steer) s.steerLen.setBy(id, n => n + b.length()) else s.steerLen,
+    },
+  }
+
+  // pi takes the head of its queues.
+  pure def piPops(st: State, id: str): State = { ...st,
+    fetched: st.fetched.setBy(id, l => l.tail()),
+    steerLen: st.steerLen.setBy(id, n => if (n > 0) n - 1 else 0),
   }
 
   // A delivery reaches the session. The context hook shows the model only ids the session does
@@ -372,19 +430,20 @@ module pi_actors {
       persisted: st.persisted.setBy(id, x => x.union(Set(m.uid))),
       pendingAck: st.pendingAck.setBy(id, x => x.union(Set(m.uid))),
       dupConsumed: st.dupConsumed or (st.persisted.get(id).contains(m.uid) and not(hidden)),
+      urgentConsumed: st.urgentConsumed or (not(hidden) and m.urgent),
       fifoViolated: st.fifoViolated or (not(hidden) and m.kind == "mail" and m.seq <= prev),
       lastSeen: if (hidden or m.kind != "mail") st.lastSeen else st.lastSeen.setBy(id, mm => mm.set(m.src, m.seq)),
     }
   }
 
-  // The tool result reaches the session: the model has consumed the message. pi's queue is
-  // FIFO, so anything it kept goes first.
+  // The injected entry reaches the session: the model has consumed the message. Anything pi
+  // kept goes first. (pi saves a batch as one entry; taking it a message at a time allows more.)
   action persist(id: str): bool = all {
     s.procAlive.get(id),
     s.held.get(id).length() == 0,
     s.fetched.get(id).length() > 0,
     val m = s.fetched.get(id).head()
-    s' = { ...consume(s, id, m), fetched: s.fetched.setBy(id, l => l.tail()) },
+    s' = piPops(consume(s, id, m), id),
   }
 
   // Deferred ack (D3): only persisted ids are acked.
@@ -405,14 +464,14 @@ module pi_actors {
   // know yet: the id stays in flight and the broker keeps the lease.
   action piDrops(id: str): bool = all {
     s.fetched.get(id).length() > 0, s.faults < MAX_FAULTS,
-    s' = { ...fault(s), fetched: s.fetched.setBy(id, l => l.tail()) },
+    s' = piPops(fault(s), id),
   }
 
   // pi keeps an injected message queued across an aborted run (RPC abort keeps queues). The
   // client cannot tell it from a dropped one: after the age guard, reclaim redelivers it.
   action piKeeps(id: str): bool = all {
     s.fetched.get(id).length() > 0, s.faults < MAX_FAULTS,
-    s' = { ...fault(s), fetched: s.fetched.setBy(id, l => l.tail()), held: s.held.setBy(id, l => l.append(s.fetched.get(id).head())) },
+    s' = { ...piPops(fault(s), id), held: s.held.setBy(id, l => l.append(s.fetched.get(id).head())) },
   }
 
   // The next run: pi hands the model what it kept.
@@ -424,10 +483,13 @@ module pi_actors {
   }
 
   // Reclaim (fix F4): an in-flight id that never reached the session is released and forgotten,
-  // so it is fetched and delivered again. Only ids that are really gone qualify (the age guard).
+  // so it is fetched and delivered again. Only ids that are really gone qualify (the age guard);
+  // the batch being drained is not injected yet.
+  pure def inPi(st: State, id: str, u: int): bool =
+    st.fetched.get(id).select(m => m.uid == u).length() > 0 or st.batch.get(id).select(m => m.uid == u).length() > 0
   action reclaim(id: str): bool = all {
     s.brokerUp, s.connected.get(id),
-    val gone = s.injected.get(id).filter(u => s.fetched.get(id).select(m => m.uid == u).length() == 0)
+    val gone = s.injected.get(id).filter(u => not(inPi(s, id, u)))
     all {
       gone.size() > 0,
       nondet u = gone.oneOf()
@@ -597,9 +659,27 @@ module pi_actors {
     any {
       spawn(a, b), hello(a), send(a, b), brokerAccept(a), brokerAcceptAny(a), clientResend(a), clientAccepted(a),
       brokerSigterm, stopTree, brokerFinish, keeperShutdown(a),
-      fetch(a), persist(a), ack(a), piDrops(a), piKeeps(a), piDeliversKept(a), reclaim(a), exit(a), kill(a, b), forget(a, b),
+      fetch(a), inject(a), persist(a), ack(a), piDrops(a), piKeeps(a), piDeliversKept(a), reclaim(a), exit(a), kill(a, b), forget(a, b),
       graceExpire(a), startTimeout(a), processEnds(a), procExitReported(a), killingExpire(a),
       processCrash(a), reload(a), connectionDrop(a), brokerCrash, brokerRestart,
+    }
+  }
+
+  // Focused simulation of delivery between r and a live child a: every trace is a trace of
+  // `step` (from the state that init, spawn("r", "a") and hello("a") reach), so the invariants
+  // must hold here too; random `step` traces rarely reach the deep delivery orderings.
+  action initDelivery = {
+    nondet lb = Set(true, false).oneOf()
+    initWith(lb).then(spawn("r", "a")).then(hello("a"))
+  }
+
+  action deliveryStep = {
+    nondet a = Set("r", "a").oneOf()
+    nondet b = Set("r", "a").oneOf()
+    any {
+      send(a, b), brokerAccept(a), brokerAcceptAny(a), clientResend(a), clientAccepted(a), hello(a),
+      fetch(a), inject(a), persist(a), ack(a), piDrops(a), piKeeps(a), piDeliversKept(a), reclaim(a),
+      reload(a), connectionDrop(a), brokerCrash, brokerRestart,
     }
   }
 
@@ -675,6 +755,7 @@ module pi_actors {
   // ---------------- reachability witnesses (each MUST be violated by simulation) ----------------
   val witnessConsumed = AGENTS.forall(id => s.persisted.get(id).size() == 0)
   val witnessRedelivered = s.redeliveries == 0
+  val witnessUrgentConsumed = not(s.urgentConsumed)
   val witnessRetransmitPending = not(AGENTS.exists(id => s.inflight.get(id).length() > 0
       and s.inflight.get(id).head().seq <= s.lastSeq.get(id) and not(s.connected.get(id))))
   val witnessTwoAccepted = s.acceptedBySender.size() < 2
@@ -728,9 +809,9 @@ module pi_actors {
 
   run redeliveryAfterReloadTest =
     init.then(spawn("r", "a")).then(hello("a")).then(send("r", "a")).then(brokerAccept("r"))
-      .then(clientAccepted("r")).then(fetch("a")).then(persist("a")).then(reload("a"))
+      .then(clientAccepted("r")).then(fetch("a")).then(inject("a")).then(persist("a")).then(reload("a"))
       .then(hello("a")).then(fetch("a"))
-      .then(all { assert(s.redeliveries == 1 and s.fetched.get("a").length() == 0 and all_invariants), s' = s })
+      .then(all { assert(s.redeliveries == 1 and s.batch.get("a").length() == 0 and all_invariants), s' = s })
 
   run retransmitAfterBrokerCrashTest =
     init.then(spawn("r", "a")).then(hello("a")).then(send("r", "a")).then(brokerAccept("r"))
@@ -760,27 +841,53 @@ module pi_actors {
     init.then(spawn("r", "a")).then(hello("a")).then(send("r", "a")).then(brokerAccept("r"))
       .then(clientAccepted("r")).then(fetch("a")).then(brokerCrash).then(brokerRestart)
       .then(hello("a")).then(fetch("a"))
-      .then(all { assert(s.fetched.get("a").length() == 1 and all_invariants), s' = s })
-      .then(persist("a"))
+      .then(all { assert(s.batch.get("a").length() == 1 and all_invariants), s' = s })
+      .then(inject("a")).then(persist("a"))
       .then(all { assert(all_invariants), s' = s })
 
   // Fix F4: pi drops an injection; reclaim releases it; it is delivered and consumed exactly once.
   run droppedPushReclaimedTest =
     init.then(spawn("r", "a")).then(hello("a")).then(send("r", "a")).then(brokerAccept("r"))
-      .then(clientAccepted("r")).then(fetch("a")).then(piDrops("a"))
+      .then(clientAccepted("r")).then(fetch("a")).then(inject("a")).then(piDrops("a"))
       .then(all { assert(s.fetched.get("a").length() == 0 and s.persisted.get("a").size() == 0), s' = s })
-      .then(reclaim("a")).then(fetch("a")).then(persist("a")).then(ack("a"))
+      .then(reclaim("a")).then(fetch("a")).then(inject("a")).then(persist("a")).then(ack("a"))
       .then(all { assert(s.persisted.get("a").size() == 1 and s.mailbox.get("a").length() == 0 and all_invariants), s' = s })
 
   // Fix N1: pi keeps an injection, reclaim redelivers it, then pi delivers its kept copy too.
   // The session holds both; the model consumes the message once.
   run keptPushNotSeenTwiceTest =
     init.then(spawn("r", "a")).then(hello("a")).then(send("r", "a")).then(brokerAccept("r"))
-      .then(clientAccepted("r")).then(fetch("a")).then(piKeeps("a"))
-      .then(reclaim("a")).then(fetch("a"))
+      .then(clientAccepted("r")).then(fetch("a")).then(inject("a")).then(piKeeps("a"))
+      .then(reclaim("a")).then(fetch("a")).then(inject("a"))
       .then(all { assert(s.held.get("a").length() == 1 and s.fetched.get("a").length() == 1), s' = s })
       .then(piDeliversKept("a")).then(persist("a")).then(ack("a"))
       .then(all { assert(s.persisted.get("a").size() == 1 and s.mailbox.get("a").length() == 0 and all_invariants), s' = s })
+
+  // The 0.2.8 incident: a sender's urgent message overtook its earlier, still queued one. Now the
+  // first message waits in pi as the one injection; the urgent one stays in the broker until it
+  // is consumed, and the two are consumed in send order.
+  run urgentAfterQueuedMailTest =
+    init.then(spawn("r", "a")).then(hello("a"))
+      .then(sendWith("r", "a", false)).then(sendWith("r", "a", true))
+      .then(brokerAccept("r")).then(clientAccepted("r")).then(brokerAccept("r")).then(clientAccepted("r"))
+      .then(fetch("a")).then(injectAs("a", false))
+      .then(all { assert(waiting(s, "a") and not(mayFetch(s, "a")) and s.mailbox.get("a").length() == 2), s' = s })
+      .then(persist("a"))
+      .then(all { assert(not(waiting(s, "a")) and mayFetch(s, "a")), s' = s })
+      .then(fetch("a")).then(injectAs("a", false))
+      .then(all { assert(s.steerLen.get("a") == 1 and s.fetched.get("a")[0].urgent), s' = s })
+      .then(persist("a")).then(ack("a")).then(ack("a"))
+      .then(all { assert(s.urgentConsumed and s.lastSeen.get("a").get("r") == 2 and s.mailbox.get("a").length() == 0 and all_invariants), s' = s })
+
+  // Both messages arrived before the drain: one batch, in send order, as a steer.
+  run urgentBatchInOrderTest =
+    init.then(spawn("r", "a")).then(hello("a"))
+      .then(sendWith("r", "a", false)).then(sendWith("r", "a", true))
+      .then(brokerAccept("r")).then(clientAccepted("r")).then(brokerAccept("r")).then(clientAccepted("r"))
+      .then(fetch("a")).then(fetch("a")).then(injectAs("a", false))
+      .then(all { assert(s.steerLen.get("a") == 2 and s.fetched.get("a").length() == 2 and not(s.fetched.get("a")[0].urgent)), s' = s })
+      .then(persist("a")).then(persist("a"))
+      .then(all { assert(s.steerLen.get("a") == 0 and all_invariants), s' = s })
 
   // Forget: refused while a descendant is still ending; then the whole ended subtree goes, the
   // parent's DOWN notice stays, and the id can be neither spawned nor greeted again.

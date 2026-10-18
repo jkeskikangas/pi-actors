@@ -47,6 +47,58 @@ test("F2: parallel first spawns share one connection; both return and pushes kee
 	await h.waitFor(() => /echo:echo/.test(h.inbox()) && (h.inbox().match(/ended: normal/g) ?? []).length === 2);
 });
 
+test("asynchronous startup failures notify the parent after spawn returned", async () => {
+	const command = process.env.PI_ACTORS_CHILD_COMMAND;
+	process.env.PI_ACTORS_CHILD_COMMAND = JSON.stringify([join(home, "missing-executable")]);
+	const h = root();
+	try {
+		assert.match((await h.tool("spawn", { task: "echo", name: "startup-failure" })).content[0].text, /Started startup-failure/);
+		await h.waitFor(() => /startup-failure ended: error:start_failed/.test(h.inbox()));
+		assert.equal(h.events.filter((e) => e.name === "actors:waiting").at(-1)?.data.waiting, false);
+		assert.equal((h.inbox().match(/startup-failure ended/g) ?? []).length, 1);
+	} finally {
+		process.env.PI_ACTORS_CHILD_COMMAND = command;
+	}
+});
+
+test("terminal provider errors are pushed once, clear waiting, and do not poison later runs", async () => {
+	const command = process.env.PI_ACTORS_CHILD_COMMAND;
+	process.env.PI_ACTORS_CHILD_COMMAND = JSON.stringify([process.execPath, fileURLToPath(new URL("./fixtures/reporting-agent.ts", import.meta.url))]);
+	const h = root();
+	try {
+		for (const task of ["error", "partial", "fallback", "long", "retry"]) {
+			await h.tool("spawn", { task, name: task });
+			await h.waitFor(() => h.inbox().includes(`fixture settled: ${task}`));
+			const reports = h.pushed.filter((p) => p.content.includes(`Report from ${task}:`));
+			assert.equal(reports.length, 1);
+			const report = reports[0].content;
+			if (task === "retry") {
+				assert.match(report, /Retry succeeded/);
+				assert.doesNotMatch(report, /failed|configured/);
+			} else {
+				assert.match(report, /Run failed:/);
+				assert.doesNotMatch(report, /I will investigate/);
+				if (task === "fallback") assert.match(report, /unknown provider error/i);
+				else if (task === "long") assert.match(report, /truncated; full text in/);
+				else assert.match(report, /Provider is not configured: anthropic/);
+			}
+			assert.equal(h.events.filter((e) => e.name === "actors:waiting").at(-1)?.data.waiting, false);
+		}
+		await h.tool("send", { to: "error", text: "success" });
+		await h.waitFor(() => /Recovered successfully/.test(h.inbox()));
+		const recovered = h.pushed.find((p) => /Recovered successfully/.test(p.content))!;
+		assert.doesNotMatch(recovered.content, /Run failed|configured/);
+		await h.tool("spawn", { task: "interactive", name: "interactive" });
+		await h.waitFor(() => h.inbox().includes("fixture settled: interactive"));
+		assert.doesNotMatch(h.inbox(), /Report from interactive:/, "user-started pane runs are not reported");
+		await h.tool("send", { to: "interactive", text: "success" });
+		await h.waitFor(() => h.inbox().includes("Report from interactive:"));
+		assert.match(h.pushed.find((p) => p.content.includes("Report from interactive:"))!.content, /Recovered successfully/);
+	} finally {
+		process.env.PI_ACTORS_CHILD_COMMAND = command;
+	}
+});
+
 test("F1: a missing cwd is rejected by the tool; relative paths resolve against the agent's cwd", async () => {
 	const h = root();
 	await assert.rejects(h.tool("spawn", { task: "echo", cwd: "no/such/dir" }), /not a directory/);
@@ -86,6 +138,220 @@ test("F4: a push that pi dropped (queue cleared) is redelivered after the agent 
 	await new Promise((r) => setTimeout(r, 5200)); // reclaim only what has been in flight for a while
 	await h.fire("agent_settled");
 	await h.waitFor(() => h.pushed.length > before && /echo:ping/.test(h.pushed.at(-1)!.content));
+});
+
+test("mail that arrives during a run waits in the broker and reaches pi as one batch, in order, at the run's last turn", async () => {
+	// pi hands queued deliveries to the model one per turn (followUpMode/steeringMode "one-at-a-time"):
+	// one injection per message let a busy agent's queue grow without bound and surface stale
+	// messages after newer urgent ones (incident 2026-10-18).
+	const h = root();
+	await h.tool("spawn", { task: "serve", name: "busy-q" });
+	const mailbox = () => {
+		try {
+			return JSON.parse(readFileSync(join(home, "h", "trees", treeOf(h), "status.json"), "utf8")).agents.find((a: { id: string }) => a.id === "root")?.mailbox;
+		} catch {
+			return undefined;
+		}
+	};
+	await h.fire("agent_start");
+	h.setPush("keep"); // a busy pi queues injections instead of persisting them
+	const before = h.pushed.length;
+	for (const n of [1, 2, 3, 4, 5]) await h.tool("send", { to: "busy-q", text: `m${n}` });
+	await h.waitFor(() => mailbox() === 5);
+	assert.equal(h.pushed.length, before, "nothing is queued in pi mid-run");
+	// A turn that called tools is not the last one: the mail keeps waiting.
+	await h.fire("turn_end", { message: { role: "assistant", stopReason: "toolUse", content: [{ type: "toolCall", id: "t", name: "bash", arguments: {} }] }, toolResults: [] });
+	assert.equal(h.pushed.length, before);
+	await h.fire("turn_end", { message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "done" }] }, toolResults: [] });
+	assert.equal(h.pushed.length, before + 1, "one injection for the whole backlog");
+	const batch = h.pushed.at(-1)!;
+	assert.equal(batch.options.deliverAs, "followUp");
+	assert.match(batch.content, /echo:m1[\s\S]*echo:m2[\s\S]*echo:m3[\s\S]*echo:m4[\s\S]*echo:m5/);
+
+	// While that batch is still in pi's queue, newer mail (urgent too) waits behind it, then goes
+	// as one steer that keeps the older message first.
+	await h.tool("send", { to: "busy-q", text: "older" });
+	await h.tool("send", { to: "busy-q", text: "urgent:grant" });
+	await h.waitFor(() => mailbox() === 7);
+	assert.equal(h.pushed.length, before + 1, "never a second delivery queued behind an unconsumed one");
+	h.drainQueue(); // pi hands the batch to the model
+	await h.fire("turn_end", { message: { role: "assistant", stopReason: "toolUse", content: [{ type: "toolCall", id: "t2", name: "bash", arguments: {} }] }, toolResults: [] });
+	assert.equal(h.pushed.length, before + 2);
+	const urgent = h.pushed.at(-1)!;
+	assert.equal(urgent.options.deliverAs, "steer");
+	assert.match(urgent.content, /echo:older[\s\S]*echo:urgent:grant/);
+	assert.doesNotMatch(urgent.content, /echo:m\d/, "nothing delivered twice");
+	h.drainQueue();
+	h.setPush("persist");
+	await h.fire("agent_settled", { aborted: false });
+	await h.waitFor(() => mailbox() === 0, 5000);
+
+	// An urgent message to a busy agent with nothing queued goes at once, as a steer.
+	await h.fire("agent_start");
+	await h.tool("send", { to: "busy-q", text: "urgent:now" });
+	await h.waitFor(() => /echo:urgent:now/.test(h.inbox()));
+	assert.equal(h.pushed.at(-1)!.options.deliverAs, "steer");
+	await h.fire("agent_settled", { aborted: false });
+});
+
+test("review: no ack before turn_end/settle; a lagging idle flag steers; Esc then a quick new run does not stall delivery; an old incarnation's end keeps waiting", async () => {
+	const h = root();
+	await h.tool("spawn", { task: "serve", name: "rv" });
+	const agent = (id: string) => {
+		try {
+			return JSON.parse(readFileSync(join(home, "h", "trees", treeOf(h), "status.json"), "utf8")).agents.find((a: { id: string }) => a.id === id);
+		} catch {
+			return undefined;
+		}
+	};
+	// In the session (persist) but no turn_end yet: the next delivery goes, yet nothing is acked.
+	await h.tool("send", { to: "rv", text: "one" });
+	await h.waitFor(() => /echo:one/.test(h.inbox()));
+	await h.tool("send", { to: "rv", text: "two" });
+	await h.waitFor(() => /echo:two/.test(h.inbox()));
+	await new Promise((r) => setTimeout(r, 1300));
+	assert.equal(agent("root")?.mailbox, 2, "acks wait for turn_end or agent_settled");
+	await h.fire("turn_end", { message: { role: "assistant", stopReason: "stop", content: [] }, toolResults: [] });
+	await h.waitFor(() => agent("root")?.mailbox === 0, 5000);
+
+	// pi already runs a turn our idle flag has not seen: the delivery is a steer, never a follow-up that waits out the run.
+	h.setPush("keep");
+	await h.tool("send", { to: "rv", text: "lag" });
+	await h.waitFor(() => /echo:lag/.test(h.inbox()));
+	assert.equal(h.pushed.at(-1)!.options.deliverAs, "steer");
+
+	// Esc clears pi's queue and the user starts a run at once: the next urgent mail is not held up.
+	await h.fire("agent_start");
+	h.clearQueue();
+	await h.fire("agent_settled", { aborted: true });
+	await h.fire("agent_start");
+	const n = h.pushed.length;
+	await h.tool("send", { to: "rv", text: "urgent:after-esc" });
+	await h.waitFor(() => h.pushed.length > n && /echo:lag[\s\S]*echo:urgent:after-esc/.test(h.pushed.at(-1)!.content));
+	h.setPush("persist");
+	h.drainQueue();
+	await h.fire("agent_settled", { aborted: false });
+
+	// Stop then resume while busy: the old incarnation's end arrives later and is quiet, and the
+	// resumed child still owes its report.
+	await h.fire("agent_start");
+	await h.tool("stop", { id: "rv" });
+	for (let t = 0; !(await h.tool("spawn", { task: "serve", resume: "rv" }).then(() => true, () => false)); t++) {
+		assert.ok(t < 100, "rv could not be resumed");
+		await new Promise((r) => setTimeout(r, 100));
+	}
+	await h.fire("turn_end", { message: { role: "assistant", stopReason: "stop", content: [] }, toolResults: [] });
+	await h.fire("agent_settled", { aborted: false });
+	await h.waitFor(() => agent("root")?.mailbox === 0, 5000);
+	assert.doesNotMatch(JSON.stringify(await h.context()), /rv ended/);
+	assert.equal(h.events.filter((e) => e.name === "actors:waiting").at(-1)?.data.waiting, true, "the resumed child still owes a report");
+});
+
+test("INV-4: an urgent message to a busy agent never overtakes older mail from the same sender", async () => {
+	// Incident 2026-10-18: bpe-finish's urgent 2:66 reached the root model before its 2:54..2:65.
+	const h = root();
+	await h.tool("spawn", { task: "serve", name: "fifo" });
+	await h.fire("agent_start");
+	h.setPush("keep");
+	await h.tool("send", { to: "fifo", text: "wait for approval" });
+	await new Promise((r) => setTimeout(r, 500));
+	await h.tool("send", { to: "fifo", text: "urgent:approved" });
+	await h.waitFor(() => /echo:urgent:approved/.test(h.inbox()));
+	h.drainQueue(); // pi: steering first, then follow-ups
+	const seen = (await h.context()).flatMap((m: any) => m.details.actors.messages.map((x: { body: string }) => x.body));
+	assert.deepEqual(seen, ["echo:wait for approval", "echo:urgent:approved"]);
+	h.setPush("persist");
+	await h.fire("agent_settled", { aborted: false });
+});
+
+test("stress: floods of ordinary and urgent mail to a busy agent, through tool turns, pi clearing its queue, a broker crash and a child resume: one delivery in pi at a time, each message once, in sender order", async () => {
+	const h = root();
+	let seed = 20261018;
+	const rnd = () => (seed = (seed * 1103515245 + 12345) % 2 ** 31) / 2 ** 31;
+	const kids = ["st-a", "st-b", "st-c"];
+	for (const k of kids) await h.tool("spawn", { task: "serve", name: k });
+	const status = () => {
+		try {
+			return JSON.parse(readFileSync(join(home, "h", "trees", treeOf(h), "status.json"), "utf8"));
+		} catch {
+			return undefined;
+		}
+	};
+	const tick = () => new Promise((r) => setTimeout(r, 40));
+	const toolTurn = { message: { role: "assistant", stopReason: "toolUse", content: [{ type: "toolCall", id: "t", name: "bash", arguments: {} }] }, toolResults: [] };
+	const lastTurn = { message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "ok" }] }, toolResults: [] };
+	const expected: string[] = [];
+	let maxQueued = 0;
+	await h.fire("agent_start");
+	h.setPush("keep");
+	for (let i = 0; i < 70; i++) {
+		if (i === 25) {
+			// The broker crashes with a delivery possibly in pi's queue; the root relaunches it.
+			process.kill(status().pid, "SIGKILL");
+			await new Promise((r) => setTimeout(r, 300));
+		}
+		if (i === 40) {
+			// Stop a child once it has answered everything (mail a stopped child never read is dropped
+			// by design), then resume it. Its end notice is the root's own doing, even if it arrives
+			// after the resume.
+			const answered = () => {
+				const evs = readFileSync(join(home, "h", "trees", treeOf(h), "events.log"), "utf8").split("\n").filter((l) => l.includes('"type":"send"'));
+				return evs.filter((l) => l.includes('"from":"st-c"')).length === evs.filter((l) => l.includes('"to":"st-c"')).length;
+			};
+			await h.waitFor(answered, 15_000);
+			await h.tool("stop", { id: "st-c" });
+			for (let t = 0; ; t++) {
+				const r = await h.tool("spawn", { task: "serve", resume: "st-c" }).then(() => true, () => false);
+				if (r) break;
+				assert.ok(t < 100, "st-c could not be resumed");
+				await new Promise((r) => setTimeout(r, 100));
+			}
+		}
+		if (i === 55) {
+			// Esc: pi clears its queues; the run settles and, once old enough, the lost delivery is reclaimed.
+			h.clearQueue();
+			await h.fire("agent_settled", { aborted: true });
+			await new Promise((r) => setTimeout(r, 5200));
+			await h.fire("agent_settled", { aborted: true });
+			await h.fire("agent_start");
+		}
+		const x = rnd();
+		if (x < 0.45) {
+			const kid = kids[Math.floor(rnd() * kids.length)];
+			const body = `${rnd() < 0.3 ? "urgent:" : ""}${kid}#${i}`;
+			await h.tool("send", { to: kid, text: body });
+			expected.push(`echo:${body}`);
+		} else if (x < 0.65) await h.fire("turn_end", toolTurn);
+		else if (x < 0.8) await h.fire("turn_end", lastTurn);
+		else if (x < 0.95) h.drainQueue();
+		else {
+			h.drainQueue();
+			await h.fire("agent_settled", { aborted: false });
+			await tick();
+			await h.fire("agent_start");
+		}
+		await tick();
+		maxQueued = Math.max(maxQueued, h.queuedCount());
+	}
+	h.setPush("persist");
+	h.drainQueue();
+	await h.fire("agent_settled", { aborted: false });
+	const consumed = async () =>
+		(await h.context()).flatMap((m: any) => m.details.actors.messages as { from: string; body: string }[]).filter((m) => m.body.startsWith("echo:"));
+	for (let t = 0; (await consumed()).length < expected.length; t++) {
+		assert.ok(t < 200, `missing: ${expected.filter((e) => !h.inbox().includes(e)).join(", ")} ${JSON.stringify(status()?.agents.map((a: any) => [a.id, a.status, a.inc, a.mailbox]))}`);
+		await new Promise((r) => setTimeout(r, 100));
+		await h.fire("agent_settled", { aborted: false });
+	}
+	const got = await consumed();
+	assert.deepEqual([...got.map((m) => m.body)].sort(), [...expected].sort(), "every message consumed exactly once");
+	assert.doesNotMatch(JSON.stringify(await h.context()), /st-c ended/, "the end of a child it stopped is not news to the root");
+	assert.ok(maxQueued <= 1, `at most one delivery waits in pi's queue (saw ${maxQueued})`);
+	for (const kid of kids) {
+		const order = got.filter((m) => m.from === kid).map((m) => Number(m.body.split("#")[1]));
+		assert.deepEqual(order, [...order].sort((a, b) => a - b), `${kid}: consumed in sender order`);
+	}
+	await h.waitFor(() => status()?.agents.find((a: { id: string }) => a.id === "root")?.mailbox === 0, 5000);
 });
 
 test("F8: an oversized message is refused up front and does not break later sends", async () => {
