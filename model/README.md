@@ -14,7 +14,17 @@ Run it with `npm run model`. That command:
 
 ## Push delivery (design v4)
 
-The model's `fetch` / `persist` / `ack` actions describe the client's mailroom, not a model-facing tool: the client fetches (leases) messages when notified, injects them as one stamped entry (`persist` is that entry being saved), and acks at `turn_end`. So v4's push delivery is covered as is.
+The model's `fetch` / `inject` / `persist` / `ack` actions describe the client's mailroom, not a model-facing tool: the client drains (fetches and leases) the available mail into one batch (`batch`), injects it into pi as one stamped entry (`inject`), and acks it once saved (`persist` is the model consuming it).
+
+pi's queues are "one-at-a-time": pi hands the model one queued injection per turn, steers before follow-ups. The model keeps them as one list, `fetched`, whose first `steerLen` items are steers. A follow-up is appended; a steer goes after the queued steers but ahead of every queued follow-up. A message is urgent (`Msg.urgent`, chosen by `send`); a batch holding urgent mail is injected as a steer, otherwise as a follow-up (or as a steer if urgent mail was announced, `urgentOwed`).
+
+At most one injection waits in pi (`mailroom.waiting`, the model's `waiting`: an injected id that is not in the batch and is neither consumed nor reclaimed). While one waits, `fetch` is disabled: mail that arrives meanwhile stays in the broker, unleased, and the next delivery takes all of it, in order, in one batch. So pi's queues never hold two of our live injections (a copy pi kept across an aborted run is already reclaimed, and the context hook hides it once redelivered), and a steer has nothing of ours to overtake. `reclaim` never takes an id in the batch, which is not injected yet. When the client calls `deliver` (urgent mail at once, the rest at the run's last turn or at settle) is not modelled: `fetch` and `inject` may happen at any time.
+
+The incident behind this rule (0.2.8): the client injected each `mail` notification separately, non-urgent ones as follow-ups and urgent ones as steers. Sender bpe-finish's urgent message 2:66 was consumed (acked 12:59:13) before the same sender's earlier, non-urgent 2:54 to 2:65 (acked 13:08 to 13:09), so per-sender FIFO (INV-4) was broken, and the root saw messages up to 14 minutes late. The mutant "client injects each notification separately" removes the `waiting` gate; `urgentAfterQueuedMailTest` fails on it, and without that scenario the delivery simulation finds `fifo` violated. Scenarios `urgentAfterQueuedMailTest` (a non-urgent message waits in pi, so the same sender's urgent one cannot be fetched until it is consumed; both are consumed in send order) and `urgentBatchInOrderTest` (both in one steer batch, in order). Witness `witnessUrgentConsumed`.
+
+Abstractions: pi saves a batch as one entry and drops its queues whole; the model consumes and drops a message at a time, which allows more orderings, not fewer.
+
+Random traces of `step` rarely reach deep delivery orderings: the gate mutant needs about 170,000 traces. `check.sh` and `mutants.py` therefore also simulate `deliveryStep` from `initDelivery`: only the root and one live child, with the delivery actions and their faults. Every such trace is a trace of `step`, so the invariants must hold there too; it catches the gate mutant within a few hundred traces.
 
 ## Covered
 
