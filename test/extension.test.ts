@@ -47,6 +47,58 @@ test("F2: parallel first spawns share one connection; both return and pushes kee
 	await h.waitFor(() => /echo:echo/.test(h.inbox()) && (h.inbox().match(/ended: normal/g) ?? []).length === 2);
 });
 
+test("asynchronous startup failures notify the parent after spawn returned", async () => {
+	const command = process.env.PI_ACTORS_CHILD_COMMAND;
+	process.env.PI_ACTORS_CHILD_COMMAND = JSON.stringify([join(home, "missing-executable")]);
+	const h = root();
+	try {
+		assert.match((await h.tool("spawn", { task: "echo", name: "startup-failure" })).content[0].text, /Started startup-failure/);
+		await h.waitFor(() => /startup-failure ended: error:start_failed/.test(h.inbox()));
+		assert.equal(h.events.filter((e) => e.name === "actors:waiting").at(-1)?.data.waiting, false);
+		assert.equal((h.inbox().match(/startup-failure ended/g) ?? []).length, 1);
+	} finally {
+		process.env.PI_ACTORS_CHILD_COMMAND = command;
+	}
+});
+
+test("terminal provider errors are pushed once, clear waiting, and do not poison later runs", async () => {
+	const command = process.env.PI_ACTORS_CHILD_COMMAND;
+	process.env.PI_ACTORS_CHILD_COMMAND = JSON.stringify([process.execPath, fileURLToPath(new URL("./fixtures/reporting-agent.ts", import.meta.url))]);
+	const h = root();
+	try {
+		for (const task of ["error", "partial", "fallback", "long", "retry"]) {
+			await h.tool("spawn", { task, name: task });
+			await h.waitFor(() => h.inbox().includes(`fixture settled: ${task}`));
+			const reports = h.pushed.filter((p) => p.content.includes(`Report from ${task}:`));
+			assert.equal(reports.length, 1);
+			const report = reports[0].content;
+			if (task === "retry") {
+				assert.match(report, /Retry succeeded/);
+				assert.doesNotMatch(report, /failed|configured/);
+			} else {
+				assert.match(report, /Run failed:/);
+				assert.doesNotMatch(report, /I will investigate/);
+				if (task === "fallback") assert.match(report, /unknown provider error/i);
+				else if (task === "long") assert.match(report, /truncated; full text in/);
+				else assert.match(report, /Provider is not configured: anthropic/);
+			}
+			assert.equal(h.events.filter((e) => e.name === "actors:waiting").at(-1)?.data.waiting, false);
+		}
+		await h.tool("send", { to: "error", text: "success" });
+		await h.waitFor(() => /Recovered successfully/.test(h.inbox()));
+		const recovered = h.pushed.find((p) => /Recovered successfully/.test(p.content))!;
+		assert.doesNotMatch(recovered.content, /Run failed|configured/);
+		await h.tool("spawn", { task: "interactive", name: "interactive" });
+		await h.waitFor(() => h.inbox().includes("fixture settled: interactive"));
+		assert.doesNotMatch(h.inbox(), /Report from interactive:/, "user-started pane runs are not reported");
+		await h.tool("send", { to: "interactive", text: "success" });
+		await h.waitFor(() => h.inbox().includes("Report from interactive:"));
+		assert.match(h.pushed.find((p) => p.content.includes("Report from interactive:"))!.content, /Recovered successfully/);
+	} finally {
+		process.env.PI_ACTORS_CHILD_COMMAND = command;
+	}
+});
+
 test("F1: a missing cwd is rejected by the tool; relative paths resolve against the agent's cwd", async () => {
 	const h = root();
 	await assert.rejects(h.tool("spawn", { task: "echo", cwd: "no/such/dir" }), /not a directory/);

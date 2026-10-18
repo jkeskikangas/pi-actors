@@ -46,6 +46,7 @@ export default function piActors(pi: ExtensionAPI) {
 	let ctxRef: ExtensionContext | undefined;
 	let idle = true;
 	let lastAssistantText = "";
+	let lastAssistantError: string | undefined;
 	let lastRunInteractive = false;
 	let usage = { input: 0, output: 0, cacheWrite: 0, cost: 0 };
 	/** Children that owe a report. */
@@ -575,12 +576,16 @@ export default function piActors(pi: ExtensionAPI) {
 		lastRunInteractive = (event as { source?: string }).source === "interactive";
 	});
 	pi.on("agent_start", async () => {
+		lastAssistantText = "";
+		lastAssistantError = undefined;
 		idle = false;
 		client?.setRunning(true);
 	});
 	pi.on("message_end", async (event) => {
-		const m = event.message as { role?: string; content?: unknown; usage?: { input?: number; output?: number; cacheWrite?: number; cost?: { total?: number } } };
+		const m = event.message as { role?: string; content?: unknown; stopReason?: string; errorMessage?: string; usage?: { input?: number; output?: number; cacheWrite?: number; cost?: { total?: number } } };
 		if (m.role !== "assistant") return;
+		// Wait for settlement: an automatic retry can replace this failure with a successful answer.
+		lastAssistantError = m.stopReason === "error" ? (m.errorMessage?.trim() || "Unknown provider error") : undefined;
 		const text = Array.isArray(m.content) ? m.content.filter((b: { type?: string }) => b?.type === "text").map((b: { text?: string }) => b.text ?? "").join("") : "";
 		if (text.trim()) lastAssistantText = text;
 		usage = { input: usage.input + (m.usage?.input ?? 0), output: usage.output + (m.usage?.output ?? 0), cacheWrite: usage.cacheWrite + (m.usage?.cacheWrite ?? 0), cost: usage.cost + (m.usage?.cost?.total ?? 0) };
@@ -605,10 +610,13 @@ export default function piActors(pi: ExtensionAPI) {
 		// Pushes pi dropped (its queues are cleared on Esc) never reached the session: release their
 		// leases and deliver them again (F4).
 		if (client && mailroom) for (const id of mailroom.reclaim(ctx.sessionManager.getEntries())) client.release(id);
-		// A child's final answer is its report (no exit tool to forget).
-		if (isChild() && client && parent && lastAssistantText.trim() && !lastRunInteractive) {
-			const body = cutReport(lastAssistantText, ctx.sessionManager.getSessionFile());
-			lastAssistantText = "";
+		// A child's final answer is its report (no exit tool to forget). A failed provider request can
+		// have no text, or leave an earlier partial answer behind: the failure is the report.
+		const report = lastAssistantError ? `Run failed: ${lastAssistantError}` : lastAssistantText;
+		lastAssistantText = "";
+		lastAssistantError = undefined;
+		if (isChild() && client && parent && report.trim() && !lastRunInteractive) {
+			const body = cutReport(report, ctx.sessionManager.getSessionFile());
 			await client.op("send", { to: parent, kind: "mail", tag: "report", body });
 		}
 		lastRunInteractive = false;
