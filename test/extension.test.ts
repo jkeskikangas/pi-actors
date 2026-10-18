@@ -194,6 +194,113 @@ test("mail that arrives during a run waits in the broker and reaches pi as one b
 	await h.fire("agent_settled", { aborted: false });
 });
 
+test("INV-4: an urgent message to a busy agent never overtakes older mail from the same sender", async () => {
+	// Incident 2026-10-18: bpe-finish's urgent 2:66 reached the root model before its 2:54..2:65.
+	const h = root();
+	await h.tool("spawn", { task: "serve", name: "fifo" });
+	await h.fire("agent_start");
+	h.setPush("keep");
+	await h.tool("send", { to: "fifo", text: "wait for approval" });
+	await new Promise((r) => setTimeout(r, 500));
+	await h.tool("send", { to: "fifo", text: "urgent:approved" });
+	await h.waitFor(() => /echo:urgent:approved/.test(h.inbox()));
+	h.drainQueue(); // pi: steering first, then follow-ups
+	const seen = (await h.context()).flatMap((m: any) => m.details.actors.messages.map((x: { body: string }) => x.body));
+	assert.deepEqual(seen, ["echo:wait for approval", "echo:urgent:approved"]);
+	h.setPush("persist");
+	await h.fire("agent_settled", { aborted: false });
+});
+
+test("stress: floods of ordinary and urgent mail to a busy agent, through tool turns, pi clearing its queue, a broker crash and a child resume: one delivery in pi at a time, each message once, in sender order", async () => {
+	const h = root();
+	let seed = 20261018;
+	const rnd = () => (seed = (seed * 1103515245 + 12345) % 2 ** 31) / 2 ** 31;
+	const kids = ["st-a", "st-b", "st-c"];
+	for (const k of kids) await h.tool("spawn", { task: "serve", name: k });
+	const status = () => {
+		try {
+			return JSON.parse(readFileSync(join(home, "h", "trees", treeOf(h), "status.json"), "utf8"));
+		} catch {
+			return undefined;
+		}
+	};
+	const tick = () => new Promise((r) => setTimeout(r, 40));
+	const toolTurn = { message: { role: "assistant", stopReason: "toolUse", content: [{ type: "toolCall", id: "t", name: "bash", arguments: {} }] }, toolResults: [] };
+	const lastTurn = { message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "ok" }] }, toolResults: [] };
+	const expected: string[] = [];
+	let maxQueued = 0;
+	await h.fire("agent_start");
+	h.setPush("keep");
+	for (let i = 0; i < 70; i++) {
+		if (i === 25) {
+			// The broker crashes with a delivery possibly in pi's queue; the root relaunches it.
+			process.kill(status().pid, "SIGKILL");
+			await new Promise((r) => setTimeout(r, 300));
+		}
+		if (i === 40) {
+			// Stop a child once it has answered everything (mail a stopped child never read is dropped
+			// by design), then resume it. Its end notice is the root's own doing, even if it arrives
+			// after the resume.
+			const answered = () => {
+				const evs = readFileSync(join(home, "h", "trees", treeOf(h), "events.log"), "utf8").split("\n").filter((l) => l.includes('"type":"send"'));
+				return evs.filter((l) => l.includes('"from":"st-c"')).length === evs.filter((l) => l.includes('"to":"st-c"')).length;
+			};
+			await h.waitFor(answered, 15_000);
+			await h.tool("stop", { id: "st-c" });
+			for (let t = 0; ; t++) {
+				const r = await h.tool("spawn", { task: "serve", resume: "st-c" }).then(() => true, () => false);
+				if (r) break;
+				assert.ok(t < 100, "st-c could not be resumed");
+				await new Promise((r) => setTimeout(r, 100));
+			}
+		}
+		if (i === 55) {
+			// Esc: pi clears its queues; the run settles and, once old enough, the lost delivery is reclaimed.
+			h.clearQueue();
+			await h.fire("agent_settled", { aborted: true });
+			await new Promise((r) => setTimeout(r, 5200));
+			await h.fire("agent_settled", { aborted: true });
+			await h.fire("agent_start");
+		}
+		const x = rnd();
+		if (x < 0.45) {
+			const kid = kids[Math.floor(rnd() * kids.length)];
+			const body = `${rnd() < 0.3 ? "urgent:" : ""}${kid}#${i}`;
+			await h.tool("send", { to: kid, text: body });
+			expected.push(`echo:${body}`);
+		} else if (x < 0.65) await h.fire("turn_end", toolTurn);
+		else if (x < 0.8) await h.fire("turn_end", lastTurn);
+		else if (x < 0.95) h.drainQueue();
+		else {
+			h.drainQueue();
+			await h.fire("agent_settled", { aborted: false });
+			await tick();
+			await h.fire("agent_start");
+		}
+		await tick();
+		maxQueued = Math.max(maxQueued, h.queuedCount());
+	}
+	h.setPush("persist");
+	h.drainQueue();
+	await h.fire("agent_settled", { aborted: false });
+	const consumed = async () =>
+		(await h.context()).flatMap((m: any) => m.details.actors.messages as { from: string; body: string }[]).filter((m) => m.body.startsWith("echo:"));
+	for (let t = 0; (await consumed()).length < expected.length; t++) {
+		assert.ok(t < 200, `missing: ${expected.filter((e) => !h.inbox().includes(e)).join(", ")} ${JSON.stringify(status()?.agents.map((a: any) => [a.id, a.status, a.inc, a.mailbox]))}`);
+		await new Promise((r) => setTimeout(r, 100));
+		await h.fire("agent_settled", { aborted: false });
+	}
+	const got = await consumed();
+	assert.deepEqual([...got.map((m) => m.body)].sort(), [...expected].sort(), "every message consumed exactly once");
+	assert.doesNotMatch(JSON.stringify(await h.context()), /st-c ended/, "the end of a child it stopped is not news to the root");
+	assert.ok(maxQueued <= 1, `at most one delivery waits in pi's queue (saw ${maxQueued})`);
+	for (const kid of kids) {
+		const order = got.filter((m) => m.from === kid).map((m) => Number(m.body.split("#")[1]));
+		assert.deepEqual(order, [...order].sort((a, b) => a - b), `${kid}: consumed in sender order`);
+	}
+	await h.waitFor(() => status()?.agents.find((a: { id: string }) => a.id === "root")?.mailbox === 0, 5000);
+});
+
 test("F8: an oversized message is refused up front and does not break later sends", async () => {
 	const h = root();
 	await h.tool("spawn", { task: "serve", name: "big" });

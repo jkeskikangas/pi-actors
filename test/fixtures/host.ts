@@ -44,7 +44,7 @@ export function fakeHost(opts: HostOptions) {
 			pushed.push({ content: m.content, details: m.details, options });
 			const entry = { type: "custom_message", customType: m.customType, content: m.content, details: m.details };
 			if (push === "persist") entries.push(entry);
-			else if (push === "keep") queued.push(entry);
+			else if (push === "keep") queued.push({ entry, steer: options?.deliverAs === "steer" });
 		},
 		events: {
 			emit: (name: string, data: any) => {
@@ -117,7 +117,13 @@ export function fakeHost(opts: HostOptions) {
 		overlayLines: (width = 120) => overlay?.component.render(width) ?? [],
 		overlayOpen: () => !!overlay,
 		setPush: (p: "persist" | "drop" | "keep") => (push = p),
-		/** pi delivers what it kept queued (the next run). */
-		drainQueue: () => entries.push(...queued.splice(0)),
+		/** pi delivers what it kept queued (the next run): steering messages before follow-ups, as pi polls them. */
+		drainQueue: () => {
+			const q = queued.splice(0);
+			entries.push(...q.filter((x) => x.steer).map((x) => x.entry), ...q.filter((x) => !x.steer).map((x) => x.entry));
+		},
+		/** pi clears its queues (Esc): what it kept is gone. */
+		clearQueue: () => queued.splice(0).length,
+		queuedCount: () => queued.length,
 	};
 }

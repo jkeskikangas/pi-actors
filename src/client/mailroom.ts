@@ -216,9 +216,9 @@ export function summarizeDelivery(messages: readonly Message[]): string {
 		.join(" · ");
 }
 
-export function endNotice(m: Message): { id: string; reason: string; result?: string } {
-	const d = safeJson(m.body) as { id?: string; reason?: string; result?: string | null } | undefined;
-	return { id: d?.id ?? "?", reason: d?.reason ?? "?", result: d?.result ?? undefined };
+export function endNotice(m: Message): { id: string; inc?: number; reason: string; result?: string } {
+	const d = safeJson(m.body) as { id?: string; inc?: number; reason?: string; result?: string | null } | undefined;
+	return { id: d?.id ?? "?", inc: typeof d?.inc === "number" ? d.inc : undefined, reason: d?.reason ?? "?", result: d?.result ?? undefined };
 }
 
 function safeJson(s: string): unknown {

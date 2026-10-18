@@ -53,7 +53,8 @@ export default function piActors(pi: ExtensionAPI) {
 	const awaitingReport = new Set<string>();
 	const myChildren = new Set<string>();
 	/** Agents this one stopped: their end notice tells it nothing new. */
-	const stoppedByMe = new Set<string>();
+	/** Agents this one stopped: id -> the newest incarnation the stop covers. */
+	const stoppedByMe = new Map<string, number>();
 	let lastSnap: Snapshot | undefined;
 	let panelOpen = false;
 	let uiTimer: NodeJS.Timeout | undefined;
@@ -298,8 +299,10 @@ export default function piActors(pi: ExtensionAPI) {
 		const d = endNotice(m);
 		const base = d.reason.replace(/:unconfirmed$/, "");
 		// Any end settles a stop: a stop that came too late (the child was already finishing) must
-		// not hide a later incarnation's end.
-		const mine = stoppedByMe.delete(d.id);
+		// not hide a later incarnation's end. The stopped incarnation's end can arrive after a resume.
+		const covers = stoppedByMe.get(d.id);
+		stoppedByMe.delete(d.id);
+		const mine = covers !== undefined && (d.inc === undefined || d.inc <= covers);
 		return base === "killed:tree_stopped" || (base === "killed" && mine);
 	}
 
@@ -678,8 +681,12 @@ export default function piActors(pi: ExtensionAPI) {
 				req: { name: p.name, task: p.task, model: p.model, thinking: p.thinking, fast: p.fast, context: p.fork ? "fork" : "fresh", cwd, placement: p.pane ? "pane" : "headless", timeoutS: p.timeout_minutes ? p.timeout_minutes * 60 : undefined, resume: p.resume },
 			}, signal);
 			if (!r.ok) throw new Error(r.error === "limit_depth" ? "limit_depth: do this work yourself; this agent may not spawn deeper." : failText(r));
-			const id = (r as { id: string }).id;
-			stoppedByMe.delete(id); // a resumed child is a new incarnation
+			const { id, inc } = r as { id: string; inc?: number };
+			// A resumed child is a new incarnation: a stop covers only the older ones.
+			if (stoppedByMe.has(id)) {
+				if (typeof inc === "number") stoppedByMe.set(id, inc - 1);
+				else stoppedByMe.delete(id);
+			}
 			myChildren.add(id);
 			awaitingReport.add(id);
 			updateWaiting();
@@ -724,7 +731,7 @@ export default function piActors(pi: ExtensionAPI) {
 			const r = await op(ctx, "kill", { target: p.id }, signal);
 			if (!r.ok) throw new Error(failText(r));
 			awaitingReport.delete(p.id);
-			stoppedByMe.add(p.id);
+			stoppedByMe.set(p.id, Infinity);
 			updateWaiting();
 			return text(`Stopping ${p.id}.`);
 		},
@@ -742,7 +749,7 @@ export default function piActors(pi: ExtensionAPI) {
 			if (sub === "stop") {
 				if (target) {
 					const r = await c.op("kill", { target });
-					if (r.ok) stoppedByMe.add(target);
+					if (r.ok) stoppedByMe.set(target, Infinity);
 					return ctx.ui.notify(r.ok ? `Stopping ${target}.` : failText(r as { ok: false; error: string }), r.ok ? "info" : "warning");
 				}
 				if (self !== "root") return ctx.ui.notify("Only the root can stop the whole tree.", "warning");
