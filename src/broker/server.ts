@@ -8,7 +8,7 @@ import { closePane, herdrAvailable, listPanes, paneAgentName, paneForegroundGrou
 import { closeTmuxPane, listTmuxPanes, startTmuxPane, tmuxAvailable, tmuxPanePid } from "../placement/tmux.ts";
 import { signalGroup, startHeadless } from "../placement/headless.ts";
 import { decode, encode, LIMITS, PROTO, TIMING } from "../protocol.ts";
-import { acquireLock, type Config, ensureDir, ensurePrivateDir, holdsLock, pidAlive, releaseLock, writeFileAtomicSync } from "../runtime.ts";
+import { acquireLock, brokerDownMs, type Config, ensureDir, ensurePrivateDir, holdsLock, pidAlive, releaseLock, writeFileAtomicSync } from "../runtime.ts";
 import { apply, type Effect, type Event, finished, initial, nextDeadline, replay, ROOT, type SpawnRequest, type TreeState, UNSYNCED_EVENTS } from "../tree.ts";
 import { EventLog } from "./log.ts";
 
@@ -252,7 +252,7 @@ export async function startBroker(dir: string, sock: string, config: Config): Pr
 				return;
 			}
 			const argv = config.childCommand ? [...config.childCommand, ...piArgs] : [...config.piCommand, "--mode", "rpc", ...piArgs];
-			startHeadless(config.runtimeDir, { id, inc, socket: sock, argv, cwd, logDir: logsDir, graceMs: TIMING.childGraceMs }, (err) => startFailed(id, inc, err));
+			startHeadless(config.runtimeDir, { id, inc, socket: sock, argv, cwd, logDir: logsDir, graceMs: TIMING.childGraceMs, treeDir: dir, brokerDownMs: brokerDownMs(config) }, (err) => startFailed(id, inc, err));
 		} catch (err) {
 			startFailed(id, inc, err);
 		}
@@ -317,8 +317,14 @@ export async function startBroker(dir: string, sock: string, config: Config): Pr
 				c.role = "keeper";
 				c.id = String(f.id);
 				c.inc = Number(f.inc);
-				keeperConn.set(c.id, c);
-				return send(c, { t: "welcome" });
+				const a = st.agents[c.id];
+				// An older incarnation's Keeper must not take the current one's place for signals.
+				if (a && a.inc === c.inc) keeperConn.set(c.id, c);
+				send(c, { t: "welcome" });
+				// A Keeper that outlived its broker reattaches to a tree that has declared its child gone
+				// (ended, or since resumed as a new incarnation): the link rule applies now.
+				if (!a || a.inc !== c.inc || a.status === "down") send(c, { t: "signal", sig: "KILL" });
+				return;
 			}
 			case "proc_start": {
 				if (c.role !== "keeper" || !c.id) return;
