@@ -6,7 +6,7 @@
 
 import { execFile } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, rmSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -20,7 +20,7 @@ import { type AgentItem, agentLine, editorFocused, endedRoots, initialState, ite
 import { captureRunner, readSession, renderDelivery, Transcript } from "./client/transcript.ts";
 import type { Snapshot } from "./client/connection.ts";
 import { fastPayload, supportsFast } from "./client/fast.ts";
-import { closeOwnPaneOnExit, detectMux, paneAgentName, stateRoot } from "./runtime.ts";
+import { closeOwnPaneOnExit, detectMux, paneAgentName, stateRoot, writeFileAtomicSync } from "./runtime.ts";
 import { type Limits, type Message, TIMING } from "./protocol.ts";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -193,7 +193,7 @@ export default function piActors(pi: ExtensionAPI) {
 	function carryTreeId(treeId: string) {
 		try {
 			mkdirSync(dirname(carryPath()), { recursive: true, mode: 0o700 });
-			writeFileSync(carryPath(), JSON.stringify({ treeId, process: processToken }), { mode: 0o600 });
+			writeFileAtomicSync(carryPath(), JSON.stringify({ treeId, process: processToken }));
 		} catch {
 			// best effort: without it a session switch starts a new tree
 		}

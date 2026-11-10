@@ -31,6 +31,8 @@ export interface Snapshot {
 	/** `running`: executing a run (not idle) on its current connection; absent from older brokers. */
 	agents: { id: string; parent: string | null; status: string; inc: number; reason?: string; connected: boolean; running?: boolean; placement?: string; paneId?: string; model?: string; fast?: boolean; mailbox: number; spawns: number; sessionFile?: string; task?: string }[];
 	liveChildren: number;
+	/** Agents not listed (the oldest ended ones), so the reply fits one frame. */
+	omitted?: number;
 }
 
 type OpFrame = { t: "op"; seq: number; op: string } & Record<string, unknown>;
@@ -342,7 +344,13 @@ export class Client extends EventEmitter {
 		const reqId = `i${++this.counter}`;
 		const p = new Promise<Snapshot>((resolve) => this.inspects.set(reqId, resolve));
 		this.ask(`inspect:${reqId}`, { t: "inspect", reqId });
-		return Promise.race([p, new Promise<undefined>((r) => setTimeout(() => r(undefined), 5000).unref())]);
+		return Promise.race([p, new Promise<undefined>((r) => setTimeout(() => {
+			// Given up on: no longer owed, or a broker that cannot answer it (an older one whose reply
+			// was over the frame limit) would get this connection dropped by the watchdog.
+			this.inspects.delete(reqId);
+			this.owed.delete(`inspect:${reqId}`);
+			r(undefined);
+		}, 5000).unref())]);
 	}
 
 	/** Resolve on the next mail notice or after `ms`, without leaking listeners. */
