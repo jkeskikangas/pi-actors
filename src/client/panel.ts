@@ -22,7 +22,7 @@ export type AgentItem = {
 	clearable: boolean;
 };
 
-export type PanelItem = AgentItem | { kind: "ended"; count: number; expanded: boolean };
+export type PanelItem = AgentItem | { kind: "ended"; count: number; expanded: boolean; older?: number };
 
 export type PanelKey = "up" | "down" | "pageUp" | "pageDown" | "home" | "end" | "enter" | "escape" | "focus" | "clear" | "expand";
 
@@ -75,7 +75,7 @@ const sameRow = (a: PanelItem, b: PanelItem) => (a.kind === "ended" ? b.kind ===
 export function items(st: Pick<PanelState, "snap" | "showEnded">): PanelItem[] {
 	const { running, ended } = sections(st.snap);
 	if (ended.length === 0) return running;
-	return [...running, { kind: "ended", count: ended.length, expanded: st.showEnded }, ...(st.showEnded ? ended : [])];
+	return [...running, { kind: "ended", count: ended.length, expanded: st.showEnded, ...(st.snap.omitted ? { older: st.snap.omitted } : {}) }, ...(st.showEnded ? ended : [])];
 }
 
 /** Ended rows are indented within their own ended subtree. */
@@ -295,7 +295,7 @@ export function view(st: PanelState, width: number, height: number, transcript: 
 	keys.push("esc close");
 	const lines: Line[] = rows.map((it, i) => {
 		const cursor = i === st.selected ? "❯ " : "  ";
-		if (it.kind === "ended") return fit(`${cursor}${it.expanded ? "▾" : "▸"} ${it.count} ended`, i === st.selected ? "text" : "dim");
+		if (it.kind === "ended") return fit(`${cursor}${it.expanded ? "▾" : "▸"} ${it.count} ended${it.older ? ` (${it.older} older not shown)` : ""}`, i === st.selected ? "text" : "dim");
 		return fit(`${cursor}${"  ".repeat(it.depth)}${agentLine(it)}`, i === st.selected ? "text" : it.ended ? "dim" : "muted");
 	});
 	// Keep the cursor visible in a short list.

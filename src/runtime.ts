@@ -3,7 +3,7 @@
 
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { closeSync, cpSync, existsSync, linkSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync, writeSync } from "node:fs";
+import { closeSync, cpSync, existsSync, fsyncSync, linkSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync, writeSync } from "node:fs";
 import { homedir, tmpdir, uptime, userInfo } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -108,11 +108,109 @@ function listFiles(dir: string, prefix = ""): string[] {
 	});
 }
 
-function writeFileAtomicSync(path: string, content: string) {
+/**
+ * Replace a whole file so a reader sees the old or the new content, never a torn or empty one:
+ * write a temp file in the same directory, fsync it, rename it over the target, fsync the
+ * directory. On any failure (a full disk) the temp file is removed and the old file is untouched.
+ */
+export function writeFileAtomicSync(path: string, content: string, mode = 0o600): void {
 	ensureDir(dirname(path));
-	const fd = openSync(path, "w");
-	writeSync(fd, content);
-	closeSync(fd);
+	const tmp = `${path}.tmp-${process.pid}-${Date.now()}`;
+	try {
+		const fd = openSync(tmp, "w", mode);
+		try {
+			const buf = Buffer.from(content);
+			for (let off = 0; off < buf.length; ) {
+				injectedFault(path, () => writeSync(fd, buf, off, Math.ceil((buf.length - off) / 2)));
+				off += writeSync(fd, buf, off);
+			}
+			fsyncSync(fd);
+		} finally {
+			closeSync(fd);
+		}
+		renameSync(tmp, path);
+	} catch (err) {
+		rmSync(tmp, { force: true });
+		throw err;
+	}
+	// The rename itself must reach the disk, or a machine crash can bring back the old file.
+	try {
+		const dirFd = openSync(dirname(path), "r");
+		try {
+			fsyncSync(dirFd);
+		} finally {
+			closeSync(dirFd);
+		}
+	} catch {
+		// the new content is in place; only its durability across a machine crash is unconfirmed
+	}
+}
+
+/** Errors of the disk rather than of the program: a broker survives these and retries (ENOSPC, EIO...). */
+export function isIoError(err: unknown): boolean {
+	return ["ENOSPC", "EDQUOT", "EIO", "EROFS", "EFBIG", "EMFILE", "ENFILE"].includes((err as NodeJS.ErrnoException)?.code ?? "");
+}
+
+/**
+ * Test hook: while the file named by PI_ACTORS_TEST_ENOSPC exists, state writes fail like on a
+ * full disk, after writing part of their data (`partial`), as a real ENOSPC can.
+ */
+export function injectedFault(path: string, partial?: () => void): void {
+	const flag = process.env.PI_ACTORS_TEST_ENOSPC;
+	if (!flag || !existsSync(flag)) return;
+	partial?.();
+	throw Object.assign(new Error(`ENOSPC: no space left on device, write '${path}'`), { code: "ENOSPC", errno: -28, syscall: "write" });
+}
+
+// ---------------------------------------------------------------- tree config
+
+/** A parsed config with the fields every process of the tree needs, or undefined. */
+function parseConfig(text: string): Config | undefined {
+	try {
+		const c = JSON.parse(text) as Config;
+		return c && typeof c === "object" && typeof c.treeId === "string" && typeof c.runtimeDir === "string" && Array.isArray(c.piCommand) && c.limits ? c : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+export const configBackup = (configPath: string) => `${configPath}.bak`;
+
+/**
+ * Read a tree's config.json, falling back to its backup copy when it is missing, empty or
+ * corrupt (a full disk truncated it once and every later launch failed). `problem` says what was
+ * wrong with config.json; `config` is undefined only when the backup is unusable too.
+ */
+export function loadConfig(configPath: string): { config?: Config; text?: string; problem?: string; fromBackup?: boolean } {
+	let problem: string | undefined;
+	try {
+		const text = readFileSync(configPath, "utf8");
+		const config = parseConfig(text);
+		if (config) return { config, text };
+		problem = text.length === 0 ? `${configPath} is empty` : `${configPath} is not a valid tree config`;
+	} catch (err) {
+		problem = (err as NodeJS.ErrnoException).code === "ENOENT" ? `${configPath} is missing` : `${configPath} is unreadable: ${(err as Error).message}`;
+	}
+	try {
+		const config = parseConfig(readFileSync(configBackup(configPath), "utf8"));
+		if (config) return { config, problem, fromBackup: true };
+	} catch {
+		// no usable backup
+	}
+	return { problem };
+}
+
+/** Write config.json (and its backup) atomically, only where the content changed. */
+export function saveConfig(configPath: string, config: Config, current?: string): void {
+	const text = JSON.stringify(config, null, 1);
+	if (text !== current) writeFileAtomicSync(configPath, text);
+	let backup: string | undefined;
+	try {
+		backup = readFileSync(configBackup(configPath), "utf8");
+	} catch {
+		// none yet
+	}
+	if (backup !== text) writeFileAtomicSync(configBackup(configPath), text);
 }
 
 // ---------------------------------------------------------------- broker lock

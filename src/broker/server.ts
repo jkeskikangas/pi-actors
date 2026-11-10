@@ -7,8 +7,8 @@ import { dirname, join } from "node:path";
 import { closePane, herdrAvailable, listPanes, paneAgentName, paneForegroundGroup, startPane } from "../placement/pane.ts";
 import { closeTmuxPane, listTmuxPanes, startTmuxPane, tmuxAvailable, tmuxPanePid } from "../placement/tmux.ts";
 import { signalGroup, startHeadless } from "../placement/headless.ts";
-import { decode, encode, PROTO, TIMING } from "../protocol.ts";
-import { acquireLock, type Config, ensureDir, ensurePrivateDir, holdsLock, pidAlive, releaseLock } from "../runtime.ts";
+import { decode, encode, LIMITS, PROTO, TIMING } from "../protocol.ts";
+import { acquireLock, type Config, ensureDir, ensurePrivateDir, holdsLock, pidAlive, releaseLock, writeFileAtomicSync } from "../runtime.ts";
 import { apply, type Effect, type Event, finished, initial, nextDeadline, replay, ROOT, type SpawnRequest, type TreeState, UNSYNCED_EVENTS } from "../tree.ts";
 import { EventLog } from "./log.ts";
 
@@ -39,6 +39,12 @@ export interface BrokerHandle {
 }
 
 const SLEEP_GAP_MS = 5000;
+/**
+ * An inspect reply lists every agent that has not ended, and of the ended ones only the newest
+ * (fewer if needed to fit one frame); the rest are counted in `omitted`. status.json lists all.
+ */
+const INSPECT_STEPS: [ended: number, taskChars: number][] = [[50, 200], [20, 200], [20, 60], [5, 0], [0, 0]];
+const INSPECT_BYTES = LIMITS.frameBytes * 2 - 1024;
 
 export async function startBroker(dir: string, sock: string, config: Config): Promise<BrokerHandle> {
 	ensureDir(dir);
@@ -59,8 +65,26 @@ export async function startBroker(dir: string, sock: string, config: Config): Pr
 	const sessionsDir = join(dir, "sessions");
 	ensureDir(sessionsDir);
 
+	// A failing disk (ENOSPC, EIO) is reported once per kind of write, and again once it works.
+	const ioErrors = new Map<string, string>();
+	const ioFailed = (what: string, err: unknown) => {
+		if (!ioErrors.has(what)) console.error(`${new Date().toISOString()} ${what} failed: ${(err as Error)?.message ?? err}; will retry`);
+		ioErrors.set(what, String(err));
+	};
+	const ioOk = (what: string) => {
+		if (ioErrors.delete(what)) console.error(`${new Date().toISOString()} ${what} works again`);
+	};
+
 	const send = (c: Conn | undefined, frame: object) => {
-		if (c && !c.socket.destroyed) c.socket.write(encode(frame));
+		if (!c || c.socket.destroyed) return;
+		let line: string;
+		try {
+			line = encode(frame);
+		} catch (err) {
+			console.error(`${new Date().toISOString()} frame ${(frame as { t?: string }).t} to ${c.id ?? "?"} not sent: ${(err as Error).message}`);
+			return;
+		}
+		c.socket.write(line);
 	};
 
 	// ------------------------------------------------------------ events and effects
@@ -146,7 +170,7 @@ export async function startBroker(dir: string, sock: string, config: Config): Pr
 				break;
 			}
 			case "start":
-				void start(e.id, e.inc, e.spec, e.parentSessionFile, e.resumeSessionFile);
+				void start(e.id, e.inc, e.spec, e.parentSessionFile, e.resumeSessionFile).catch((err) => console.error("start error", err));
 				break;
 			case "down": {
 				const pane = panes.get(e.id);
@@ -202,7 +226,11 @@ export async function startBroker(dir: string, sock: string, config: Config): Pr
 
 	/** A child that cannot start ends now with a reason, instead of after the start timeout (F1). */
 	const startFailed = (id: string, inc: number, err: unknown) => {
-		writeFileSync(join(logsDir, `${id}.${inc}.start-error`), String(err));
+		try {
+			writeFileSync(join(logsDir, `${id}.${inc}.start-error`), String(err));
+		} catch (e) {
+			console.error(`${new Date().toISOString()} ${id}.${inc} could not start: ${err}; and its start-error file failed: ${(e as Error).message}`);
+		}
 		const a = st.agents[id];
 		if (a && a.inc === inc && a.status !== "down") run({ type: "procExit", now: Date.now(), id, inc, code: null, signal: "start_failed" });
 	};
@@ -364,27 +392,57 @@ export async function startBroker(dir: string, sock: string, config: Config): Pr
 		return !a.pid || !pidAlive(a.pid);
 	};
 
-	const inspect = (forId: string) => ({
-		treeId: st.treeId,
-		self: forId,
-		agents: Object.values(st.agents).map((a) => ({
-			id: a.id, parent: a.parent, status: a.status, inc: a.inc, reason: a.reason, connected: a.connected, running: a.status === "live" && !!agentConn.get(a.id)?.running,
-			placement: a.spec?.placement, paneId: a.paneId, model: a.spec?.model, fast: a.spec?.fast, mailbox: (st.mailbox[a.id] ?? []).length, spawns: a.spawns, limits: a.limits, sessionFile: a.sessionFile, task: a.spec?.task?.slice(0, 200),
-		})),
-		liveChildren: Object.values(st.agents).filter((a) => a.parent === forId && a.status !== "down").length,
+	type Agent = TreeState["agents"][string];
+	const agentView = (a: Agent, taskChars: number) => ({
+		id: a.id, parent: a.parent, status: a.status, inc: a.inc, reason: a.reason, connected: a.connected, running: a.status === "live" && !!agentConn.get(a.id)?.running,
+		placement: a.spec?.placement, paneId: a.paneId, model: a.spec?.model, fast: a.spec?.fast, mailbox: (st.mailbox[a.id] ?? []).length, spawns: a.spawns, limits: a.limits, sessionFile: a.sessionFile, task: taskChars > 0 ? a.spec?.task?.slice(0, taskChars) : undefined,
 	});
+
+	/** The whole tree (status.json), or what fits one frame (the inspect reply). */
+	const inspect = (forId: string, full = false) => {
+		const all = Object.values(st.agents);
+		const base = { treeId: st.treeId, self: forId, liveChildren: all.filter((a) => a.parent === forId && a.status !== "down").length };
+		if (full) return { ...base, agents: all.map((a) => agentView(a, 200)) };
+		const listed = (ended: number): Set<string> => {
+			const keep = new Set<string>();
+			// An agent listed brings its ancestors: the panel walks the tree down from `self`.
+			const add = (id: string | null) => {
+				for (let a = id ? st.agents[id] : undefined; a && !keep.has(a.id); a = a.parent ? st.agents[a.parent] : undefined) keep.add(a.id);
+			};
+			add(forId);
+			for (const a of all) if (a.status !== "down") add(a.id);
+			if (ended > 0) for (const a of all.filter((a) => a.status === "down" && !keep.has(a.id)).slice(-ended)) add(a.id);
+			return keep;
+		};
+		let reply: ReturnType<typeof agentView>[] = [];
+		for (const [ended, taskChars] of INSPECT_STEPS) {
+			const keep = listed(ended);
+			reply = all.filter((a) => keep.has(a.id)).map((a) => agentView(a, taskChars));
+			if (Buffer.byteLength(JSON.stringify(reply)) <= INSPECT_BYTES) break;
+		}
+		// Still too large (thousands running): this agent and its own children only.
+		if (Buffer.byteLength(JSON.stringify(reply)) > INSPECT_BYTES) reply = reply.filter((a) => a.id === forId || a.parent === forId).slice(0, 100);
+		const omitted = all.length - reply.length;
+		return { ...base, agents: reply, ...(omitted > 0 ? { omitted } : {}) };
+	};
 
 	// ------------------------------------------------------------ status file
 
 	let statusTimer: NodeJS.Timeout | undefined;
+	let statusOwed = false;
 	const writeStatus = () => {
 		if (statusTimer) return;
 		statusTimer = setTimeout(() => {
 			statusTimer = undefined;
+			if (stopping) return;
+			// Atomic: a full disk leaves the previous status, never an empty one. Retried by the tick.
 			try {
-				writeFileSync(join(dir, "status.json"), JSON.stringify({ updated: new Date().toISOString(), pid: process.pid, ...inspect(ROOT) }, null, 1));
-			} catch {
-				// best effort
+				writeFileAtomicSync(join(dir, "status.json"), JSON.stringify({ updated: new Date().toISOString(), pid: process.pid, ...inspect(ROOT, true) }, null, 1));
+				statusOwed = false;
+				ioOk("status.json write");
+			} catch (err) {
+				statusOwed = true;
+				ioFailed("status.json write", err);
 			}
 		}, 1000);
 		statusTimer.unref();
@@ -431,6 +489,13 @@ export async function startBroker(dir: string, sock: string, config: Config): Pr
 	let lastWall = Date.now();
 	let lastMono = performance.now();
 	timer = setInterval(() => {
+		try {
+			tick();
+		} catch (err) {
+			console.error(`${new Date().toISOString()} tick error`, err); // never let one tick end the broker
+		}
+	}, 1000);
+	function tick() {
 		const wall = Date.now();
 		const mono = performance.now();
 		const slept = wall - lastWall - (mono - lastMono);
@@ -445,18 +510,24 @@ export async function startBroker(dir: string, sock: string, config: Config): Pr
 		if (lockLost || !holdsLock(dir)) return loseLock();
 		const due = nextDeadline(st);
 		if (due !== undefined && wall >= due) run({ type: "tick", now: wall });
-		if (log.needsCompaction()) log.compact(st, wall);
-	}, 1000);
+		if (log.failing) log.flush(); // a full disk freed: write the held events
+		if (statusOwed) writeStatus();
+		if (log.needsCompaction(wall)) log.compact(st, wall);
+	}
 
 	paneTimer = setInterval(async () => {
-		if (panes.size === 0) return;
-		const alive = await mux.list();
-		if (!alive) return;
-		for (const [id, pane] of panes) {
-			if (alive.has(pane)) continue;
-			panes.delete(id);
-			const a = st.agents[id];
-			if (a && a.status !== "down") run({ type: "procExit", now: Date.now(), id, inc: a.inc, code: null, signal: "pane_closed" });
+		try {
+			if (panes.size === 0) return;
+			const alive = await mux.list();
+			if (!alive) return;
+			for (const [id, pane] of panes) {
+				if (alive.has(pane)) continue;
+				panes.delete(id);
+				const a = st.agents[id];
+				if (a && a.status !== "down") run({ type: "procExit", now: Date.now(), id, inc: a.inc, code: null, signal: "pane_closed" });
+			}
+		} catch (err) {
+			console.error(`${new Date().toISOString()} pane check error`, err);
 		}
 	}, 5000);
 
@@ -483,12 +554,13 @@ export async function startBroker(dir: string, sock: string, config: Config): Pr
 		stopping = true;
 		clearInterval(timer);
 		clearInterval(paneTimer);
+		log.compact(st, Date.now()); // or keep the uncompacted log
 		try {
-			log.compact(st, Date.now());
-		} catch {
-			// keep the uncompacted log
+			writeFileAtomicSync(join(dir, "status.json"), JSON.stringify({ updated: new Date().toISOString(), finished: finished(st), ...inspect(ROOT, true) }, null, 1));
+		} catch (err) {
+			// Without it a finished tree could be restarted empty: say so (F7).
+			console.error(`${new Date().toISOString()} final status.json write failed: ${(err as Error).message}`);
 		}
-		writeFileSync(join(dir, "status.json"), JSON.stringify({ updated: new Date().toISOString(), finished: finished(st), ...inspect(ROOT) }, null, 1));
 		// Keepers would otherwise hold their exit reports for the full grace period.
 		for (const k of keeperConn.values()) send(k, { t: "shutdown" });
 		await new Promise((r) => setTimeout(r, 100));
