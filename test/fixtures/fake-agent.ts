@@ -4,10 +4,13 @@
 // "urgent:" is answered urgently), "crash"
 // (exit 3 without the exit op).
 import { Client } from "../../src/client/connection.ts";
+import { childLink } from "../../src/client/launcher.ts";
 import type { Message } from "../../src/protocol.ts";
 
 const flag = (name: string) => process.argv.find((a) => a.startsWith(`--actors-${name}=`))?.split("=").slice(1).join("=");
-const c = new Client({ socket: flag("socket")!, id: flag("id")!, inc: Number(flag("inc")), pid: process.pid });
+// Linked like the extension's children: relaunch a dead broker, give up after the broker-down window.
+const link = childLink(flag("tree")!, flag("socket")!);
+const c = new Client({ socket: flag("socket")!, id: flag("id")!, inc: Number(flag("inc")), pid: process.pid }, link.graceMs, link.redial);
 c.on("terminate", () => process.exit(0));
 c.on("lost", () => process.exit(4));
 await c.start();

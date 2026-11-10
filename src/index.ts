@@ -14,7 +14,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { type Component, matchesKey, type OverlayHandle } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { Client } from "./client/connection.ts";
-import { DEFAULT_KEEP_FINISHED_DAYS, ensureBroker, pruneFinishedTrees } from "./client/launcher.ts";
+import { childLink, DEFAULT_KEEP_FINISHED_DAYS, ensureBroker, pruneFinishedTrees } from "./client/launcher.ts";
 import { cutReport, dedupeContext, ENTRY_TYPE, endNotice, formatDelivery, Mailroom } from "./client/mailroom.ts";
 import { type AgentItem, agentLine, editorFocused, endedRoots, initialState, items, type Line, type PanelAction, type PanelKey, type PanelState, press, summary, view, withSnapshot } from "./client/panel.ts";
 import { captureRunner, readSession, renderDelivery, Transcript } from "./client/transcript.ts";
@@ -97,10 +97,14 @@ export default function piActors(pi: ExtensionAPI) {
 	async function doConnect(ctx: ExtensionContext): Promise<Client> {
 		const sm = ctx.sessionManager;
 		if (isChild()) {
+			// A dead broker is relaunched from here too; the child gives up only after the tree's
+			// broker-down window, not after the 60 s grace.
+			const socket = String(pi.getFlag("actors-socket"));
+			const link = childLink(String(pi.getFlag("actors-tree")), socket);
 			return open(ctx, {
-				socket: String(pi.getFlag("actors-socket")), id: String(pi.getFlag("actors-id")), inc: Number(pi.getFlag("actors-inc")),
+				socket, id: String(pi.getFlag("actors-id")), inc: Number(pi.getFlag("actors-inc")),
 				pid: process.pid, sessionId: sm.getSessionId(), sessionFile: sm.getSessionFile(),
-			}, TIMING.childGraceMs);
+			}, link.graceMs, link.redial);
 		}
 		// The root: the tree this process is running (carried across a session switch) wins over
 		// the tree the session recorded (N4); then the recorded one; then a new one. A finished tree
@@ -110,7 +114,7 @@ export default function piActors(pi: ExtensionAPI) {
 		for (let attempt = 0; ; attempt++) {
 			const treeId = candidates[attempt];
 			const where = detectMux();
-			const launch = { treeId, rootCwd: ctx.cwd, mux: where?.mux, rootPaneId: where?.pane, childArgs: jsonEnv("PI_ACTORS_CHILD_ARGS"), childCommand: jsonEnv("PI_ACTORS_CHILD_COMMAND"), limits: readLimits() };
+			const launch = { treeId, rootCwd: ctx.cwd, mux: where?.mux, rootPaneId: where?.pane, childArgs: jsonEnv("PI_ACTORS_CHILD_ARGS"), childCommand: jsonEnv("PI_ACTORS_CHILD_COMMAND"), limits: readLimits(), brokerDownMs: readBrokerDownMs() };
 			try {
 				const socket = await ensureBroker(launch);
 				const c = await open(ctx, { socket, id: "root", inc: 1, pid: process.pid, sessionId: sm.getSessionId(), sessionFile: sm.getSessionFile() }, TIMING.rootGraceMs, () => ensureBroker(launch).then(() => {}));
@@ -240,6 +244,12 @@ export default function piActors(pi: ExtensionAPI) {
 		} catch {
 			return undefined;
 		}
+	}
+
+	/** `brokerDownMinutes`: how long children outlive a broker that cannot be relaunched (default 30). */
+	function readBrokerDownMs(): number | undefined {
+		const m = readSettings().brokerDownMinutes;
+		return typeof m === "number" && m >= 0 ? Math.round(m * 60_000) : undefined;
 	}
 
 	/** Test hooks: PI_ACTORS_CHILD_ARGS (extra pi args) and PI_ACTORS_CHILD_COMMAND, as JSON arrays. */

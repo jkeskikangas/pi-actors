@@ -3,9 +3,9 @@
 import { spawn } from "node:child_process";
 import { appendFileSync, existsSync, openSync, readdirSync, readFileSync, rmSync, statSync } from "node:fs";
 import { connect } from "node:net";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { DEFAULT_LIMITS, type Limits } from "../protocol.ts";
-import { type Config, ensureDir, ensurePrivateDir, ensureSnapshot, loadConfig, nodeBinary, pidAlive, piCommandFromProcess, saveConfig, socketPath, stateRoot, treeDir, writeFileAtomicSync } from "../runtime.ts";
+import { bootTime, brokerDownMs, type Config, ensureDir, ensurePrivateDir, ensureSnapshot, loadConfig, nodeBinary, pidAlive, piCommandFromProcess, saveConfig, socketPath, stateRoot, treeDir, writeFileAtomicSync } from "../runtime.ts";
 
 export interface LaunchOptions {
 	treeId: string;
@@ -16,6 +16,8 @@ export interface LaunchOptions {
 	childArgs?: string[];
 	childCommand?: string[];
 	piCommand?: string[];
+	/** How long Keepers and children wait out a broker that cannot be relaunched (pi-actors.json). */
+	brokerDownMs?: number;
 }
 
 /** The broker writes status.json; a finished tree is never restarted (F7). */
@@ -61,10 +63,11 @@ export function pruneFinishedTrees(keepMs: number, now = Date.now()): string[] {
 	return pruned;
 }
 
-function lockHeld(dir: string): boolean {
+function lockHeld(dir: string, thisBoot = false): boolean {
 	try {
-		const pid = (JSON.parse(readFileSync(join(dir, "broker.lock"), "utf8")) as { pid?: number }).pid;
-		return typeof pid === "number" && pidAlive(pid);
+		const lock = JSON.parse(readFileSync(join(dir, "broker.lock"), "utf8")) as { pid?: number; bootTime?: number };
+		// `thisBoot`: a pid from an earlier boot is someone else's now.
+		return typeof lock.pid === "number" && pidAlive(lock.pid) && (!thisBoot || typeof lock.bootTime !== "number" || Math.abs(lock.bootTime - bootTime()) <= 5);
 	} catch {
 		return false;
 	}
@@ -100,7 +103,7 @@ export async function ensureBroker(opts: LaunchOptions): Promise<string> {
 	let config: Config;
 	if (loaded?.config) {
 		// The code snapshot stays pinned; where the root lives and how children start may change.
-		config = { ...loaded.config, rootCwd: opts.rootCwd, mux: opts.mux, rootPaneId: opts.rootPaneId, childArgs: opts.childArgs, childCommand: opts.childCommand };
+		config = { ...loaded.config, rootCwd: opts.rootCwd, mux: opts.mux, rootPaneId: opts.rootPaneId, childArgs: opts.childArgs, childCommand: opts.childCommand, brokerDownMs: opts.brokerDownMs ?? loaded.config.brokerDownMs };
 		if (loaded.problem) notes.push(`${loaded.problem}; restored it from ${configPath}.bak`);
 	}
 	else {
@@ -115,6 +118,7 @@ export async function ensureBroker(opts: LaunchOptions): Promise<string> {
 			rootPaneId: opts.rootPaneId,
 			childArgs: opts.childArgs,
 			childCommand: opts.childCommand,
+			brokerDownMs: opts.brokerDownMs,
 		};
 		if (loaded) notes.push(`${loaded.problem} and has no usable backup; re-derived it (runtime ${config.runtimeDir})`);
 	}
@@ -128,20 +132,56 @@ export async function ensureBroker(opts: LaunchOptions): Promise<string> {
 		notes.push(`could not update ${configPath} (${(err as Error).message}); starting with the previous one`);
 	}
 	for (const n of notes) logLine(logPath, `launcher: ${n}`);
-	const out = openSync(logPath, "a");
-	const broker = spawn(nodeBinary(), [join(config.runtimeDir, "broker", "main.ts"), dir, sock, configPath], {
-		detached: true,
-		stdio: ["ignore", out, out],
-		cwd: dir,
-	});
-	broker.unref();
+	await startAndWait(dir, sock, configPath, config);
+	return sock;
+}
+
+/** Start a broker process (unless a live one holds the lock) and wait for its socket. */
+async function startAndWait(dir: string, sock: string, configPath: string, config: Config): Promise<void> {
+	const logPath = join(dir, "broker.log");
+	// A live lock holder is a broker starting (or stuck): another process would only lose the lock.
+	if (!lockHeld(dir, true)) {
+		const out = openSync(logPath, "a");
+		const broker = spawn(nodeBinary(), [join(config.runtimeDir, "broker", "main.ts"), dir, sock, configPath], {
+			detached: true,
+			stdio: ["ignore", out, out],
+			cwd: dir,
+		});
+		broker.unref();
+	}
 	// Another launcher may win the lock; either way a broker appears on the socket.
 	for (let i = 0; i < 100; i++) {
-		if (await canConnect(sock)) return sock;
+		if (await canConnect(sock)) return;
 		await new Promise((r) => setTimeout(r, 100));
 	}
 	const tail = logTail(logPath);
-	throw new Error(`broker for tree ${opts.treeId} did not start${tail ? `: ${tail}` : ""}; see ${logPath}`);
+	throw new Error(`broker for tree ${config.treeId} did not start${tail ? `: ${tail}` : ""}; see ${logPath}`);
+}
+
+/**
+ * Relaunch the broker of a running tree from its saved config: what Keepers and children do when
+ * their broker is gone (the root uses ensureBroker). Never creates a tree or writes its config;
+ * throws "... finished" for a finished tree. Many callers may race: the broker lock picks one,
+ * and a random pause first lets the others find its socket instead of starting more brokers.
+ */
+export async function relaunchBroker(dir: string, sock: string, jitterMs = 1000): Promise<void> {
+	if (await canConnect(sock)) return;
+	await new Promise((r) => setTimeout(r, Math.random() * jitterMs));
+	if (await canConnect(sock)) return;
+	if (treeFinished(dir)) throw new Error(`tree ${basename(dir)} finished`);
+	const configPath = join(dir, "config.json");
+	const { config, problem } = loadConfig(configPath);
+	if (!config) throw new Error(`cannot relaunch the broker: ${problem} and has no usable backup`);
+	await startAndWait(dir, sock, configPath, config);
+}
+
+/**
+ * How a child stays linked to its tree: its connection relaunches a dead broker, and it gives up
+ * (exits as an orphan) only after the tree's broker-down window, not after the 60 s grace.
+ */
+export function childLink(treeId: string, sock: string): { graceMs: number; redial: () => Promise<void> } {
+	const dir = treeDir(treeId);
+	return { graceMs: brokerDownMs(loadConfig(join(dir, "config.json")).config), redial: () => relaunchBroker(dir, sock) };
 }
 
 /** The runtime snapshot the tree's newest child was started from, if it still exists. */

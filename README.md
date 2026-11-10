@@ -67,7 +67,7 @@ Outside both, `pane: true` fails immediately with a clear message.
 Set in `~/.pi/agent/pi-actors.json`:
 
 ```json
-{ "maxDepth": 2, "maxSpawns": 50, "keepFinishedDays": 7 }
+{ "maxDepth": 2, "maxSpawns": 50, "keepFinishedDays": 7, "brokerDownMinutes": 30 }
 ```
 
 - **`maxDepth`:** how many levels of children below you are allowed.
@@ -76,10 +76,11 @@ Set in `~/.pi/agent/pi-actors.json`:
 An agent can set lower limits for the children it starts, but never higher ones. When a limit is reached, the agent is told to do the work itself.
 
 - **`keepFinishedDays`:** how long a finished tree keeps its files: the event log and every child's session, which hold their transcripts. After that, they're deleted the next time a session uses pi-actors. A finished tree is one that was stopped, or whose root never came back.
+- **`brokerDownMinutes`:** how long children keep running while their broker is gone and cannot be restarted (for example, the disk is full). Meanwhile their keepers and the children themselves keep trying to restart it. After that, they stop. Applies to trees started after the change.
 
 ## How it works
 
-Each tree of agents is coordinated by one small background process, the broker. Every change it makes is written to disk before it is confirmed, so after a crash it can be restarted and carry on exactly where it was. Agents that run without a visible pane are each watched by a tiny keeper process, which keeps them alive if the broker restarts. Stopping the broker with a signal (SIGTERM, SIGINT, SIGHUP) counts as such a restart, not as stopping the tree (`/actors stop`, `/new`). Each tree runs from its own copy of this extension's code, so updating pi in the middle of a run never mixes versions.
+Each tree of agents is coordinated by one small background process, the broker. Every change it makes is written to disk before it is confirmed, so after a crash it can be restarted and carry on exactly where it was. Agents that run without a visible pane are each watched by a tiny keeper process, which keeps them alive if the broker restarts and restarts a broker that died. Stopping the broker with a signal (SIGTERM, SIGINT, SIGHUP) counts as such a restart, not as stopping the tree (`/actors stop`, `/new`). Each tree runs from its own copy of this extension's code, so updating pi in the middle of a run never mixes versions.
 
 The design (`designs/pi-actors.md`), the spec (`specs/pi-actors.md`) and the formal model (`model/`) are in the repository.
 

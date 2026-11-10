@@ -7,7 +7,7 @@ import { closeSync, cpSync, existsSync, fsyncSync, linkSync, lstatSync, mkdirSyn
 import { homedir, tmpdir, uptime, userInfo } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import type { Limits } from "./protocol.ts";
+import { type Limits, TIMING } from "./protocol.ts";
 
 export const PKG_ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 export const SRC_ROOT = join(PKG_ROOT, "src");
@@ -61,6 +61,13 @@ export interface Config {
 	childArgs?: string[];
 	/** Test hook: replaces the child pi command entirely (fake agents). */
 	childCommand?: string[];
+	/** How long Keepers and children wait out a broker that cannot be relaunched; TIMING.brokerDownMs if unset. */
+	brokerDownMs?: number;
+}
+
+export function brokerDownMs(config: Pick<Config, "brokerDownMs"> | undefined): number {
+	const ms = config?.brokerDownMs;
+	return typeof ms === "number" && ms >= 0 ? ms : TIMING.brokerDownMs;
 }
 
 /** Resolve a `node` binary: the running one if it is node, otherwise `node` on PATH. */
@@ -341,6 +348,12 @@ export interface KeeperSpec {
 	logDir: string;
 	/** How long the Keeper keeps a finished child's exit report while the broker is unreachable. */
 	graceMs: number;
+	/**
+	 * The tree's directory: the Keeper relaunches a dead broker from its config, and keeps its child
+	 * through `brokerDownMs` of broker absence instead of `graceMs`. Absent in older specs.
+	 */
+	treeDir?: string;
+	brokerDownMs?: number;
 }
 
 /** herdr agent names are global across herdr: prefix with the tree id. */
