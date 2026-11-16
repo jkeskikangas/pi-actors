@@ -345,7 +345,10 @@ export default function piActors(pi: ExtensionAPI) {
 			ctx.ui.setWidget("pi-actors", undefined, { placement: "belowEditor" });
 			return;
 		}
-		lastSnap = await client.inspect();
+		const snap = await client.inspect();
+		// The session may have been replaced or reloaded meanwhile: its ctx is stale and throws.
+		if (ctx !== ctxRef) return;
+		lastSnap = snap;
 		const line = summary(lastSnap);
 		ctx.ui.setWidget("pi-actors", line ? [line] : undefined, { placement: "belowEditor" });
 	}
@@ -565,6 +568,7 @@ export default function piActors(pi: ExtensionAPI) {
 	});
 
 	pi.on("session_shutdown", async (event) => {
+		ctxRef = undefined;
 		clearInterval(uiTimer);
 		uiTimer = undefined;
 		clearInterval(reclaimTimer);

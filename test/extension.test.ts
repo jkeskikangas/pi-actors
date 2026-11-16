@@ -393,6 +393,43 @@ test("F11: a root session switch (/fork) keeps the tree (children's reports reac
 	await sessionB.waitFor(() => /echo:still there\?/.test(sessionB.inbox()));
 });
 
+test("a UI refresh in flight across a session switch does not touch the stale ctx", async () => {
+	const h = root({ mode: "tui" });
+	await h.tool("spawn", { task: "serve", name: "ui" });
+	const errors: unknown[] = [];
+	const onError = (e: unknown) => errors.push(e);
+	process.on("unhandledRejection", onError);
+	// pi makes every ctx getter throw once the session is replaced. The switch lands while the
+	// refresh awaits its inspect: armed on the next read of ctx.mode, it runs before the reply.
+	let stale = false;
+	let armed = true;
+	const ui = h.ctx.ui;
+	const check = () => {
+		if (stale) throw new Error("This extension ctx is stale");
+	};
+	Object.defineProperty(h.ctx, "ui", { get: () => (check(), ui) });
+	Object.defineProperty(h.ctx, "mode", {
+		get: () => {
+			check();
+			if (armed) {
+				armed = false;
+				queueMicrotask(() => void h.fire("session_shutdown", { reason: "resume" }).then(() => (stale = true)));
+			}
+			return "tui";
+		},
+	});
+	try {
+		await h.tool("send", { to: "ui", text: "ping" });
+		await h.waitFor(() => stale);
+		await new Promise((r) => setTimeout(r, 300));
+		assert.deepEqual(errors, []);
+	} finally {
+		process.off("unhandledRejection", onError);
+		Object.defineProperty(h.ctx, "ui", { value: ui, writable: true });
+		Object.defineProperty(h.ctx, "mode", { value: "tui", writable: true });
+	}
+});
+
 const lastNote = (h: ReturnType<typeof fakeHost>) => h.notes.at(-1) ?? "";
 const treeOf = (h: ReturnType<typeof fakeHost>) => h.entries.filter((e) => e.type === "custom" && e.customType === "pi-actors-root").at(-1)?.data.treeId;
 

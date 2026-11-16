@@ -52,7 +52,7 @@ export class Client extends EventEmitter {
 	private gapped = new Set<number>();
 	private waiters = new Map<number, (r: Response) => void>();
 	private fetches = new Map<string, (m: Message | null) => void>();
-	private inspects = new Map<string, (s: Snapshot) => void>();
+	private inspects = new Map<string, (s: Snapshot | undefined) => void>();
 	private counter = 0;
 	private closed = false;
 	private lostSince: number | undefined;
@@ -93,6 +93,8 @@ export class Client extends EventEmitter {
 		this.gapped.clear();
 		for (const [, r] of this.fetches) r(null);
 		this.fetches.clear();
+		for (const [, r] of this.inspects) r(undefined);
+		this.inspects.clear();
 	}
 
 	/** Connect and resolve on the first welcome; rejects on an identity rejection. */
@@ -340,7 +342,7 @@ export class Client extends EventEmitter {
 	inspect(): Promise<Snapshot | undefined> {
 		if (!this.connected) return Promise.resolve(undefined);
 		const reqId = `i${++this.counter}`;
-		const p = new Promise<Snapshot>((resolve) => this.inspects.set(reqId, resolve));
+		const p = new Promise<Snapshot | undefined>((resolve) => this.inspects.set(reqId, resolve));
 		this.ask(`inspect:${reqId}`, { t: "inspect", reqId });
 		return Promise.race([p, new Promise<undefined>((r) => setTimeout(() => r(undefined), 5000).unref())]);
 	}
