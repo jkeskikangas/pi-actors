@@ -26,6 +26,11 @@ export const TIMING = {
 	killGiveUpMs: 15_000,
 	heartbeatMs: 15_000,
 	heartbeatTimeoutMs: 45_000,
+	/**
+	 * A broker that is gone and cannot be relaunched: Keepers and children keep running and retry
+	 * this long before the link rule ends them (default; pi-actors.json `brokerDownMinutes`).
+	 */
+	brokerDownMs: 30 * 60_000,
 } as const;
 
 export const DEFAULT_LIMITS: Limits = { maxDepth: 2, maxSpawns: 50 };

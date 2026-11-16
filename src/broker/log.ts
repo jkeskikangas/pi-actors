@@ -3,8 +3,9 @@
 // a torn or holed tail, but only after the last fsync, so only in lines nobody was promised:
 // open cuts the file back to the last good line before appending again.
 
-import { closeSync, existsSync, fstatSync, fsyncSync, openSync, readFileSync, renameSync, truncateSync, writeSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { closeSync, existsSync, fstatSync, fsyncSync, ftruncateSync, openSync, readFileSync, truncateSync, writeSync } from "node:fs";
+import { join } from "node:path";
+import { injectedFault, writeFileAtomicSync } from "../runtime.ts";
 import { type Event, type TreeState, UNSYNCED_EVENTS } from "../tree.ts";
 
 export const LOG_VERSION = 1;
@@ -27,17 +28,27 @@ export interface Loaded {
 export class EventLog {
 	private fd: number;
 	readonly path: string;
+	/** Bytes of whole lines in the file: a failed append is cut back to this. */
+	private bytes: number;
+	/** Lines a failing disk refused, in order; written before anything newer. */
+	private held: string[] = [];
+	private torn = false;
+	private unsynced = false;
+	private error: string | undefined;
+	/** Told once when writing starts failing and once when it works again. */
+	report: (msg: string) => void = (msg) => console.error(`${new Date().toISOString()} ${msg}`);
 
 	private constructor(path: string, fd: number) {
 		this.path = path;
 		this.fd = fd;
+		this.bytes = fstatSync(fd).size;
 	}
 
 	/** Open (creating with a header if missing) and return the log plus everything in it. */
 	static open(dir: string, treeId: string): { log: EventLog; loaded: Loaded } {
 		const path = join(dir, "events.log");
 		const loaded = existsSync(path) ? EventLog.read(path, treeId) : undefined;
-		if (!loaded) writeAtomic(path, `${JSON.stringify({ pia_log: LOG_VERSION, treeId } satisfies Header)}\n`);
+		if (!loaded) writeFileAtomicSync(path, `${JSON.stringify({ pia_log: LOG_VERSION, treeId } satisfies Header)}\n`);
 		else if (loaded.goodBytes < fstatSize(path)) truncateSync(path, loaded.goodBytes);
 		return { log: new EventLog(path, openSync(path, "a")), loaded: loaded ?? { snapshot: undefined, events: [], lastTime: undefined, goodBytes: 0 } };
 	}
@@ -79,27 +90,127 @@ export class EventLog {
 	 * fsync is F_FULLFSYNC (past the drive cache).
 	 */
 	append(ev: Event, t: number, durable = true): void {
-		writeSync(this.fd, `${JSON.stringify({ ev, t })}\n`);
-		if (durable) fsyncSync(this.fd);
+		const line = `${JSON.stringify({ ev, t })}\n`;
+		if (this.error) {
+			// Never out of order: behind the held lines, and only once they are written.
+			this.held.push(line);
+			this.unsynced ||= durable;
+			this.flush();
+			return;
+		}
+		try {
+			this.writeLine(line);
+		} catch (err) {
+			this.held.push(line);
+			this.unsynced ||= durable;
+			return this.failed(err);
+		}
+		if (!durable) return;
+		try {
+			fsyncSync(this.fd);
+		} catch (err) {
+			this.unsynced = true;
+			this.failed(err);
+		}
+	}
+
+	/**
+	 * A full or failing disk (ENOSPC, EIO) does not stop the broker: refused lines are held in
+	 * memory, in order, and written by the next append or `flush` once the disk takes them. Until
+	 * then they are not durable: a broker crash in that window loses them.
+	 */
+	get failing(): string | undefined {
+		return this.error;
+	}
+
+	/** Retry what the disk refused; true once everything is written and synced. */
+	flush(): boolean {
+		if (!this.error) return true;
+		try {
+			if (this.torn) {
+				ftruncateSync(this.fd, this.bytes);
+				this.torn = false;
+			}
+			while (this.held.length > 0) {
+				this.writeLine(this.held[0]);
+				this.held.shift();
+			}
+			if (this.unsynced) fsyncSync(this.fd);
+			this.unsynced = false;
+		} catch (err) {
+			this.failed(err);
+			return false;
+		}
+		this.report(`event log ${this.path} is writable again`);
+		this.error = undefined;
+		return true;
+	}
+
+	/** One whole line or nothing: a short write (a full disk) is cut back off the file. */
+	private writeLine(line: string) {
+		const buf = Buffer.from(line);
+		let off = 0;
+		try {
+			while (off < buf.length) {
+				injectedFault(this.path, () => (off += writeSync(this.fd, buf, off, Math.ceil((buf.length - off) / 2))));
+				off += writeSync(this.fd, buf, off);
+			}
+		} catch (err) {
+			if (off > 0) {
+				try {
+					ftruncateSync(this.fd, this.bytes);
+				} catch {
+					this.torn = true; // cut before the next write, or it would follow a torn line
+				}
+			}
+			throw err;
+		}
+		this.bytes += buf.length;
+	}
+
+	private failed(err: unknown) {
+		const msg = (err as Error)?.message ?? String(err);
+		if (!this.error) this.report(`event log ${this.path}: ${msg}; holding events in memory and retrying`);
+		this.error = msg;
 	}
 
 	get size(): number {
 		return fstatSync(this.fd).size;
 	}
 
-	needsCompaction(): boolean {
-		return this.size > COMPACT_BYTES;
+	needsCompaction(now = Date.now()): boolean {
+		return now >= this.compactRetryAt && this.size > COMPACT_BYTES;
 	}
 
-	/** Replace the log with header + snapshot (atomic rename), then keep appending to it. */
-	compact(state: TreeState, t: number): void {
+	/** After a failed compaction, the next try waits: each one writes the whole state. */
+	private compactRetryAt = 0;
+
+	/**
+	 * Replace the log with header + snapshot (atomic rename), then keep appending to it. The
+	 * snapshot covers any held lines too. False (old log kept) when the disk refuses it.
+	 */
+	compact(state: TreeState, t: number): boolean {
 		const header: Header = { pia_log: LOG_VERSION, treeId: state.treeId };
-		writeAtomic(this.path, `${JSON.stringify(header)}\n${JSON.stringify({ snapshot: state, t })}\n`);
+		try {
+			writeFileAtomicSync(this.path, `${JSON.stringify(header)}\n${JSON.stringify({ snapshot: state, t })}\n`);
+		} catch (err) {
+			if (this.compactRetryAt === 0) this.report(`event log ${this.path}: compaction failed: ${(err as Error)?.message ?? err}; keeping the uncompacted log`);
+			this.compactRetryAt = Date.now() + 60_000;
+			return false;
+		}
 		closeSync(this.fd);
 		this.fd = openSync(this.path, "a");
+		this.bytes = fstatSync(this.fd).size;
+		this.compactRetryAt = 0;
+		this.held = [];
+		this.torn = this.unsynced = false;
+		if (this.error) this.report(`event log ${this.path} is writable again (compacted)`);
+		this.error = undefined;
+		return true;
 	}
 
 	close(): void {
+		this.flush();
 		closeSync(this.fd);
 	}
 }
@@ -124,18 +235,3 @@ function fstatSize(path: string): number {
 	}
 }
 
-function writeAtomic(path: string, content: string) {
-	const tmp = `${path}.tmp-${process.pid}`;
-	const fd = openSync(tmp, "w");
-	writeSync(fd, content);
-	fsyncSync(fd);
-	closeSync(fd);
-	renameSync(tmp, path);
-	// The rename itself must reach the disk, or a machine crash can bring back the old file.
-	const dirFd = openSync(dirname(path), "r");
-	try {
-		fsyncSync(dirFd);
-	} finally {
-		closeSync(dirFd);
-	}
-}

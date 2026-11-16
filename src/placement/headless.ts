@@ -2,15 +2,15 @@
 // process and stdio, so the broker can crash and restart without the child noticing.
 
 import { spawn } from "node:child_process";
-import { openSync, writeFileSync } from "node:fs";
+import { openSync } from "node:fs";
 import { join } from "node:path";
-import { childEnv, type KeeperSpec, nodeBinary } from "../runtime.ts";
+import { childEnv, type KeeperSpec, nodeBinary, writeFileAtomicSync } from "../runtime.ts";
 
 
 /** Launch a Keeper for one child; returns the Keeper's pid. */
 export function startHeadless(runtimeDir: string, spec: KeeperSpec, onError: (err: Error) => void): number {
 	const specPath = join(spec.logDir, `${spec.id}.${spec.inc}.keeper.json`);
-	writeFileSync(specPath, JSON.stringify(spec), { mode: 0o600 });
+	writeFileAtomicSync(specPath, JSON.stringify(spec));
 	const out = openSync(join(spec.logDir, `${spec.id}.${spec.inc}.keeper.log`), "a");
 	const keeper = spawn(nodeBinary(), [join(runtimeDir, "keeper", "main.ts"), specPath], {
 		cwd: spec.cwd,
